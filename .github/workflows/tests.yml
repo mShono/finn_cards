@@ -1,0 +1,30 @@
+name: tests
+
+on:
+  workflow_dispatch:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      # uralicNLP auto-downloads the Finnish FST model (~370MB) on first
+      # use if it's missing - cache it so most runs skip the download.
+      - name: Cache Finnish FST model
+        uses: actions/cache@v4
+        with:
+          path: .venv/lib/python3.12/site-packages/uralicNLP/models
+          key: fst-models-fin-v1
+
+      - name: Run tests
+        run: uv run pytest
