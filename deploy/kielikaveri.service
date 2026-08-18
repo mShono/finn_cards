@@ -1,0 +1,16 @@
+[Unit]
+Description=Kielikaveri Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kielikaveri
+WorkingDirectory=/opt/kielikaveri
+EnvironmentFile=/opt/kielikaveri/.env
+ExecStart=/opt/kielikaveri/.venv/bin/python -m kielikaveri.bot.main
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
