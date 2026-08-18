@@ -1,0 +1,34 @@
+{
+  "id": "4801f7a8-fe32-4612-ae51-1fc7a8b774cd",
+  "lemma": "hammas",
+  "pos": "substantiivi",
+  "translation_ru": "зуб",
+  "example_fi": "Minulla on kipeä hammas.",
+  "example_ru": "У меня болит зуб.",
+  "kind": "word",
+  "meta": {
+    "word_class_detail": "astevaihtelu mp/mm",
+    "stems": { "vowel": "hampaa-", "consonant": null },
+    "gradation": "mp/mm",
+    "principal_forms": {
+      "nominatiivi": "hammas",
+      "genetiivi": "hampaan",
+      "partitiivi": "hammasta",
+      "illatiivi": "hampaaseen",
+      "monikon_partitiivi": "hampaita"
+    },
+    "forms_source": "fst+llm",
+    "forms_verified": false,
+    "rektio": null,
+    "cognates": [
+      { "lemma": "hammaslääkäri", "pos": "substantiivi", "translation_ru": "стоматолог" },
+      { "lemma": "hampaisto", "pos": "substantiivi", "translation_ru": "зубной ряд" }
+    ],
+    "puhekieli": null,
+    "confusable_with": [],
+    "cefr": "A2",
+    "topics": ["terveys", "keho"],
+    "origin": "text",
+    "source": { "type": "article", "ref": "Yle Uutiset selkosuomeksi", "context_fi": "Lapsen ensimmäinen hammas puhkeaa yleensä kuuden kuukauden iässä." }
+  }
+}

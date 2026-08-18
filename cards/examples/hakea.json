@@ -1,0 +1,35 @@
+{
+  "id": "c4d31927-b71f-4f0e-8970-bfc6e65e20b4",
+  "lemma": "hakea",
+  "pos": "verbi",
+  "translation_ru": "искать / подавать заявление",
+  "example_fi": "Haen töitä kaupungista.",
+  "example_ru": "Я ищу работу в городе.",
+  "kind": "word",
+  "meta": {
+    "word_class_detail": "verbityyppi 1",
+    "stems": { "vowel": "hae-", "consonant": null },
+    "gradation": "k/-",
+    "principal_forms": {
+      "preesens_1s": "haen",
+      "preesens_3s": "hakee",
+      "imperfekti_3s": "haki",
+      "nut_partisiippi": "hakenut",
+      "passiivi": "haetaan"
+    },
+    "forms_source": "fst",
+    "forms_verified": true,
+    "rektio": "hakea + partitiivi",
+    "cognates": [
+      { "lemma": "haku", "pos": "substantiivi", "translation_ru": "поиск, набор" },
+      { "lemma": "hakemus", "pos": "substantiivi", "translation_ru": "заявление" },
+      { "lemma": "hakija", "pos": "substantiivi", "translation_ru": "заявитель" }
+    ],
+    "puhekieli": "mä haen",
+    "confusable_with": ["hakata"],
+    "cefr": "B1",
+    "topics": ["työnhaku"],
+    "origin": "error",
+    "source": { "type": "conversation", "ref": "разговор о поиске работы", "context_fi": "Hän haki työpaikkaa." }
+  }
+}

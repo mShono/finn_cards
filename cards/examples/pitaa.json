@@ -1,0 +1,34 @@
+{
+  "id": "7d0604f6-17b4-4d12-8323-909a4a23584d",
+  "lemma": "pitää",
+  "pos": "verbi",
+  "translation_ru": "нравиться",
+  "example_fi": "Pidän suomen kielestä.",
+  "example_ru": "Мне нравится финский язык.",
+  "kind": "word",
+  "meta": {
+    "word_class_detail": "verbityyppi 1",
+    "stems": { "vowel": "pidä-", "consonant": "pitä-" },
+    "gradation": "t/d",
+    "principal_forms": {
+      "preesens_1s": "pidän",
+      "preesens_3s": "pitää",
+      "imperfekti_3s": "piti",
+      "nut_partisiippi": "pitänyt",
+      "passiivi": "pidetään"
+    },
+    "forms_source": "fst",
+    "forms_verified": true,
+    "rektio": "pitää + elatiivi",
+    "cognates": [
+      { "lemma": "pidike", "pos": "substantiivi", "translation_ru": "держатель" },
+      { "lemma": "pitävä", "pos": "adjektiivi", "translation_ru": "прочный, герметичный" }
+    ],
+    "puhekieli": "mä pidän suomen kielestä",
+    "confusable_with": [],
+    "cefr": "B1",
+    "topics": ["mielipide", "kieli"],
+    "origin": "error",
+    "source": { "type": "conversation", "ref": "разговор о финском языке", "context_fi": "Minä pitää suomen kielestä." }
+  }
+}
