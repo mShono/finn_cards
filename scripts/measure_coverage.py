@@ -12,7 +12,7 @@ Usage: python scripts/measure_coverage.py
 
 from __future__ import annotations
 
-from finn_cards.morphology import detect_pos, generate_forms, forms_for_pos
+from finn_cards.morphology import detect_pos, forms_for_pos, generate_forms
 
 VERBS = [
     "hakea", "olla", "tulla", "juosta", "tarvita", "opiskella",
