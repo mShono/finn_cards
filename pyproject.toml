@@ -1,24 +1,35 @@
 [project]
 name = "finn-cards"
 version = "0.1.0"
-description = "FST-verified flashcard generator for Finnish (Kielikaveri phase 0)"
+description = "Kielikaveri: FST-verified Finnish flashcards (phase 0) and the Telegram bot (phase 1+)"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "uralicnlp>=2.1.1",
     "jsonschema>=4.20",
+    "aiogram>=3.13",
+    "sqlalchemy[asyncio]>=2.0",
+    "aiosqlite>=0.20",
+    "alembic>=1.13",
+    "pydantic-settings>=2.5",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.7",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/finn_cards"]
+packages = ["src/finn_cards", "src/kielikaveri"]
