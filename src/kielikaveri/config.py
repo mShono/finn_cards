@@ -24,11 +24,7 @@ class Settings(BaseSettings):
 
     @property
     def whitelist(self) -> set[int]:
-        return {
-            int(user_id)
-            for user_id in self.whitelist_user_ids.split(",")
-            if user_id.strip()
-        }
+        return {int(user_id) for user_id in self.whitelist_user_ids.split(",") if user_id.strip()}
 
 
 def load_settings() -> Settings:

@@ -82,9 +82,7 @@ class User(Base):
     # Telegram user id - the app has one user in phase 1, but every other
     # table still carries user_id so multi-user is a non-event later.
     id: Mapped[int] = mapped_column(primary_key=True)
-    created_at: Mapped[datetime] = mapped_column(
-        UTCDateTime, default=lambda: datetime.now(UTC)
-    )
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=lambda: datetime.now(UTC))
 
 
 class Source(Base):
@@ -107,13 +105,9 @@ class Note(Base):
     example_fi: Mapped[str] = mapped_column(String)
     example_ru: Mapped[str] = mapped_column(String)
     kind: Mapped[NoteKind] = mapped_column(Enum(NoteKind, native_enum=False))
-    source_id: Mapped[str | None] = mapped_column(
-        ForeignKey("sources.id"), nullable=True
-    )
+    source_id: Mapped[str | None] = mapped_column(ForeignKey("sources.id"), nullable=True)
     meta: Mapped[dict] = mapped_column(JSON)
-    created_at: Mapped[datetime] = mapped_column(
-        UTCDateTime, default=lambda: datetime.now(UTC)
-    )
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=lambda: datetime.now(UTC))
 
     cards: Mapped[list[Card]] = relationship(back_populates="note")
 
@@ -131,9 +125,7 @@ class Card(Base):
     state: Mapped[CardState] = mapped_column(
         Enum(CardState, native_enum=False), default=CardState.learning
     )
-    due: Mapped[datetime] = mapped_column(
-        UTCDateTime, default=lambda: datetime.now(UTC)
-    )
+    due: Mapped[datetime] = mapped_column(UTCDateTime, default=lambda: datetime.now(UTC))
     stability: Mapped[float] = mapped_column(default=0.0)
     difficulty: Mapped[float] = mapped_column(default=0.0)
     reps: Mapped[int] = mapped_column(default=0)
@@ -149,6 +141,4 @@ class Review(Base):
     card_id: Mapped[str] = mapped_column(ForeignKey("cards.id"))
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
     rating: Mapped[int] = mapped_column()
-    reviewed_at: Mapped[datetime] = mapped_column(
-        UTCDateTime, default=lambda: datetime.now(UTC)
-    )
+    reviewed_at: Mapped[datetime] = mapped_column(UTCDateTime, default=lambda: datetime.now(UTC))

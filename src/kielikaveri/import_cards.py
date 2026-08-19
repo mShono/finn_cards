@@ -45,7 +45,9 @@ async def import_notes(session_factory, user_id: int, cards_dir: Path) -> list[s
             validator.validate(payload)
             if "kind" not in payload:
                 # schema.json is oneOf[note, card] - "kind" only exists on note
-                raise ValueError(f"{note_file} is a card, not a note - import_cards only imports notes")
+                raise ValueError(
+                    f"{note_file} is a card, not a note - import_cards only imports notes"
+                )
 
             existing = await session.get(Note, payload["id"])
             if existing is not None:

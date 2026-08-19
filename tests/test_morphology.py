@@ -124,9 +124,7 @@ def test_concurrent_calls_do_not_crash():
 
     words = [("hakea", "verbi"), ("perhe", "substantiivi"), ("hammas", "substantiivi")]
     threads = [
-        threading.Thread(target=worker, args=(lemma, pos))
-        for lemma, pos in words
-        for _ in range(4)
+        threading.Thread(target=worker, args=(lemma, pos)) for lemma, pos in words for _ in range(4)
     ]
     for t in threads:
         t.start()

@@ -17,7 +17,7 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
-    "ruff>=0.7",
+    "ruff==0.16.3",  # pinned to match .pre-commit-config.yaml's rev exactly
 ]
 
 [tool.pytest.ini_options]

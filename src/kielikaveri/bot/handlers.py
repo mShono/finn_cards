@@ -17,8 +17,7 @@ router = Router(name="core")
 @router.message(Command("start"))
 async def start(message: Message) -> None:
     await message.answer(
-        "Привет! Kielikaveri на связи - бот для практики финского.\n"
-        "Команды: /help, /stats."
+        "Привет! Kielikaveri на связи - бот для практики финского.\nКоманды: /help, /stats."
     )
 
 
@@ -32,9 +31,7 @@ async def help_(message: Message) -> None:
 
 
 @router.message(Command("stats"))
-async def stats(
-    message: Message, session_factory: async_sessionmaker[AsyncSession]
-) -> None:
+async def stats(message: Message, session_factory: async_sessionmaker[AsyncSession]) -> None:
     user_id = message.from_user.id
     async with session_factory() as session:
         notes_count = await session.scalar(

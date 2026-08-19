@@ -15,13 +15,36 @@ from __future__ import annotations
 from finn_cards.morphology import detect_pos, forms_for_pos, generate_forms
 
 VERBS = [
-    "hakea", "olla", "tulla", "juosta", "tarvita", "opiskella",
-    "voida", "syödä", "pitää", "mennä", "nähdä", "antaa",
+    "hakea",
+    "olla",
+    "tulla",
+    "juosta",
+    "tarvita",
+    "opiskella",
+    "voida",
+    "syödä",
+    "pitää",
+    "mennä",
+    "nähdä",
+    "antaa",
 ]
 NOUNS = [
-    "käsi", "työ", "vesi", "ihminen", "puhelin", "kaupunki", "hammas",
-    "perhe", "tyttö", "kirje", "huone", "vastaus", "sisar", "kieli",
-    "päivä", "auto",
+    "käsi",
+    "työ",
+    "vesi",
+    "ihminen",
+    "puhelin",
+    "kaupunki",
+    "hammas",
+    "perhe",
+    "tyttö",
+    "kirje",
+    "huone",
+    "vastaus",
+    "sisar",
+    "kieli",
+    "päivä",
+    "auto",
 ]
 ADJECTIVES = ["lyhyt", "pitkä", "hyvä", "iso", "kaunis", "vaikea", "helppo", "uusi"]
 
@@ -56,9 +79,13 @@ def main() -> None:
         else:
             problems.append((lemma, pos, result))
 
-    print(f"words: {len(WORDS)}  (verbs={len(VERBS)} nouns={len(NOUNS)} adjectives={len(ADJECTIVES)})")
-    print(f"notes fully verified (no ambiguity, no gaps): {notes_fully_verified}/{len(WORDS)} "
-          f"({notes_fully_verified / len(WORDS):.1%})")
+    print(
+        f"words: {len(WORDS)}  (verbs={len(VERBS)} nouns={len(NOUNS)} adjectives={len(ADJECTIVES)})"
+    )
+    print(
+        f"notes fully verified (no ambiguity, no gaps): {notes_fully_verified}/{len(WORDS)} "
+        f"({notes_fully_verified / len(WORDS):.1%})"
+    )
     print(f"forms total: {total_forms}")
     print(f"  resolved (unambiguous):   {resolved_forms} ({resolved_forms / total_forms:.1%})")
     print(f"  ambiguous (needs LLM):    {ambiguous_forms}")
