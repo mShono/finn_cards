@@ -14,6 +14,11 @@ async def run() -> None:
     settings = load_settings()
     if not settings.bot_token:
         raise RuntimeError("BOT_TOKEN is not set - see .env.example")
+    if not settings.whitelist:
+        # An empty whitelist doesn't fail open - WhitelistMiddleware blocks
+        # everyone, owner included, with no error anywhere. Better to refuse
+        # to start than to run a bot that silently ignores every message.
+        raise RuntimeError("WHITELIST_USER_IDS is not set - see .env.example")
 
     bot = Bot(token=settings.bot_token)
     dp = Dispatcher()
