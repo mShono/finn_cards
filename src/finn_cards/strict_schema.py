@@ -20,9 +20,7 @@ import copy
 from collections.abc import Iterable
 
 
-def convert_to_strict(
-    schema: dict, def_name: str, exclude: Iterable[str] = ()
-) -> dict:
+def convert_to_strict(schema: dict, def_name: str, exclude: Iterable[str] = ()) -> dict:
     """Return an OpenAI strict-mode schema for schema['$defs'][def_name]."""
     defs = schema.get("$defs", {})
     resolved = _resolve_refs({"$ref": f"#/$defs/{def_name}"}, defs)
@@ -48,9 +46,7 @@ def _make_strict(node: dict, exclude: frozenset[str]) -> dict:
 
     if node.get("type") == "object" and "properties" in node:
         properties = {
-            name: prop
-            for name, prop in node["properties"].items()
-            if name not in exclude
+            name: prop for name, prop in node["properties"].items() if name not in exclude
         }
         required = set(node.get("required", [])) - exclude
         for name, prop in properties.items():
