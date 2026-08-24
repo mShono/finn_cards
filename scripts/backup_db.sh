@@ -5,8 +5,8 @@
 # ssh/scp) and add that step below - not decided/configured yet.
 set -euo pipefail
 
-DB_PATH="${DB_PATH:-/opt/kielikaveri/kielikaveri.db}"
-BACKUP_DIR="${BACKUP_DIR:-/opt/kielikaveri/backups}"
+DB_PATH="${DB_PATH:-/opt/kielikaveri/finn_cards/kielikaveri.db}"
+BACKUP_DIR="${BACKUP_DIR:-/opt/kielikaveri/finn_cards/backups}"
 KEEP_DAYS="${KEEP_DAYS:-14}"
 
 mkdir -p "$BACKUP_DIR"
