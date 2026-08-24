@@ -1,3 +1,8 @@
+# Assumes the repo is cloned to /opt/kielikaveri/finn_cards - e.g.
+#   mkdir -p /opt/kielikaveri && cd /opt/kielikaveri
+#   git clone https://github.com/mShono/finn_cards.git
+# (no trailing "." - that's what nests it under finn_cards/, matching the
+# paths below).
 [Unit]
 Description=Kielikaveri Telegram bot
 After=network-online.target
@@ -6,9 +11,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=kielikaveri
-WorkingDirectory=/opt/kielikaveri
-EnvironmentFile=/opt/kielikaveri/.env
-ExecStart=/opt/kielikaveri/.venv/bin/python -m kielikaveri.bot.main
+WorkingDirectory=/opt/kielikaveri/finn_cards
+EnvironmentFile=/opt/kielikaveri/finn_cards/.env
+ExecStart=/opt/kielikaveri/finn_cards/.venv/bin/python -m kielikaveri.bot.main
 Restart=on-failure
 RestartSec=5
 

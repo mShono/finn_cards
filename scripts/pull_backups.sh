@@ -6,7 +6,7 @@
 set -euo pipefail
 
 SERVER="${SERVER:?set SERVER=user@host, e.g. SERVER=kielikaveri@1.2.3.4}"
-REMOTE_DIR="${REMOTE_DIR:-/opt/kielikaveri/backups}"
+REMOTE_DIR="${REMOTE_DIR:-/opt/kielikaveri/finn_cards/backups}"
 LOCAL_DIR="${LOCAL_DIR:-$HOME/yki/backups/kielikaveri}"
 
 mkdir -p "$LOCAL_DIR"
