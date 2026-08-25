@@ -231,6 +231,28 @@ async def learn_rate(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     _, _, card_id, rating_value = callback.data.split(":")
+
+    data = await state.get_data()
+    queue: list[str] = data.get("queue", [])
+    if not queue or queue[0] != card_id:
+        # A stale button - e.g. a duplicate tap on a message whose card was
+        # already rated and is no longer at the head of the queue. Telegram
+        # doesn't disable a button once it's used, so the old keyboard stays
+        # live; applying it again would silently record a phantom review the
+        # user never actually made and corrupt that card's FSRS history.
+        await callback.answer("Эта карточка уже учтена.", show_alert=True)
+        return
+
+    # Claim the head *before* the first real await (the DB writes below) -
+    # two callback_query updates for one genuine double-tap can otherwise
+    # both pass the check above and race: each opens its own session, reads
+    # the same not-yet-updated card, and both commit a review for it (proven
+    # by test_concurrent_double_tap_..., which without this line records two
+    # Review rows and crashes the second call with a KeyError from a queue
+    # already cleared out from under it). Popping now makes the second call
+    # see an empty/mismatched head and take the stale-button exit above.
+    await state.update_data(queue=queue[1:], reviewed_count=data.get("reviewed_count", 0) + 1)
+
     rating = Rating(int(rating_value))
     now = datetime.now(UTC)
 
@@ -261,12 +283,6 @@ async def learn_rate(
         note = await session.get(Note, card.note_id)
         await ensure_card_types(session, note, now)
         await session.commit()
-
-    data = await state.get_data()
-    queue: list[str] = data.get("queue", [])
-    if queue and queue[0] == card_id:
-        queue = queue[1:]
-    await state.update_data(queue=queue, reviewed_count=data.get("reviewed_count", 0) + 1)
 
     await callback.answer(f"Записано: {RATING_LABELS[rating]}")
     await _show_next_card(callback.message, state, session_factory)

@@ -164,6 +164,39 @@ async def test_build_session_queue_holds_back_new_cards_past_the_daily_limit(ses
     assert "review-1" in queue
 
 
+async def test_a_new_card_backlog_larger_than_the_fetch_window_can_starve_a_review_card(
+    session_factory,
+):
+    # Documents a known limit of the fetch-generously heuristic (see the
+    # comment on build_session_queue): candidates are fetched oldest-due
+    # first, capped at session_max_cards * 5. If more new (reps == 0) cards
+    # than that fit *before* an older review card in due order, every fetched
+    # candidate gets skipped for being past the daily new-card budget, the
+    # window is exhausted, and the review card - due, and already known to
+    # the learner - never gets fetched at all this session. This test pins
+    # the current behavior so a future change to the multiplier or query is
+    # judged against this real failure mode instead of drifting further.
+    now = datetime(2026, 8, 24, 10, 0, tzinfo=UTC)
+    async with session_factory() as session:
+        session.add(User(id=1))
+        session.add(make_note("note-1", 1))
+        await session.flush()
+        # session_max_cards=3 -> fetch window is 15. 20 new cards, all due
+        # *before* the review card, fill the entire window on their own.
+        for i in range(20):
+            session.add(
+                make_card(f"new-{i}", "note-1", 1, due=now - timedelta(days=1, seconds=i), reps=0)
+            )
+        session.add(make_card("review-1", "note-1", 1, due=now - timedelta(minutes=1), reps=2))
+        await session.commit()
+
+        queue = await build_session_queue(
+            session, 1, now, session_max_cards=3, daily_new_limit=1, boundary_hour=4
+        )
+
+    assert "review-1" not in queue  # starved - see comment above, not a desired outcome
+
+
 # --- defer_overdue_tail -------------------------------------------------------
 
 
