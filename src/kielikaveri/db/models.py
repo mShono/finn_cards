@@ -143,6 +143,21 @@ class Card(Base):
     note: Mapped[Note] = relationship(back_populates="cards")
 
 
+class IngestCache(Base):
+    """Cached /add candidate-generation result, keyed by the input text's hash.
+
+    Saves a re-paid LLM call if the same text comes through /add twice - a
+    crashed confirmation flow, a resent paragraph - see plan 3.8/3.11.
+    """
+
+    __tablename__ = "ingest_cache"
+
+    text_hash: Mapped[str] = mapped_column(String, primary_key=True)
+    model: Mapped[str] = mapped_column(String)
+    candidates: Mapped[list] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=lambda: datetime.now(UTC))
+
+
 class Review(Base):
     __tablename__ = "reviews"
 
