@@ -315,6 +315,27 @@ async def test_add_keep_saves_a_word_note_with_resolved_forms(session_factory, m
     assert sources[0].context_fi == "Haen töitä."
 
 
+async def test_add_keep_word_with_unsupported_pos_saves_instead_of_crashing(session_factory):
+    # Regression: forms_for_pos()/generate_forms() only cover
+    # verbi/substantiivi/adjektiivi. A "word" candidate tagged with any other
+    # note.pos (adverbi here) used to raise ValueError straight out of
+    # resolve_note_forms, uncaught by add_keep's except clauses - the
+    # confirmation flow died with the callback never answered. Runs the real
+    # ingest.resolve_note_forms (no monkeypatch) to exercise the actual path.
+    candidate = {**WORD_CANDIDATE, "lemma": "kuitenkin", "pos": "adverbi"}
+    state = await _start_review(session_factory, [candidate])
+    callback = make_callback("add:keep:0")
+
+    await add_keep(callback, state, session_factory, make_settings(), make_breaker())
+
+    async with session_factory() as session:
+        notes = (await session.scalars(select(Note))).all()
+    assert len(notes) == 1
+    assert notes[0].meta["forms_source"] == "llm"
+    assert notes[0].meta["forms_verified"] is False
+    callback.answer.assert_awaited_once_with("Добавлено.")
+
+
 async def test_add_keep_pattern_kind_skips_the_llm_form_call(session_factory, monkeypatch):
     resolve = AsyncMock()
     monkeypatch.setattr("kielikaveri.bot.add.resolve_note_forms", resolve)
@@ -363,6 +384,47 @@ async def test_add_keep_reports_a_tripped_breaker_and_does_not_save(session_fact
 
     callback.answer.assert_awaited_once_with(
         "Предохранитель сработал - карточка не сохранена.", show_alert=True
+    )
+    async with session_factory() as session:
+        assert (await session.scalars(select(Note))).all() == []
+
+
+async def test_add_keep_reports_openai_unavailable_and_does_not_save(session_factory, monkeypatch):
+    monkeypatch.setattr(
+        "kielikaveri.bot.add.resolve_note_forms",
+        AsyncMock(side_effect=openai.APIConnectionError(request=SimpleNamespace())),
+    )
+    state = await _start_review(session_factory, [WORD_CANDIDATE])
+    callback = make_callback("add:keep:0")
+
+    await add_keep(callback, state, session_factory, make_settings(), make_breaker())
+
+    callback.answer.assert_awaited_once_with(
+        "OpenAI недоступен - карточка не сохранена, попробуй позже.", show_alert=True
+    )
+    async with session_factory() as session:
+        assert (await session.scalars(select(Note))).all() == []
+
+
+async def test_add_keep_rejects_a_schema_invalid_note(session_factory, monkeypatch):
+    monkeypatch.setattr(
+        "kielikaveri.bot.add.resolve_note_forms",
+        AsyncMock(return_value=(ResolvedForms({}, "fst", True), None)),
+    )
+    # Stand in for a malformed LLM candidate without hand-building one -
+    # build_full_note is exercised on its own in test_ingest.py, here we
+    # only need *some* result that fails cards/schema.json's note validator.
+    monkeypatch.setattr(
+        "kielikaveri.bot.add.build_full_note",
+        lambda candidate, resolved: {"lemma": "hakea"},
+    )
+    state = await _start_review(session_factory, [WORD_CANDIDATE])
+    callback = make_callback("add:keep:0")
+
+    await add_keep(callback, state, session_factory, make_settings(), make_breaker())
+
+    callback.answer.assert_awaited_once_with(
+        "Не удалось сохранить - невалидные данные от модели.", show_alert=True
     )
     async with session_factory() as session:
         assert (await session.scalars(select(Note))).all() == []

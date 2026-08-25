@@ -154,6 +154,39 @@ async def test_resolve_note_forms_asks_the_llm_only_for_the_ambiguous_form():
     client.responses.create.assert_called_once()
 
 
+async def test_resolve_note_forms_handles_a_pos_with_no_forms_table():
+    # adverbi is a valid note.pos (cards/schema.json), but forms_for_pos()
+    # only covers verbi/substantiivi/adjektiivi - must degrade, not crash.
+    client = MagicMock()
+    client.responses.create = AsyncMock()
+    breaker = make_breaker()
+
+    resolved, usage = await resolve_note_forms(
+        client, breaker, "gpt-5.6-terra", "kuitenkin", "adverbi", NOW
+    )
+
+    assert resolved.forms_source == "llm"
+    assert resolved.forms_verified is False
+    assert resolved.principal_forms == {}
+    assert usage is None
+    client.responses.create.assert_not_called()
+
+
+async def test_resolve_note_forms_handles_a_missing_pos():
+    # Strict mode drops schema.json's "kind=word requires pos" allOf, so the
+    # LLM can hand back pos=None even for kind="word" - must degrade too.
+    client = MagicMock()
+    client.responses.create = AsyncMock()
+    breaker = make_breaker()
+
+    resolved, usage = await resolve_note_forms(client, breaker, "gpt-5.6-terra", "hakea", None, NOW)
+
+    assert resolved.forms_source == "llm"
+    assert resolved.forms_verified is False
+    assert usage is None
+    client.responses.create.assert_not_called()
+
+
 async def test_resolve_ambiguous_forms_schema_only_allows_the_fst_candidates():
     client = MagicMock()
     client.responses.create = AsyncMock(

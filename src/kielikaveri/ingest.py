@@ -203,11 +203,24 @@ async def resolve_note_forms(
     breaker: CallBreaker,
     model: str,
     lemma: str,
-    pos: str,
+    pos: str | None,
     now: datetime,
 ) -> tuple[ResolvedForms, TokenUsage | None]:
-    """FST first (finn_cards.morphology); LLM only breaks ties among real FST forms."""
-    result: FormsResult = generate_forms(lemma, pos)
+    """FST first (finn_cards.morphology); LLM only breaks ties among real FST forms.
+
+    generate_forms()/forms_for_pos() only have a principal-forms table for
+    verbi/substantiivi/adjektiivi and raise ValueError on anything else -
+    including pos=None. The LLM's strict schema can still hand us either:
+    note.pos allows all 11 cards/schema.json parts of speech, and the
+    kind=word -> pos required rule lives in schema.json's `allOf`, which
+    strict_schema._make_strict() drops (no strict-mode equivalent), so pos
+    is nullable there regardless of kind. Treat both as "FST has nothing"
+    rather than letting the ValueError crash the /add confirmation handler.
+    """
+    try:
+        result: FormsResult = generate_forms(lemma, pos)
+    except ValueError:
+        return ResolvedForms({}, "llm", False), None
     covered = result.principal_forms.keys() | result.ambiguous.keys()
     missing = set(forms_for_pos(pos)) - covered
 
