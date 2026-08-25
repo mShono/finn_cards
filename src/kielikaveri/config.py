@@ -18,9 +18,19 @@ class Settings(BaseSettings):
 
     database_url: str = "sqlite+aiosqlite:///./kielikaveri.db"
 
-    # Hour (0-23, local server time) a new study day starts for `due`
-    # scheduling - used from phase 2 onward.
+    # Hour (0-23, Europe/Helsinki) a new study day starts for `due`
+    # scheduling and the daily new-card limit - see srs/queue.py.
     day_boundary_hour: int = 4
+
+    # /learn session shape.
+    session_max_cards: int = 20
+    session_max_minutes: int = 10
+    daily_new_limit: int = 10
+
+    # Above this many overdue cards, /learn offers to postpone the backlog
+    # instead of dumping it all into one session.
+    debt_threshold: int = 100
+    debt_postpone_days: int = 7
 
     @property
     def whitelist(self) -> set[int]:

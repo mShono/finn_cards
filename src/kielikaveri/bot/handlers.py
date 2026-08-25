@@ -26,7 +26,8 @@ async def help_(message: Message) -> None:
     await message.answer(
         "/start - поздороваться\n"
         "/help - эта справка\n"
-        "/stats - сколько заметок и карточек к повторению"
+        "/stats - сколько заметок и карточек к повторению\n"
+        "/learn - повторить карточки, которым пора"
     )
 
 
