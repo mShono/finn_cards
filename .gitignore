@@ -7,4 +7,3 @@ __pycache__/
 *.db
 *.db-journal
 .ruff_cache/
-tts_spike_output/
