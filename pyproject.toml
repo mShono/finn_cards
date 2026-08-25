@@ -11,6 +11,8 @@ dependencies = [
     "aiosqlite>=0.20",
     "alembic>=1.13",
     "pydantic-settings>=2.5",
+    "fsrs>=6.3.2",
+    "openai>=3.3.1",
 ]
 
 [project.optional-dependencies]

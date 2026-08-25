@@ -126,10 +126,19 @@ class Card(Base):
         Enum(CardState, native_enum=False), default=CardState.learning
     )
     due: Mapped[datetime] = mapped_column(UTCDateTime, default=lambda: datetime.now(UTC))
-    stability: Mapped[float] = mapped_column(default=0.0)
-    difficulty: Mapped[float] = mapped_column(default=0.0)
+    # None means "never reviewed" - py-fsrs uses that as its own sentinel for
+    # a brand new card and picks the initial value itself. Storing 0.0 here
+    # instead would be read back as an existing (and nonsensical, FSRS
+    # stability is always positive) card state and corrupt the very first
+    # review's math.
+    stability: Mapped[float | None] = mapped_column(nullable=True, default=None)
+    difficulty: Mapped[float | None] = mapped_column(nullable=True, default=None)
     reps: Mapped[int] = mapped_column(default=0)
     lapses: Mapped[int] = mapped_column(default=0)
+    # py-fsrs's sub-step index within its short learning/relearning steps
+    # (e.g. 1min, 10min) - must round-trip through the DB or a restart loses
+    # where a card was mid-step and effectively restarts its learning phase.
+    step: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
 
     note: Mapped[Note] = relationship(back_populates="cards")
 

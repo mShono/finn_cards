@@ -5,6 +5,7 @@ import asyncio
 from aiogram import Bot, Dispatcher
 
 from kielikaveri.bot.handlers import router
+from kielikaveri.bot.learn import router as learn_router
 from kielikaveri.bot.middleware import WhitelistMiddleware
 from kielikaveri.config import load_settings
 from kielikaveri.db.engine import make_engine, make_session_factory
@@ -26,13 +27,14 @@ async def run() -> None:
     # UserContextMiddleware and can rely on event_from_user being set.
     dp.update.outer_middleware(WhitelistMiddleware(settings.whitelist))
     dp.include_router(router)
+    dp.include_router(learn_router)
 
     # Schema is managed by alembic (`alembic upgrade head`), not created here.
     engine = make_engine(settings.database_url)
     session_factory = make_session_factory(engine)
 
     try:
-        await dp.start_polling(bot, session_factory=session_factory)
+        await dp.start_polling(bot, session_factory=session_factory, settings=settings)
     finally:
         await engine.dispose()
         await bot.session.close()
