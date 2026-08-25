@@ -14,6 +14,7 @@ from kielikaveri.bot.learn import (
     Rating,
     _show_next_card,
     learn_debt_choice,
+    learn_listen,
     learn_rate,
     learn_reveal,
     learn_start,
@@ -74,7 +75,7 @@ def make_callback(data: str) -> SimpleNamespace:
         data=data,
         from_user=SimpleNamespace(id=1),
         answer=AsyncMock(),
-        message=SimpleNamespace(answer=AsyncMock()),
+        message=SimpleNamespace(answer=AsyncMock(), answer_audio=AsyncMock()),
     )
 
 
@@ -366,7 +367,56 @@ async def test_learn_reveal_shows_the_back_and_a_rating_keyboard_for_that_card(s
     assert "искать" in text  # note.translation_ru, part of the back
     rate_buttons = kwargs["reply_markup"].inline_keyboard[0]
     assert all(button.callback_data.startswith("learn:rate:card-A:") for button in rate_buttons)
+    listen_button = kwargs["reply_markup"].inline_keyboard[1][0]
+    assert listen_button.callback_data == "learn:listen:card-A"
     callback.answer.assert_awaited_once()
+
+
+# --- learn_listen -------------------------------------------------------------
+
+
+async def test_learn_listen_sends_synthesized_audio_of_the_example_sentence(
+    session_factory, monkeypatch
+):
+    async with session_factory() as session:
+        session.add(User(id=1))
+        session.add(make_note())
+        await session.flush()
+        session.add(make_card("card-A", "note-1", 1, due=NOW))
+        await session.commit()
+
+    monkeypatch.setattr(
+        "kielikaveri.bot.learn.synthesize_speech",
+        lambda client, model, text: b"fake-mp3-bytes",
+    )
+    callback = make_callback("learn:listen:card-A")
+    settings = make_settings(openai_api_key="sk-test", openai_tts_model="tts-1")
+
+    await learn_listen(callback, session_factory, settings)
+
+    callback.message.answer_audio.assert_awaited_once()
+    audio = callback.message.answer_audio.call_args.args[0]
+    assert audio.data == b"fake-mp3-bytes"
+    callback.answer.assert_awaited_once()
+
+
+async def test_learn_listen_without_an_openai_key_answers_gracefully(session_factory):
+    async with session_factory() as session:
+        session.add(User(id=1))
+        session.add(make_note())
+        await session.flush()
+        session.add(make_card("card-A", "note-1", 1, due=NOW))
+        await session.commit()
+
+    callback = make_callback("learn:listen:card-A")
+    settings = make_settings(openai_api_key="")
+
+    await learn_listen(callback, session_factory, settings)
+
+    callback.answer.assert_awaited_once_with(
+        "Озвучка недоступна - не настроен OpenAI.", show_alert=True
+    )
+    callback.message.answer_audio.assert_not_awaited()
 
 
 # --- learn_start: debt-threshold branching ----------------------------------

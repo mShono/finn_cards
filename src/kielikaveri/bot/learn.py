@@ -15,7 +15,14 @@ from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
+from openai import OpenAI
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from kielikaveri.config import Settings
@@ -24,6 +31,7 @@ from kielikaveri.srs.graduation import ensure_card_types, sync_user_card_types
 from kielikaveri.srs.queue import build_session_queue, defer_overdue_tail, overdue_count
 from kielikaveri.srs.scheduler import RATING_LABELS, Rating, SrsState
 from kielikaveri.srs.scheduler import review as apply_review
+from kielikaveri.tts import synthesize_speech
 
 router = Router(name="learn")
 
@@ -64,7 +72,8 @@ def _rating_keyboard(card_id: str) -> InlineKeyboardMarkup:
                     text=label, callback_data=f"learn:rate:{card_id}:{rating.value}"
                 )
                 for rating, label in RATING_LABELS.items()
-            ]
+            ],
+            [InlineKeyboardButton(text="🔊 Послушать", callback_data=f"learn:listen:{card_id}")],
         ]
     )
 
@@ -286,6 +295,27 @@ async def learn_rate(
 
     await callback.answer(f"Записано: {RATING_LABELS[rating]}")
     await _show_next_card(callback.message, state, session_factory)
+
+
+@router.callback_query(F.data.startswith("learn:listen:"), LearnStates.reviewing)
+async def learn_listen(
+    callback: CallbackQuery,
+    session_factory: async_sessionmaker[AsyncSession],
+    settings: Settings,
+) -> None:
+    if not settings.openai_api_key:
+        await callback.answer("Озвучка недоступна - не настроен OpenAI.", show_alert=True)
+        return
+
+    card_id = callback.data.split(":", 2)[2]
+    async with session_factory() as session:
+        card = await session.get(Card, card_id)
+        note = await session.get(Note, card.note_id)
+
+    client = OpenAI(api_key=settings.openai_api_key)
+    audio = synthesize_speech(client, settings.openai_tts_model, note.example_fi)
+    await callback.message.answer_audio(BufferedInputFile(audio, filename="example.mp3"))
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("learn:"))
