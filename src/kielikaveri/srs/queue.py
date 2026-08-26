@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from kielikaveri.db.models import Card, Review
+from kielikaveri.db.models import Card, Note, Review
 
 # The study day boundary is defined in Europe/Helsinki regardless of where
 # the server runs (see plan 3.10) - it's the learner's day that matters, not
@@ -28,18 +28,26 @@ def study_day_bounds(now: datetime, boundary_hour: int) -> tuple[datetime, datet
 
 
 async def due_cards(
-    session: AsyncSession, user_id: int, now: datetime, limit: int | None
+    session: AsyncSession,
+    user_id: int,
+    now: datetime,
+    limit: int | None,
+    deck_id: str | None = None,
 ) -> list[Card]:
-    result = await session.scalars(
-        select(Card).where(Card.user_id == user_id, Card.due <= now).order_by(Card.due).limit(limit)
-    )
+    stmt = select(Card).where(Card.user_id == user_id, Card.due <= now)
+    if deck_id is not None:
+        stmt = stmt.join(Note, Card.note_id == Note.id).where(Note.deck_id == deck_id)
+    result = await session.scalars(stmt.order_by(Card.due).limit(limit))
     return list(result.all())
 
 
-async def overdue_count(session: AsyncSession, user_id: int, now: datetime) -> int:
-    return await session.scalar(
-        select(func.count()).select_from(Card).where(Card.user_id == user_id, Card.due <= now)
-    )
+async def overdue_count(
+    session: AsyncSession, user_id: int, now: datetime, deck_id: str | None = None
+) -> int:
+    stmt = select(func.count()).select_from(Card).where(Card.user_id == user_id, Card.due <= now)
+    if deck_id is not None:
+        stmt = stmt.join(Note, Card.note_id == Note.id).where(Note.deck_id == deck_id)
+    return await session.scalar(stmt)
 
 
 async def count_new_cards_today(
@@ -67,12 +75,16 @@ async def build_session_queue(
     session_max_cards: int,
     daily_new_limit: int,
     boundary_hour: int,
+    deck_id: str | None = None,
 ) -> list[str]:
     """Card ids for one /learn session, oldest-due first.
 
     Caps total size at `session_max_cards`, and caps how many never-reviewed
     (reps == 0) cards it admits at whatever's left of `daily_new_limit` for
     today's study window - review cards are never held back by this limit.
+    `deck_id` narrows candidates to one deck; the daily new-card budget stays
+    global across decks on purpose - it's a "don't overload the learner today"
+    cap, not a per-deck one.
     """
     new_today = await count_new_cards_today(session, user_id, now, boundary_hour)
     new_budget = max(0, daily_new_limit - new_today)
@@ -80,7 +92,9 @@ async def build_session_queue(
     # Fetch generously past session_max_cards - some candidates may be
     # skipped for being "new" past the daily budget, so a tight limit here
     # could starve the queue with review cards still due.
-    candidates = await due_cards(session, user_id, now, limit=session_max_cards * 5)
+    candidates = await due_cards(
+        session, user_id, now, limit=session_max_cards * 5, deck_id=deck_id
+    )
 
     queue: list[str] = []
     new_used = 0
@@ -101,10 +115,11 @@ async def defer_overdue_tail(
     now: datetime,
     keep_n: int,
     postpone_days: int,
+    deck_id: str | None = None,
 ) -> int:
     """Push every overdue card past the first `keep_n` (oldest-due) forward
     by `postpone_days`. Returns how many cards were postponed."""
-    cards = await due_cards(session, user_id, now, limit=None)
+    cards = await due_cards(session, user_id, now, limit=None, deck_id=deck_id)
     tail = cards[keep_n:]
     for card in tail:
         card.due = now + timedelta(days=postpone_days)
