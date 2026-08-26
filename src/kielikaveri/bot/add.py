@@ -24,6 +24,7 @@ from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from kielikaveri.config import Settings
@@ -120,7 +121,14 @@ async def add_start(
             await store_cached_candidates(
                 session, text_hash, settings.openai_text_model, candidates
             )
-            await session.commit()
+            try:
+                await session.commit()
+            except IntegrityError:
+                # A concurrent /add for the same text (double-tap, a resent
+                # message) already cached it first - text_hash is the PK.
+                # Our own freshly generated `candidates` are still valid to
+                # show for this request, there's just nothing left to store.
+                await session.rollback()
 
     if not candidates:
         await message.answer("Не нашла в этом тексте лексики выше текущего уровня.")

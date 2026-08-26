@@ -1,3 +1,4 @@
+import asyncio
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -13,7 +14,7 @@ from sqlalchemy import select
 from kielikaveri.bot.add import add_keep, add_skip, add_start, add_stray_callback
 from kielikaveri.config import Settings
 from kielikaveri.db.engine import create_all, make_engine, make_session_factory
-from kielikaveri.db.models import Note, Source
+from kielikaveri.db.models import IngestCache, Note, Source
 from kielikaveri.ingest import ResolvedForms, TokenUsage
 from kielikaveri.llm.breaker import CallBreaker, CircuitOpenError
 
@@ -213,6 +214,48 @@ async def test_add_reports_openai_unavailable_honestly(session_factory, monkeypa
 
     assert "недоступен" in message.answer.call_args.args[0]
     assert "/learn" in message.answer.call_args.args[0]
+
+
+async def test_add_concurrent_identical_text_does_not_crash_on_cache_write(
+    session_factory, monkeypatch
+):
+    # Two concurrent /add calls with the same text (double-tap, a resent
+    # message) both miss the empty cache and both try to INSERT the same
+    # text_hash PK into ingest_cache. Reproduced with real asyncio
+    # concurrency (aiosqlite genuinely yields to the loop on I/O), not a
+    # mock: without a fix, the second commit raises an uncaught
+    # IntegrityError straight out of add_start.
+    monkeypatch.setattr(
+        "kielikaveri.bot.add.generate_candidates",
+        AsyncMock(return_value=([WORD_CANDIDATE], TokenUsage(10, 5, 15))),
+    )
+    message_1 = make_message("/add Haen töitä.")
+    message_2 = make_message("/add Haen töitä.")
+
+    await asyncio.gather(
+        add_start(
+            message_1,
+            make_command("Haen töitä."),
+            make_state(),
+            session_factory,
+            make_settings(),
+            make_breaker(),
+        ),
+        add_start(
+            message_2,
+            make_command("Haen töitä."),
+            make_state(),
+            session_factory,
+            make_settings(),
+            make_breaker(),
+        ),
+    )
+
+    message_1.answer.assert_awaited_once()
+    message_2.answer.assert_awaited_once()
+    async with session_factory() as session:
+        cached = (await session.scalars(select(IngestCache))).all()
+    assert len(cached) == 1
 
 
 async def test_add_uses_the_cache_and_skips_the_llm_call(session_factory, monkeypatch):
