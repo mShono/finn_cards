@@ -1,11 +1,14 @@
-"""Phase 3: turn a pasted text into note candidates (plan 3.11, "Текст").
+"""Phase 3 (v2, conversational): turn a chat message into a reply plus note
+candidates (plan 3.11, "Текст", revised - a chat instead of a fixed
+one-by-one confirmation list).
 
 Two separate LLM calls, both structured (strict: true):
 
-1. generate_candidates() - reads the text, proposes notes shaped like
-   cards/schema.json's note def, minus the fields our own code fills in
-   (id, principal_forms, forms_source, forms_verified, origin). The LLM
-   never touches word forms - see resolve_note_forms().
+1. check_and_suggest() - reads one chat message (pasted text, or a
+   translation attempt) and returns a conversational Russian reply plus
+   notes shaped like cards/schema.json's note def, minus the fields our own
+   code fills in (id, principal_forms, forms_source, forms_verified,
+   origin). The LLM never touches word forms - see resolve_note_forms().
 2. resolve_note_forms() - plan 3.4: the FST (finn_cards.morphology) is the
    only thing allowed to produce a word form. When it resolves a form to
    several equally-weighted candidates ("ambiguous"), a second, separate LLM
@@ -45,7 +48,7 @@ INSTRUCTIONS_PATH = REPO_ROOT / "cards" / "instructions.md"
 # different entry point), so there's nothing for the LLM to decide.
 EXCLUDED_FIELDS = frozenset({"id", "principal_forms", "forms_source", "forms_verified", "origin"})
 
-CANDIDATES_SCHEMA_NAME = "kielikaveri_ingest_candidates"
+CHAT_SCHEMA_NAME = "kielikaveri_chat_reply"
 FORM_CHOICE_SCHEMA_NAME = "kielikaveri_form_choice"
 
 
@@ -67,24 +70,35 @@ def _load_note_schema() -> dict:
     return json.loads(SCHEMA_PATH.read_text())
 
 
-def _candidates_schema(note_schema: dict) -> dict:
+def _chat_schema(note_schema: dict) -> dict:
     note_strict = convert_to_strict(note_schema, "note", exclude=EXCLUDED_FIELDS)
     return {
         "type": "object",
         "additionalProperties": False,
-        "required": ["candidates"],
-        "properties": {"candidates": {"type": "array", "items": note_strict}},
+        "required": ["reply_ru", "candidates"],
+        "properties": {
+            "reply_ru": {"type": "string"},
+            "candidates": {"type": "array", "items": note_strict},
+        },
     }
 
 
-def _instructions() -> str:
+def _chat_instructions() -> str:
     return (
-        INSTRUCTIONS_PATH.read_text()
-        + "\n\n---\n\n"
-        + "Разбери присланный текст на кандидатов в карточки по правилам выше. "
-        "Верни только лексику и конструкции выше текущего уровня ученика - "
-        'не всё подряд. `kind: "pattern"` - только для управления/устойчивых '
-        "сочетаний, которые не сводятся к одной лемме."
+        INSTRUCTIONS_PATH.read_text() + "\n\n---\n\n"
+        "Ты - разговорный ассистент по финскому в Telegram-боте. Пользователь "
+        "пишет одним сообщением одно из трёх: (1) финский текст, из которого "
+        "нужно набрать карточки; (2) свой перевод текста (на финский или с "
+        "финского) - сверь его с оригиналом или со смыслом и разбери "
+        "неточности; (3) обычный вопрос про язык.\n\n"
+        "В `reply_ru` - разговорный ответ на русском: для перевода - "
+        "перечисли неточности (что не так и почему) и дай исправленный "
+        "вариант; для текста - коротко скажи, что нашла; для вопроса - "
+        "ответь на него. В `candidates` - карточки по правилам выше на ЛЮБУЮ "
+        "лексику и конструкции в сообщении, которые могут быть незнакомы "
+        "ученику или использованы неуверенно - не отсеивай агрессивно, лучше "
+        "предложить лишнее, чем пропустить нужное. Пустой список, если "
+        "предлагать нечего (например, чистый вопрос без нового текста)."
     )
 
 
@@ -100,35 +114,41 @@ def _usage_from(response) -> TokenUsage:
     )
 
 
-async def get_cached_candidates(session: AsyncSession, text_hash: str) -> list[dict] | None:
+async def get_cached_chat(session: AsyncSession, text_hash: str) -> tuple[str, list[dict]] | None:
     cached = await session.get(IngestCache, text_hash)
-    return cached.candidates if cached is not None else None
+    # reply_ru is None for rows written before this field existed (see
+    # models.py) - treat those as a miss rather than replaying an empty reply.
+    if cached is None or cached.reply_ru is None:
+        return None
+    return cached.reply_ru, cached.candidates
 
 
-async def store_cached_candidates(
-    session: AsyncSession, text_hash: str, model: str, candidates: list[dict]
+async def store_cached_chat(
+    session: AsyncSession, text_hash: str, model: str, reply_ru: str, candidates: list[dict]
 ) -> None:
-    session.add(IngestCache(text_hash=text_hash, model=model, candidates=candidates))
+    session.add(
+        IngestCache(text_hash=text_hash, model=model, reply_ru=reply_ru, candidates=candidates)
+    )
 
 
-async def generate_candidates(
+async def check_and_suggest(
     client: AsyncOpenAI,
     breaker: CallBreaker,
     model: str,
     text: str,
     now: datetime,
-) -> tuple[list[dict], TokenUsage]:
-    """Ask the LLM to propose note candidates for `text`. Raises CircuitOpenError via breaker."""
+) -> tuple[str, list[dict], TokenUsage]:
+    """One chat message in, a reply plus note candidates out. Raises CircuitOpenError via breaker."""
     breaker.check(now)
     response = await client.responses.create(
         model=model,
-        instructions=_instructions(),
+        instructions=_chat_instructions(),
         input=text,
         text={
             "format": {
                 "type": "json_schema",
-                "name": CANDIDATES_SCHEMA_NAME,
-                "schema": _candidates_schema(_load_note_schema()),
+                "name": CHAT_SCHEMA_NAME,
+                "schema": _chat_schema(_load_note_schema()),
                 "strict": True,
             }
         },
@@ -136,7 +156,7 @@ async def generate_candidates(
     payload = json.loads(response.output_text)
     usage = _usage_from(response)
     logger.info(
-        "ingest.generate_candidates model=%s input_tokens=%d output_tokens=%d total_tokens=%d "
+        "ingest.check_and_suggest model=%s input_tokens=%d output_tokens=%d total_tokens=%d "
         "candidates=%d",
         model,
         usage.input_tokens,
@@ -144,7 +164,7 @@ async def generate_candidates(
         usage.total_tokens,
         len(payload["candidates"]),
     )
-    return payload["candidates"], usage
+    return payload["reply_ru"], payload["candidates"], usage
 
 
 async def resolve_ambiguous_forms(
