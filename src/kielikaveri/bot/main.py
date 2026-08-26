@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 
 from aiogram import Bot, Dispatcher
 
+from kielikaveri.bot.add import router as add_router
 from kielikaveri.bot.handlers import router
 from kielikaveri.bot.learn import router as learn_router
 from kielikaveri.bot.middleware import WhitelistMiddleware
 from kielikaveri.config import load_settings
 from kielikaveri.db.engine import make_engine, make_session_factory
+from kielikaveri.llm.breaker import CallBreaker
 
 
 async def run() -> None:
@@ -28,13 +31,22 @@ async def run() -> None:
     dp.update.outer_middleware(WhitelistMiddleware(settings.whitelist))
     dp.include_router(router)
     dp.include_router(learn_router)
+    dp.include_router(add_router)
 
     # Schema is managed by alembic (`alembic upgrade head`), not created here.
     engine = make_engine(settings.database_url)
     session_factory = make_session_factory(engine)
 
+    # One breaker for the bot's whole lifetime (plan 3.8, point 3) - it must
+    # not reset per handler call, or it could never trip.
+    breaker = CallBreaker(
+        settings.breaker_max_calls, timedelta(minutes=settings.breaker_window_minutes)
+    )
+
     try:
-        await dp.start_polling(bot, session_factory=session_factory, settings=settings)
+        await dp.start_polling(
+            bot, session_factory=session_factory, settings=settings, breaker=breaker
+        )
     finally:
         await engine.dispose()
         await bot.session.close()

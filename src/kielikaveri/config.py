@@ -12,9 +12,18 @@ class Settings(BaseSettings):
     whitelist_user_ids: str = ""
 
     openai_api_key: str = ""
-    openai_text_model: str = "gpt-4o-mini"
+    # Strong model, not nano - plan 3.2: nano-tier models don't hold up on
+    # Finnish morphology and give a useless error breakdown.
+    openai_text_model: str = "gpt-5.6-terra"
     openai_stt_model: str = "whisper-1"
     openai_tts_model: str = "tts-1"
+    openai_timeout_seconds: float = 60.0
+
+    # Plan 3.8 point 3: the in-process circuit breaker. More calls than this
+    # within the window always means a bug (a human can't drive it by hand),
+    # so it trips and stops hitting the API until restart.
+    breaker_max_calls: int = 60
+    breaker_window_minutes: int = 10
 
     database_url: str = "sqlite+aiosqlite:///./kielikaveri.db"
 
