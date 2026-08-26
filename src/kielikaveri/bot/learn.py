@@ -26,7 +26,8 @@ from openai import OpenAI
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from kielikaveri.config import Settings
-from kielikaveri.db.models import Card, CardType, Note, Review
+from kielikaveri.db.decks import list_decks
+from kielikaveri.db.models import Card, CardType, Deck, Note, Review
 from kielikaveri.srs.graduation import ensure_card_types, sync_user_card_types
 from kielikaveri.srs.queue import build_session_queue, defer_overdue_tail, overdue_count
 from kielikaveri.srs.scheduler import RATING_LABELS, Rating, SrsState
@@ -35,8 +36,11 @@ from kielikaveri.tts import synthesize_speech
 
 router = Router(name="learn")
 
+DECK_ALL_TOKEN = "all"
+
 
 class LearnStates(StatesGroup):
+    deck_choice = State()
     debt_choice = State()
     reviewing = State()
 
@@ -78,6 +82,15 @@ def _rating_keyboard(card_id: str) -> InlineKeyboardMarkup:
     )
 
 
+def _deck_choice_keyboard(decks: list[Deck]) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=deck.name, callback_data=f"learn:deck:{deck.id}")]
+        for deck in decks
+    ]
+    rows.append([InlineKeyboardButton(text="Все", callback_data=f"learn:deck:{DECK_ALL_TOKEN}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def _debt_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -98,6 +111,7 @@ async def _start_session(
     settings: Settings,
     user_id: int,
     now: datetime,
+    deck_id: str | None,
 ) -> None:
     async with session_factory() as session:
         queue = await build_session_queue(
@@ -107,6 +121,7 @@ async def _start_session(
             session_max_cards=settings.session_max_cards,
             daily_new_limit=settings.daily_new_limit,
             boundary_hour=settings.day_boundary_hour,
+            deck_id=deck_id,
         )
 
     if not queue:
@@ -159,7 +174,36 @@ async def _show_next_card(
     await answer_to.answer(front, reply_markup=_reveal_keyboard(card_id))
 
 
+async def _proceed_past_deck_choice(
+    answer_to: Message,
+    state: FSMContext,
+    session_factory: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    user_id: int,
+    now: datetime,
+    deck_id: str | None,
+) -> None:
+    async with session_factory() as session:
+        await sync_user_card_types(session, user_id, now)
+        await session.commit()
+        overdue = await overdue_count(session, user_id, now, deck_id=deck_id)
+
+    if overdue > settings.debt_threshold:
+        await state.set_state(LearnStates.debt_choice)
+        await state.update_data(debt_now=now.isoformat(), deck_id=deck_id)
+        await answer_to.answer(
+            f"Просрочено {overdue} карточек - это много за одну сессию.\n"
+            f"Разгребать как обычно (по {settings.session_max_cards} за раз) "
+            f"или отложить остальное на {settings.debt_postpone_days} дн.?",
+            reply_markup=_debt_keyboard(),
+        )
+        return
+
+    await _start_session(answer_to, state, session_factory, settings, user_id, now, deck_id)
+
+
 @router.message(Command("learn"))
+@router.message(F.text == "📚 Учить")
 async def learn_start(
     message: Message,
     state: FSMContext,
@@ -170,22 +214,35 @@ async def learn_start(
     now = datetime.now(UTC)
 
     async with session_factory() as session:
-        await sync_user_card_types(session, user_id, now)
-        await session.commit()
-        overdue = await overdue_count(session, user_id, now)
+        decks = await list_decks(session, user_id)
 
-    if overdue > settings.debt_threshold:
-        await state.set_state(LearnStates.debt_choice)
-        await state.update_data(debt_now=now.isoformat())
-        await message.answer(
-            f"Просрочено {overdue} карточек - это много за одну сессию.\n"
-            f"Разгребать как обычно (по {settings.session_max_cards} за раз) "
-            f"или отложить остальное на {settings.debt_postpone_days} дн.?",
-            reply_markup=_debt_keyboard(),
+    if len(decks) <= 1:
+        # Nothing to actually choose between - skip straight to the session.
+        await _proceed_past_deck_choice(
+            message, state, session_factory, settings, user_id, now, deck_id=None
         )
         return
 
-    await _start_session(message, state, session_factory, settings, user_id, now)
+    await state.set_state(LearnStates.deck_choice)
+    await message.answer("Какую колоду учить?", reply_markup=_deck_choice_keyboard(decks))
+
+
+@router.callback_query(F.data.startswith("learn:deck:"), LearnStates.deck_choice)
+async def learn_deck_choice(
+    callback: CallbackQuery,
+    state: FSMContext,
+    session_factory: async_sessionmaker[AsyncSession],
+    settings: Settings,
+) -> None:
+    raw_deck_id = callback.data.split(":", 2)[2]
+    deck_id = None if raw_deck_id == DECK_ALL_TOKEN else raw_deck_id
+    user_id = callback.from_user.id
+    now = datetime.now(UTC)
+
+    await callback.answer()
+    await _proceed_past_deck_choice(
+        callback.message, state, session_factory, settings, user_id, now, deck_id
+    )
 
 
 @router.callback_query(F.data.startswith("learn:debt:"), LearnStates.debt_choice)
@@ -199,6 +256,7 @@ async def learn_debt_choice(
     user_id = callback.from_user.id
     data = await state.get_data()
     now = datetime.fromisoformat(data["debt_now"])
+    deck_id = data.get("deck_id")
 
     if action == "defer":
         async with session_factory() as session:
@@ -208,6 +266,7 @@ async def learn_debt_choice(
                 now,
                 keep_n=settings.session_max_cards,
                 postpone_days=settings.debt_postpone_days,
+                deck_id=deck_id,
             )
             await session.commit()
         await callback.message.answer(
@@ -215,7 +274,7 @@ async def learn_debt_choice(
         )
 
     await callback.answer()
-    await _start_session(callback.message, state, session_factory, settings, user_id, now)
+    await _start_session(callback.message, state, session_factory, settings, user_id, now, deck_id)
 
 
 @router.callback_query(F.data.startswith("learn:reveal:"), LearnStates.reviewing)
