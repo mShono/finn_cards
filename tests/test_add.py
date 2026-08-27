@@ -1,7 +1,7 @@
 import asyncio
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import openai
 import pytest
@@ -446,6 +446,25 @@ async def test_chat_reports_a_failed_candidate_without_blocking_the_others(
     report = callback.message.answer.call_args.args[0]
     assert "Не удалось сохранить «hakea»" in report
     assert "hakea + partitiivi" in report
+
+
+async def test_chat_reports_an_honest_error_instead_of_dying_silently(session_factory, monkeypatch):
+    # Regression, found live 27.08.2026: an exception anywhere in the
+    # dedup-and-save path used to die silently after "Добавляю." - the user
+    # saw a confirmation-sounding reply and then nothing, with no way to
+    # tell whether anything was saved.
+    patch_check_and_suggest(monkeypatch, "Добавляю.", [WORD_CANDIDATE])
+    monkeypatch.setattr(
+        "kielikaveri.bot.add.canonical_key", MagicMock(side_effect=RuntimeError("fst exploded"))
+    )
+    message = make_message("добавь hakea")
+
+    await chat_message(message, make_state(), session_factory, make_settings(), make_breaker())
+
+    async with session_factory() as session:
+        assert (await session.scalars(select(Note))).all() == []
+    report = texts_of(message.answer)[-1]
+    assert "не получилось" in report.lower()
 
 
 # --- /delete ---------------------------------------------------------------------

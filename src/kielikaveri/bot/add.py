@@ -295,53 +295,75 @@ async def _handle_chat_turn(
         return
 
     user_id = message.from_user.id
-    async with session_factory() as session:
-        existing = await existing_note_keys(session, user_id)
+    try:
+        async with session_factory() as session:
+            existing = await existing_note_keys(session, user_id)
 
-    seen: set[tuple[str, str | None]] = set()
-    to_add: list[dict] = []
-    duplicates = 0
-    for candidate in candidates:
-        key = canonical_key(candidate["lemma"], candidate.get("pos"))
-        if key in existing or key in seen:
-            duplicates += 1
-            continue
-        seen.add(key)
-        # canonical_key() lemmatizes to catch dupes even when the LLM handed
-        # back an inflected form as "lemma" (cards/instructions.md) - without
-        # this, the dedup check sees the corrected lemma but the saved card
-        # still gets the raw inflected string.
-        if key[0] != candidate["lemma"]:
-            candidate = {**candidate, "lemma": key[0]}
-        to_add.append(candidate)
+        seen: set[tuple[str, str | None]] = set()
+        to_add: list[dict] = []
+        duplicates = 0
+        for candidate in candidates:
+            key = canonical_key(candidate["lemma"], candidate.get("pos"))
+            if key in existing or key in seen:
+                duplicates += 1
+                continue
+            seen.add(key)
+            # canonical_key() lemmatizes to catch dupes even when the LLM
+            # handed back an inflected form as "lemma" (cards/instructions.md)
+            # - without this, the dedup check sees the corrected lemma but
+            # the saved card still gets the raw inflected string.
+            if key[0] != candidate["lemma"]:
+                candidate = {**candidate, "lemma": key[0]}
+            to_add.append(candidate)
 
-    if not to_add:
-        if duplicates:
-            await message.answer(f"Все {duplicates} кандидатов уже есть в базе.")
-        return
-
-    quote_text = context_text or text
-    async with session_factory() as session:
-        source = Source(
-            type=SourceType.other,
-            ref=f"Telegram чат, {now.date().isoformat()}",
-            context_fi=quote_text[:SOURCE_QUOTE_CHARS],
+        # Found live 27.08.2026: with only a token-count log line, "the model
+        # said candidates=4 but nothing got saved" took three round-trips to
+        # even start narrowing down. This one line pins the exact stage - did
+        # dedup eat everything, or did nothing even reach dedup.
+        logger.info(
+            "chat_message dedup candidates=%d to_add=%d duplicates=%d",
+            len(candidates),
+            len(to_add),
+            duplicates,
         )
-        session.add(source)
-        # active_deck() first - guarantees at least one deck (creating the
-        # default "Общая" for a brand new user) before the picker below is
-        # built, so it's never shown empty.
-        await active_deck(session, user_id)
-        await session.commit()
-        source_id = source.id
-        decks = await list_decks(session, user_id)
 
-    batch_id = str(uuid.uuid4())
-    await state.set_state(AddStates.choosing_deck)
-    await state.update_data(batch_id=batch_id, candidates=to_add, source_id=source_id)
-    await message.answer(
-        "В какую колоду добавить?", reply_markup=_deck_choice_keyboard(decks, batch_id)
-    )
+        if not to_add:
+            if duplicates:
+                await message.answer(f"Все {duplicates} кандидатов уже есть в базе.")
+            return
+
+        quote_text = context_text or text
+        async with session_factory() as session:
+            source = Source(
+                type=SourceType.other,
+                ref=f"Telegram чат, {now.date().isoformat()}",
+                context_fi=quote_text[:SOURCE_QUOTE_CHARS],
+            )
+            session.add(source)
+            # active_deck() first - guarantees at least one deck (creating the
+            # default "Общая" for a brand new user) before the picker below is
+            # built, so it's never shown empty.
+            await active_deck(session, user_id)
+            await session.commit()
+            source_id = source.id
+            decks = await list_decks(session, user_id)
+
+        batch_id = str(uuid.uuid4())
+        await state.set_state(AddStates.choosing_deck)
+        await state.update_data(batch_id=batch_id, candidates=to_add, source_id=source_id)
+        await message.answer(
+            "В какую колоду добавить?", reply_markup=_deck_choice_keyboard(decks, batch_id)
+        )
+    except Exception:
+        # Everything above this point used to be able to die silently - the
+        # user would see "Добавляю." and then nothing, ever, with no error
+        # anywhere they could see (found live 27.08.2026). Better to admit
+        # failure than to leave them guessing whether it worked.
+        logger.exception("chat_message failed while saving candidates")
+        await message.answer(
+            "Не получилось сохранить - что-то пошло не так на моей стороне. "
+            "Попробуй прислать список ещё раз."
+        )
 
 
 def _deck_choice_keyboard(decks: list[Deck], batch_id: str) -> InlineKeyboardMarkup:
