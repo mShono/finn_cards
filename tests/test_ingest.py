@@ -8,17 +8,17 @@ import pytest
 from kielikaveri.db.engine import create_all, make_engine, make_session_factory
 from kielikaveri.db.models import Note, NoteKind
 from kielikaveri.ingest import (
-    _candidates_schema,
+    _chat_schema,
     _load_note_schema,
     build_full_note,
     canonical_key,
+    check_and_suggest,
     existing_note_keys,
-    generate_candidates,
-    get_cached_candidates,
+    get_cached_chat,
     hash_text,
     resolve_ambiguous_forms,
     resolve_note_forms,
-    store_cached_candidates,
+    store_cached_chat,
 )
 from kielikaveri.llm.breaker import CallBreaker, CircuitOpenError
 
@@ -75,26 +75,32 @@ def test_canonical_key_pattern_kind_uses_the_raw_construction():
 # --- strict schema wrapper -------------------------------------------------------
 
 
-def test_candidates_schema_wraps_the_note_schema_and_excludes_fst_fields():
-    schema = _candidates_schema(_load_note_schema())
+def test_chat_schema_wraps_the_note_schema_and_excludes_fst_fields():
+    schema = _chat_schema(_load_note_schema())
     assert schema["additionalProperties"] is False
+    assert schema["required"] == ["reply_ru", "candidates"]
     note_item = schema["properties"]["candidates"]["items"]
     assert "principal_forms" not in note_item["properties"]["meta"]["properties"]
     assert "origin" not in note_item["properties"]["meta"]["properties"]
 
 
-# --- generate_candidates ---------------------------------------------------------
+# --- check_and_suggest ---------------------------------------------------------
 
 
-async def test_generate_candidates_parses_the_response_and_returns_usage():
+async def test_check_and_suggest_parses_the_response_and_returns_usage():
     client = MagicMock()
     client.responses.create = AsyncMock(
-        return_value=fake_response({"candidates": [{"lemma": "hakea"}]})
+        return_value=fake_response(
+            {"reply_ru": "Нашла кое-что.", "candidates": [{"lemma": "hakea"}]}
+        )
     )
     breaker = make_breaker()
 
-    candidates, usage = await generate_candidates(client, breaker, "gpt-5.6-terra", "text", NOW)
+    reply_ru, candidates, usage = await check_and_suggest(
+        client, breaker, "gpt-5.6-terra", "text", NOW
+    )
 
+    assert reply_ru == "Нашла кое-что."
     assert candidates == [{"lemma": "hakea"}]
     assert usage.input_tokens == 10
     assert usage.output_tokens == 5
@@ -103,13 +109,13 @@ async def test_generate_candidates_parses_the_response_and_returns_usage():
     assert client.responses.create.call_args.kwargs["model"] == "gpt-5.6-terra"
 
 
-async def test_generate_candidates_respects_a_tripped_breaker():
+async def test_check_and_suggest_respects_a_tripped_breaker():
     client = MagicMock()
     client.responses.create = AsyncMock()
     breaker = CallBreaker(max_calls=0, window=timedelta(minutes=10))
 
     with pytest.raises(CircuitOpenError):
-        await generate_candidates(client, breaker, "gpt-5.6-terra", "text", NOW)
+        await check_and_suggest(client, breaker, "gpt-5.6-terra", "text", NOW)
 
     client.responses.create.assert_not_called()
 
@@ -258,13 +264,31 @@ def test_build_full_note_pattern_kind_gets_placeholder_forms():
 
 async def test_cache_round_trips(session_factory):
     async with session_factory() as session:
-        assert await get_cached_candidates(session, "abc") is None
+        assert await get_cached_chat(session, "abc") is None
 
-        await store_cached_candidates(session, "abc", "gpt-5.6-terra", [{"lemma": "hakea"}])
+        await store_cached_chat(
+            session, "abc", "gpt-5.6-terra", "Нашла кое-что.", [{"lemma": "hakea"}]
+        )
         await session.commit()
 
     async with session_factory() as session:
-        assert await get_cached_candidates(session, "abc") == [{"lemma": "hakea"}]
+        assert await get_cached_chat(session, "abc") == ("Нашла кое-что.", [{"lemma": "hakea"}])
+
+
+async def test_cache_treats_a_pre_reply_ru_row_as_a_miss(session_factory):
+    # Rows written by the old generate_candidates()-based cache have no
+    # reply_ru at all - get_cached_chat must not replay them with an empty
+    # reply, it should look like nothing was cached.
+    from kielikaveri.db.models import IngestCache
+
+    async with session_factory() as session:
+        session.add(
+            IngestCache(text_hash="legacy", model="gpt-5.6-terra", candidates=[{"lemma": "hakea"}])
+        )
+        await session.commit()
+
+    async with session_factory() as session:
+        assert await get_cached_chat(session, "legacy") is None
 
 
 # --- existing_note_keys -------------------------------------------------------------

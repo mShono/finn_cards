@@ -10,10 +10,12 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from sqlalchemy import select
 
 from kielikaveri.bot.learn import (
+    DECK_ALL_TOKEN,
     LearnStates,
     Rating,
     _show_next_card,
     learn_debt_choice,
+    learn_deck_choice,
     learn_listen,
     learn_rate,
     learn_reveal,
@@ -21,6 +23,7 @@ from kielikaveri.bot.learn import (
     render_card,
 )
 from kielikaveri.config import Settings
+from kielikaveri.db.decks import create_deck
 from kielikaveri.db.engine import create_all, make_engine, make_session_factory
 from kielikaveri.db.models import Card, CardType, Note, NoteKind, Review, User
 
@@ -51,7 +54,7 @@ def make_settings(**overrides) -> Settings:
     return Settings(**{**defaults, **overrides})
 
 
-def make_note(note_id: str = "note-1", user_id: int = 1) -> Note:
+def make_note(note_id: str = "note-1", user_id: int = 1, deck_id: str | None = None) -> Note:
     return Note(
         id=note_id,
         user_id=user_id,
@@ -60,6 +63,7 @@ def make_note(note_id: str = "note-1", user_id: int = 1) -> Note:
         example_fi="Haen töitä.",
         example_ru="Я ищу работу.",
         kind=NoteKind.word,
+        deck_id=deck_id,
         meta={},
     )
 
@@ -461,6 +465,97 @@ async def test_learn_start_goes_straight_to_reviewing_when_under_the_debt_thresh
     assert await state.get_state() == LearnStates.reviewing
     message.answer.assert_awaited_once()
     assert "hakea" in message.answer.call_args.args[0]  # the card's front, not a debt prompt
+
+
+# --- learn_start / learn_deck_choice: deck picking ---------------------------
+
+
+async def test_learn_start_skips_the_picker_with_a_single_deck(session_factory):
+    async with session_factory() as session:
+        session.add(User(id=1))
+        deck = await create_deck(session, 1, "Общая")
+        await session.flush()
+        session.add(make_note(deck_id=deck.id))
+        await session.flush()
+        session.add(make_card("card-A", "note-1", 1, due=NOW - timedelta(days=1)))
+        await session.commit()
+
+    state = make_state()
+    message = make_message()
+
+    await learn_start(message, state, session_factory, make_settings())
+
+    # Straight into a session - no deck question asked.
+    assert await state.get_state() == LearnStates.reviewing
+    assert "hakea" in message.answer.call_args.args[0]
+
+
+async def test_learn_start_asks_which_deck_when_more_than_one_exists(session_factory):
+    async with session_factory() as session:
+        session.add(User(id=1))
+        await create_deck(session, 1, "Общая")
+        await create_deck(session, 1, "Из книги")
+        await session.commit()
+
+    state = make_state()
+    message = make_message()
+
+    await learn_start(message, state, session_factory, make_settings())
+
+    assert await state.get_state() == LearnStates.deck_choice
+    buttons = [
+        b for row in message.answer.call_args.kwargs["reply_markup"].inline_keyboard for b in row
+    ]
+    labels = [b.text for b in buttons]
+    assert "Общая" in labels
+    assert "Из книги" in labels
+    assert "Все" in labels
+
+
+async def test_learn_deck_choice_only_queues_cards_from_the_chosen_deck(session_factory):
+    async with session_factory() as session:
+        session.add(User(id=1))
+        deck_a = await create_deck(session, 1, "Общая")
+        deck_b = await create_deck(session, 1, "Из книги")
+        await session.flush()
+        session.add(make_note("note-a", 1, deck_id=deck_a.id))
+        session.add(make_note("note-b", 1, deck_id=deck_b.id))
+        await session.flush()
+        session.add(make_card("card-a", "note-a", 1, due=NOW - timedelta(days=1)))
+        session.add(make_card("card-b", "note-b", 1, due=NOW - timedelta(days=1)))
+        await session.commit()
+
+    state = make_state()
+    await state.set_state(LearnStates.deck_choice)
+    callback = make_callback(f"learn:deck:{deck_b.id}")
+
+    await learn_deck_choice(callback, state, session_factory, make_settings())
+
+    data = await state.get_data()
+    assert data["queue"] == ["card-b"]
+
+
+async def test_learn_deck_choice_all_queues_cards_from_every_deck(session_factory):
+    async with session_factory() as session:
+        session.add(User(id=1))
+        deck_a = await create_deck(session, 1, "Общая")
+        deck_b = await create_deck(session, 1, "Из книги")
+        await session.flush()
+        session.add(make_note("note-a", 1, deck_id=deck_a.id))
+        session.add(make_note("note-b", 1, deck_id=deck_b.id))
+        await session.flush()
+        session.add(make_card("card-a", "note-a", 1, due=NOW - timedelta(days=1)))
+        session.add(make_card("card-b", "note-b", 1, due=NOW - timedelta(days=1)))
+        await session.commit()
+
+    state = make_state()
+    await state.set_state(LearnStates.deck_choice)
+    callback = make_callback(f"learn:deck:{DECK_ALL_TOKEN}")
+
+    await learn_deck_choice(callback, state, session_factory, make_settings())
+
+    data = await state.get_data()
+    assert set(data["queue"]) == {"card-a", "card-b"}
 
 
 # --- learn_debt_choice -------------------------------------------------------

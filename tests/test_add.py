@@ -11,14 +11,15 @@ from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
 from sqlalchemy import select
 
-from kielikaveri.bot.add import add_keep, add_skip, add_start, add_stray_callback
+from kielikaveri.bot.add import add_command, chat_add_keep, chat_message
 from kielikaveri.config import Settings
+from kielikaveri.db.decks import create_deck, set_active_deck
 from kielikaveri.db.engine import create_all, make_engine, make_session_factory
 from kielikaveri.db.models import IngestCache, Note, Source
 from kielikaveri.ingest import ResolvedForms, TokenUsage
 from kielikaveri.llm.breaker import CallBreaker, CircuitOpenError
 
-NOW = datetime(2026, 8, 25, 10, 0, tzinfo=UTC)
+NOW = datetime(2026, 8, 26, 10, 0, tzinfo=UTC)
 
 WORD_CANDIDATE = {
     "lemma": "hakea",
@@ -86,12 +87,19 @@ def make_callback(data: str) -> SimpleNamespace:
     )
 
 
-# --- add_start ---------------------------------------------------------------------
+def patch_check_and_suggest(monkeypatch, reply_ru: str, candidates: list[dict]) -> AsyncMock:
+    mock = AsyncMock(return_value=(reply_ru, candidates, TokenUsage(10, 5, 15)))
+    monkeypatch.setattr("kielikaveri.bot.add.check_and_suggest", mock)
+    return mock
+
+
+# --- add_command (no args / with args) ---------------------------------------------
 
 
 async def test_add_without_text_prompts_for_it(session_factory):
     message = make_message("/add")
-    await add_start(
+
+    await add_command(
         message, make_command(None), make_state(), session_factory, make_settings(), make_breaker()
     )
 
@@ -99,47 +107,83 @@ async def test_add_without_text_prompts_for_it(session_factory):
     assert "текст" in message.answer.call_args.args[0]
 
 
-async def test_add_without_openai_key_answers_gracefully(session_factory):
+async def test_add_with_args_runs_the_same_analyzer_as_plain_chat(session_factory, monkeypatch):
+    mock = patch_check_and_suggest(monkeypatch, "Нашла кое-что.", [])
     message = make_message("/add Haen töitä.")
-    settings = make_settings(openai_api_key="")
 
-    await add_start(
+    await add_command(
         message,
         make_command("Haen töitä."),
         make_state(),
-        session_factory,
-        settings,
-        make_breaker(),
-    )
-
-    message.answer.assert_awaited_once_with("Добавление недоступно - не настроен OpenAI.")
-
-
-async def test_add_generates_and_shows_the_first_candidate(session_factory, monkeypatch):
-    monkeypatch.setattr(
-        "kielikaveri.bot.add.generate_candidates",
-        AsyncMock(return_value=([WORD_CANDIDATE], TokenUsage(10, 5, 15))),
-    )
-    message = make_message("/add Haen töitä.")
-    state = make_state()
-
-    await add_start(
-        message,
-        make_command("Haen töitä."),
-        state,
         session_factory,
         make_settings(),
         make_breaker(),
     )
 
-    message.answer.assert_awaited_once()
-    assert "hakea" in message.answer.call_args.args[0]
+    mock.assert_awaited_once()
+    assert mock.await_args.args[3] == "Haen töitä."
+
+
+# --- chat_message: no candidates / errors -------------------------------------------
+
+
+async def test_chat_without_openai_key_answers_gracefully(session_factory):
+    message = make_message("Haen töitä.")
+    settings = make_settings(openai_api_key="")
+
+    await chat_message(message, make_state(), session_factory, settings, make_breaker())
+
+    message.answer.assert_awaited_once_with("Ответить не могу - не настроен OpenAI.")
+
+
+async def test_chat_shows_the_reply_and_all_candidates_at_once(session_factory, monkeypatch):
+    patch_check_and_suggest(
+        monkeypatch, "Хорошее предложение.", [WORD_CANDIDATE, PATTERN_CANDIDATE]
+    )
+    message = make_message("Haen töitä kaupungista.")
+    state = make_state()
+
+    await chat_message(message, state, session_factory, make_settings(), make_breaker())
+
+    # reply + a deck header + one message per candidate - not one at a time.
+    texts = [call.args[0] for call in message.answer.call_args_list]
+    assert texts[0] == "Хорошее предложение."
+    assert any("hakea" in t for t in texts)
+    assert any("partitiivi" in t for t in texts)
     data = await state.get_data()
-    assert data["candidates"] == [WORD_CANDIDATE]
-    assert data["cursor"] == 0
+    assert len(data["candidates"]) == 2
+    assert data["added"] == []
 
 
-async def test_add_drops_duplicates_of_existing_notes(session_factory, monkeypatch):
+async def test_chat_reports_a_tripped_breaker_honestly(session_factory, monkeypatch):
+    monkeypatch.setattr(
+        "kielikaveri.bot.add.check_and_suggest",
+        AsyncMock(side_effect=CircuitOpenError("stopped")),
+    )
+    message = make_message("Haen töitä.")
+
+    await chat_message(message, make_state(), session_factory, make_settings(), make_breaker())
+
+    assert (
+        "предохранитель" in message.answer.call_args.args[0].lower()
+        or "баг" in message.answer.call_args.args[0]
+    )
+
+
+async def test_chat_reports_openai_unavailable_honestly(session_factory, monkeypatch):
+    monkeypatch.setattr(
+        "kielikaveri.bot.add.check_and_suggest",
+        AsyncMock(side_effect=openai.APIConnectionError(request=SimpleNamespace())),
+    )
+    message = make_message("Haen töitä.")
+
+    await chat_message(message, make_state(), session_factory, make_settings(), make_breaker())
+
+    assert "недоступен" in message.answer.call_args.args[0]
+    assert "/learn" in message.answer.call_args.args[0]
+
+
+async def test_chat_drops_duplicates_of_existing_notes(session_factory, monkeypatch):
     async with session_factory() as session:
         session.add(
             Note(
@@ -156,179 +200,101 @@ async def test_add_drops_duplicates_of_existing_notes(session_factory, monkeypat
         )
         await session.commit()
 
-    monkeypatch.setattr(
-        "kielikaveri.bot.add.generate_candidates",
-        AsyncMock(return_value=([WORD_CANDIDATE], TokenUsage(10, 5, 15))),
-    )
-    message = make_message("/add Haen töitä.")
+    patch_check_and_suggest(monkeypatch, "Нашла кое-что.", [WORD_CANDIDATE])
+    message = make_message("Haen töitä.")
 
-    await add_start(
-        message,
-        make_command("Haen töitä."),
-        make_state(),
-        session_factory,
-        make_settings(),
-        make_breaker(),
-    )
+    await chat_message(message, make_state(), session_factory, make_settings(), make_breaker())
 
-    message.answer.assert_awaited_once_with("Все 1 кандидатов уже есть в базе - добавлять нечего.")
+    texts = [call.args[0] for call in message.answer.call_args_list]
+    assert texts == ["Нашла кое-что.", "Все 1 кандидатов уже есть в базе."]
 
 
-async def test_add_reports_a_tripped_breaker_honestly(session_factory, monkeypatch):
-    monkeypatch.setattr(
-        "kielikaveri.bot.add.generate_candidates",
-        AsyncMock(side_effect=CircuitOpenError("stopped")),
-    )
-    message = make_message("/add Haen töitä.")
-
-    await add_start(
-        message,
-        make_command("Haen töitä."),
-        make_state(),
-        session_factory,
-        make_settings(),
-        make_breaker(),
-    )
-
-    assert (
-        "предохранитель" in message.answer.call_args.args[0].lower()
-        or "баг" in message.answer.call_args.args[0]
-    )
-
-
-async def test_add_reports_openai_unavailable_honestly(session_factory, monkeypatch):
-    monkeypatch.setattr(
-        "kielikaveri.bot.add.generate_candidates",
-        AsyncMock(side_effect=openai.APIConnectionError(request=SimpleNamespace())),
-    )
-    message = make_message("/add Haen töitä.")
-
-    await add_start(
-        message,
-        make_command("Haen töitä."),
-        make_state(),
-        session_factory,
-        make_settings(),
-        make_breaker(),
-    )
-
-    assert "недоступен" in message.answer.call_args.args[0]
-    assert "/learn" in message.answer.call_args.args[0]
-
-
-async def test_add_concurrent_identical_text_does_not_crash_on_cache_write(
+async def test_chat_falls_back_when_the_llm_returns_an_empty_reply_with_no_candidates(
     session_factory, monkeypatch
 ):
-    # Two concurrent /add calls with the same text (double-tap, a resent
-    # message) both miss the empty cache and both try to INSERT the same
-    # text_hash PK into ingest_cache. Reproduced with real asyncio
-    # concurrency (aiosqlite genuinely yields to the loop on I/O), not a
-    # mock: without a fix, the second commit raises an uncaught
-    # IntegrityError straight out of add_start.
-    monkeypatch.setattr(
-        "kielikaveri.bot.add.generate_candidates",
-        AsyncMock(return_value=([WORD_CANDIDATE], TokenUsage(10, 5, 15))),
-    )
-    message_1 = make_message("/add Haen töitä.")
-    message_2 = make_message("/add Haen töitä.")
+    patch_check_and_suggest(monkeypatch, "   ", [])
+    message = make_message("...")
+
+    await chat_message(message, make_state(), session_factory, make_settings(), make_breaker())
+
+    message.answer.assert_awaited_once_with("Не нашла, что ответить - попробуй переформулировать.")
+
+
+async def test_chat_with_no_candidates_only_sends_the_reply(session_factory, monkeypatch):
+    patch_check_and_suggest(monkeypatch, "Просто ответ, без карточек.", [])
+    message = make_message("Что значит kiitos?")
+
+    await chat_message(message, make_state(), session_factory, make_settings(), make_breaker())
+
+    message.answer.assert_awaited_once_with("Просто ответ, без карточек.")
+
+
+async def test_chat_concurrent_identical_text_does_not_crash_on_cache_write(
+    session_factory, monkeypatch
+):
+    patch_check_and_suggest(monkeypatch, "Нашла кое-что.", [WORD_CANDIDATE])
+    message_1 = make_message("Haen töitä.")
+    message_2 = make_message("Haen töitä.")
 
     await asyncio.gather(
-        add_start(
-            message_1,
-            make_command("Haen töitä."),
-            make_state(),
-            session_factory,
-            make_settings(),
-            make_breaker(),
-        ),
-        add_start(
-            message_2,
-            make_command("Haen töitä."),
-            make_state(),
-            session_factory,
-            make_settings(),
-            make_breaker(),
-        ),
+        chat_message(message_1, make_state(), session_factory, make_settings(), make_breaker()),
+        chat_message(message_2, make_state(), session_factory, make_settings(), make_breaker()),
     )
 
-    message_1.answer.assert_awaited_once()
-    message_2.answer.assert_awaited_once()
     async with session_factory() as session:
         cached = (await session.scalars(select(IngestCache))).all()
     assert len(cached) == 1
 
 
-async def test_add_uses_the_cache_and_skips_the_llm_call(session_factory, monkeypatch):
-    from kielikaveri.ingest import hash_text, store_cached_candidates
+async def test_chat_uses_the_cache_and_skips_the_llm_call(session_factory, monkeypatch):
+    from kielikaveri.ingest import hash_text, store_cached_chat
 
     async with session_factory() as session:
-        await store_cached_candidates(
-            session, hash_text("Haen töitä."), "gpt-5.6-terra", [WORD_CANDIDATE]
+        await store_cached_chat(
+            session, hash_text("Haen töitä."), "gpt-5.6-terra", "Из кэша.", [WORD_CANDIDATE]
         )
         await session.commit()
 
-    generate = AsyncMock()
-    monkeypatch.setattr("kielikaveri.bot.add.generate_candidates", generate)
-    message = make_message("/add Haen töitä.")
+    mock = AsyncMock()
+    monkeypatch.setattr("kielikaveri.bot.add.check_and_suggest", mock)
+    message = make_message("Haen töitä.")
 
-    await add_start(
-        message,
-        make_command("Haen töitä."),
-        make_state(),
-        session_factory,
-        make_settings(),
-        make_breaker(),
-    )
+    await chat_message(message, make_state(), session_factory, make_settings(), make_breaker())
 
-    generate.assert_not_called()
-    message.answer.assert_awaited_once()
+    mock.assert_not_called()
+    assert message.answer.call_args_list[0].args[0] == "Из кэша."
 
 
-# --- add_skip / add_keep ------------------------------------------------------------
+# --- chat_add_keep -------------------------------------------------------------------
 
 
-async def _start_review(session_factory, candidates: list[dict]) -> FSMContext:
-    state = make_state()
-    await state.set_state("AddStates:reviewing")
-    await state.update_data(
-        candidates=candidates,
-        source_text="Haen töitä.",
-        source_id=None,
-        cursor=0,
-        kept_count=0,
-        skipped_count=0,
-        duplicates_count=0,
-    )
-    return state
-
-
-async def test_add_skip_advances_without_saving(session_factory):
-    state = await _start_review(session_factory, [WORD_CANDIDATE])
-    callback = make_callback("add:skip:0")
-
-    await add_skip(callback, state)
-
-    data = await state.get_data()
-    assert data == {}  # cleared - it was the last (only) candidate
-    callback.message.answer.assert_awaited_once()
-    assert "пропущено 1" in callback.message.answer.call_args.args[0]
-
+async def _start_batch(
+    session_factory, candidates: list[dict], deck_id: str | None = None
+) -> tuple[FSMContext, str]:
     async with session_factory() as session:
-        assert (await session.scalars(select(Note))).all() == []
+        if deck_id is None:
+            deck = await create_deck(session, 1, "Общая")
+            deck_id = deck.id
+        source = Source(type="other", ref="test", context_fi="Haen töitä.")
+        session.add(source)
+        await session.commit()
+        source_id = source.id
+
+    state = make_state()
+    batch_id = "batch-1"
+    await state.update_data(
+        batch_id=batch_id,
+        candidates=candidates,
+        added=[],
+        source_id=source_id,
+        deck_id=deck_id,
+    )
+    return state, batch_id
 
 
-async def test_add_skip_rejects_a_stale_cursor(session_factory):
-    state = await _start_review(session_factory, [WORD_CANDIDATE, PATTERN_CANDIDATE])
-    callback = make_callback("add:skip:1")  # cursor is actually 0
-
-    await add_skip(callback, state)
-
-    callback.answer.assert_awaited_once_with("Эта карточка уже обработана.", show_alert=True)
-    data = await state.get_data()
-    assert data["cursor"] == 0
-
-
-async def test_add_keep_saves_a_word_note_with_resolved_forms(session_factory, monkeypatch):
+async def test_chat_add_keep_saves_a_word_note_with_resolved_forms_and_the_active_deck(
+    session_factory, monkeypatch
+):
     monkeypatch.setattr(
         "kielikaveri.bot.add.resolve_note_forms",
         AsyncMock(
@@ -338,74 +304,95 @@ async def test_add_keep_saves_a_word_note_with_resolved_forms(session_factory, m
             )
         ),
     )
-    state = await _start_review(session_factory, [WORD_CANDIDATE])
-    callback = make_callback("add:keep:0")
+    state, batch_id = await _start_batch(session_factory, [WORD_CANDIDATE])
+    callback = make_callback(f"chat:add:{batch_id}:0")
 
-    await add_keep(callback, state, session_factory, make_settings(), make_breaker())
+    await chat_add_keep(callback, state, session_factory, make_settings(), make_breaker())
 
     async with session_factory() as session:
         notes = (await session.scalars(select(Note))).all()
     assert len(notes) == 1
     assert notes[0].lemma == "hakea"
     assert notes[0].meta["principal_forms"] == {"preesens_1s": "haen"}
-    assert notes[0].meta["forms_source"] == "fst"
     assert notes[0].meta["origin"] == "text"
+    assert notes[0].deck_id is not None
     assert notes[0].source_id is not None
 
     async with session_factory() as session:
         sources = (await session.scalars(select(Source))).all()
     assert len(sources) == 1
     assert sources[0].context_fi == "Haen töitä."
-
-
-async def test_add_keep_word_with_unsupported_pos_saves_instead_of_crashing(session_factory):
-    # Regression: forms_for_pos()/generate_forms() only cover
-    # verbi/substantiivi/adjektiivi. A "word" candidate tagged with any other
-    # note.pos (adverbi here) used to raise ValueError straight out of
-    # resolve_note_forms, uncaught by add_keep's except clauses - the
-    # confirmation flow died with the callback never answered. Runs the real
-    # ingest.resolve_note_forms (no monkeypatch) to exercise the actual path.
-    candidate = {**WORD_CANDIDATE, "lemma": "kuitenkin", "pos": "adverbi"}
-    state = await _start_review(session_factory, [candidate])
-    callback = make_callback("add:keep:0")
-
-    await add_keep(callback, state, session_factory, make_settings(), make_breaker())
-
-    async with session_factory() as session:
-        notes = (await session.scalars(select(Note))).all()
-    assert len(notes) == 1
-    assert notes[0].meta["forms_source"] == "llm"
-    assert notes[0].meta["forms_verified"] is False
     callback.answer.assert_awaited_once_with("Добавлено.")
 
 
-async def test_add_keep_pattern_kind_skips_the_llm_form_call(session_factory, monkeypatch):
-    resolve = AsyncMock()
-    monkeypatch.setattr("kielikaveri.bot.add.resolve_note_forms", resolve)
-    state = await _start_review(session_factory, [PATTERN_CANDIDATE])
-    callback = make_callback("add:keep:0")
+async def test_chat_add_keep_rejects_a_stale_batch_id(session_factory):
+    state, _batch_id = await _start_batch(session_factory, [WORD_CANDIDATE])
+    callback = make_callback("chat:add:old-batch:0")
 
-    await add_keep(callback, state, session_factory, make_settings(), make_breaker())
+    await chat_add_keep(callback, state, session_factory, make_settings(), make_breaker())
 
-    resolve.assert_not_called()
+    callback.answer.assert_awaited_once_with(
+        "Эта подборка уже неактуальна - пришли текст ещё раз.", show_alert=True
+    )
     async with session_factory() as session:
-        notes = (await session.scalars(select(Note))).all()
-    assert notes[0].meta["forms_source"] == "llm"
-    assert notes[0].meta["forms_verified"] is False
+        assert (await session.scalars(select(Note))).all() == []
 
 
-async def test_add_keep_reuses_one_source_across_a_batch(session_factory, monkeypatch):
+async def test_chat_add_keep_rejects_an_already_added_index(session_factory, monkeypatch):
     monkeypatch.setattr(
         "kielikaveri.bot.add.resolve_note_forms",
         AsyncMock(return_value=(ResolvedForms({}, "fst", True), None)),
     )
-    state = await _start_review(session_factory, [WORD_CANDIDATE, PATTERN_CANDIDATE])
+    state, batch_id = await _start_batch(session_factory, [WORD_CANDIDATE])
+    callback_1 = make_callback(f"chat:add:{batch_id}:0")
+    callback_2 = make_callback(f"chat:add:{batch_id}:0")
 
-    await add_keep(
-        make_callback("add:keep:0"), state, session_factory, make_settings(), make_breaker()
+    await chat_add_keep(callback_1, state, session_factory, make_settings(), make_breaker())
+    await chat_add_keep(callback_2, state, session_factory, make_settings(), make_breaker())
+
+    callback_2.answer.assert_awaited_once_with("Уже добавлено.", show_alert=True)
+    async with session_factory() as session:
+        assert len((await session.scalars(select(Note))).all()) == 1
+
+
+async def test_chat_add_keep_can_save_candidates_out_of_order(session_factory, monkeypatch):
+    # Not sequential any more - the second candidate can be added before the
+    # first, unlike the old cursor-based swipe.
+    monkeypatch.setattr(
+        "kielikaveri.bot.add.resolve_note_forms",
+        AsyncMock(return_value=(ResolvedForms({}, "fst", True), None)),
     )
-    await add_keep(
-        make_callback("add:keep:1"), state, session_factory, make_settings(), make_breaker()
+    state, batch_id = await _start_batch(session_factory, [WORD_CANDIDATE, PATTERN_CANDIDATE])
+    callback = make_callback(f"chat:add:{batch_id}:1")
+
+    await chat_add_keep(callback, state, session_factory, make_settings(), make_breaker())
+
+    async with session_factory() as session:
+        notes = (await session.scalars(select(Note))).all()
+    assert len(notes) == 1
+    assert notes[0].lemma == "hakea + partitiivi"
+
+
+async def test_chat_add_keep_reuses_one_source_across_a_batch(session_factory, monkeypatch):
+    monkeypatch.setattr(
+        "kielikaveri.bot.add.resolve_note_forms",
+        AsyncMock(return_value=(ResolvedForms({}, "fst", True), None)),
+    )
+    state, batch_id = await _start_batch(session_factory, [WORD_CANDIDATE, PATTERN_CANDIDATE])
+
+    await chat_add_keep(
+        make_callback(f"chat:add:{batch_id}:0"),
+        state,
+        session_factory,
+        make_settings(),
+        make_breaker(),
+    )
+    await chat_add_keep(
+        make_callback(f"chat:add:{batch_id}:1"),
+        state,
+        session_factory,
+        make_settings(),
+        make_breaker(),
     )
 
     async with session_factory() as session:
@@ -415,15 +402,17 @@ async def test_add_keep_reuses_one_source_across_a_batch(session_factory, monkey
     assert {n.source_id for n in notes} == {sources[0].id}
 
 
-async def test_add_keep_reports_a_tripped_breaker_and_does_not_save(session_factory, monkeypatch):
+async def test_chat_add_keep_reports_a_tripped_breaker_and_does_not_save(
+    session_factory, monkeypatch
+):
     monkeypatch.setattr(
         "kielikaveri.bot.add.resolve_note_forms",
         AsyncMock(side_effect=CircuitOpenError("stopped")),
     )
-    state = await _start_review(session_factory, [WORD_CANDIDATE])
-    callback = make_callback("add:keep:0")
+    state, batch_id = await _start_batch(session_factory, [WORD_CANDIDATE])
+    callback = make_callback(f"chat:add:{batch_id}:0")
 
-    await add_keep(callback, state, session_factory, make_settings(), make_breaker())
+    await chat_add_keep(callback, state, session_factory, make_settings(), make_breaker())
 
     callback.answer.assert_awaited_once_with(
         "Предохранитель сработал - карточка не сохранена.", show_alert=True
@@ -432,15 +421,17 @@ async def test_add_keep_reports_a_tripped_breaker_and_does_not_save(session_fact
         assert (await session.scalars(select(Note))).all() == []
 
 
-async def test_add_keep_reports_openai_unavailable_and_does_not_save(session_factory, monkeypatch):
+async def test_chat_add_keep_reports_openai_unavailable_and_does_not_save(
+    session_factory, monkeypatch
+):
     monkeypatch.setattr(
         "kielikaveri.bot.add.resolve_note_forms",
         AsyncMock(side_effect=openai.APIConnectionError(request=SimpleNamespace())),
     )
-    state = await _start_review(session_factory, [WORD_CANDIDATE])
-    callback = make_callback("add:keep:0")
+    state, batch_id = await _start_batch(session_factory, [WORD_CANDIDATE])
+    callback = make_callback(f"chat:add:{batch_id}:0")
 
-    await add_keep(callback, state, session_factory, make_settings(), make_breaker())
+    await chat_add_keep(callback, state, session_factory, make_settings(), make_breaker())
 
     callback.answer.assert_awaited_once_with(
         "OpenAI недоступен - карточка не сохранена, попробуй позже.", show_alert=True
@@ -449,22 +440,19 @@ async def test_add_keep_reports_openai_unavailable_and_does_not_save(session_fac
         assert (await session.scalars(select(Note))).all() == []
 
 
-async def test_add_keep_rejects_a_schema_invalid_note(session_factory, monkeypatch):
+async def test_chat_add_keep_rejects_a_schema_invalid_note(session_factory, monkeypatch):
     monkeypatch.setattr(
         "kielikaveri.bot.add.resolve_note_forms",
         AsyncMock(return_value=(ResolvedForms({}, "fst", True), None)),
     )
-    # Stand in for a malformed LLM candidate without hand-building one -
-    # build_full_note is exercised on its own in test_ingest.py, here we
-    # only need *some* result that fails cards/schema.json's note validator.
     monkeypatch.setattr(
         "kielikaveri.bot.add.build_full_note",
         lambda candidate, resolved: {"lemma": "hakea"},
     )
-    state = await _start_review(session_factory, [WORD_CANDIDATE])
-    callback = make_callback("add:keep:0")
+    state, batch_id = await _start_batch(session_factory, [WORD_CANDIDATE])
+    callback = make_callback(f"chat:add:{batch_id}:0")
 
-    await add_keep(callback, state, session_factory, make_settings(), make_breaker())
+    await chat_add_keep(callback, state, session_factory, make_settings(), make_breaker())
 
     callback.answer.assert_awaited_once_with(
         "Не удалось сохранить - невалидные данные от модели.", show_alert=True
@@ -473,25 +461,23 @@ async def test_add_keep_rejects_a_schema_invalid_note(session_factory, monkeypat
         assert (await session.scalars(select(Note))).all() == []
 
 
-async def test_add_keep_rejects_a_stale_cursor(session_factory):
-    state = await _start_review(session_factory, [WORD_CANDIDATE, PATTERN_CANDIDATE])
-    callback = make_callback("add:keep:1")  # cursor is actually 0
-
-    await add_keep(callback, state, session_factory, make_settings(), make_breaker())
-
-    callback.answer.assert_awaited_once_with("Эта карточка уже обработана.", show_alert=True)
-    async with session_factory() as session:
-        assert (await session.scalars(select(Note))).all() == []
-
-
-# --- stray callback -------------------------------------------------------------------
-
-
-async def test_add_stray_callback_after_the_session_ended():
-    callback = make_callback("add:keep:0")
-
-    await add_stray_callback(callback)
-
-    callback.answer.assert_awaited_once_with(
-        "Эта сессия добавления уже неактуальна - начните заново через /add", show_alert=True
+async def test_chat_add_keep_saves_into_the_users_active_deck(session_factory, monkeypatch):
+    monkeypatch.setattr(
+        "kielikaveri.bot.add.resolve_note_forms",
+        AsyncMock(return_value=(ResolvedForms({}, "fst", True), None)),
     )
+    async with session_factory() as session:
+        deck_a = await create_deck(session, 1, "Общая")
+        deck_b = await create_deck(session, 1, "Из книги")
+        await set_active_deck(session, 1, deck_b.id)
+        await session.commit()
+
+    state, batch_id = await _start_batch(session_factory, [WORD_CANDIDATE], deck_id=deck_b.id)
+    callback = make_callback(f"chat:add:{batch_id}:0")
+
+    await chat_add_keep(callback, state, session_factory, make_settings(), make_breaker())
+
+    async with session_factory() as session:
+        note = (await session.scalars(select(Note))).one()
+    assert note.deck_id == deck_b.id
+    assert note.deck_id != deck_a.id
