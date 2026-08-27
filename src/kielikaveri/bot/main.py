@@ -20,6 +20,7 @@ from kielikaveri.llm.breaker import CallBreaker
 BOT_COMMANDS = [
     BotCommand(command="learn", description="Повторить карточки"),
     BotCommand(command="add", description="Добавить слова из текста"),
+    BotCommand(command="delete", description="Удалить слово"),
     BotCommand(command="decks", description="Колоды"),
     BotCommand(command="stats", description="Статистика"),
     BotCommand(command="help", description="Справка"),

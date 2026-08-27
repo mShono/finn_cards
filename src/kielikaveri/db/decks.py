@@ -7,6 +7,7 @@ target. It never changes FSRS scheduling itself (see srs/queue.py).
 from __future__ import annotations
 
 from sqlalchemy import select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from kielikaveri.db.models import Deck, User
@@ -52,10 +53,11 @@ async def active_deck(session: AsyncSession, user_id: int) -> Deck:
 async def set_active_deck(session: AsyncSession, user_id: int, deck_id: str) -> None:
     # Telegram users have no guaranteed `users` row (see import_cards.py -
     # only the CLI importer creates one; the live bot never has, and SQLite's
-    # FK isn't enforced here) - create it on first deck pick rather than
-    # assuming it exists.
-    user = await session.get(User, user_id)
-    if user is None:
-        user = User(id=user_id)
-        session.add(user)
-    user.last_deck_id = deck_id
+    # FK isn't enforced here) - upsert rather than get-then-insert: two
+    # concurrent first-ever saves for the same brand new user (e.g. a resent
+    # identical message, see test_chat_concurrent_identical_text_...) would
+    # otherwise both see no row, both insert, and the second commit dies on
+    # users.id's primary key.
+    stmt = sqlite_insert(User).values(id=user_id, last_deck_id=deck_id)
+    stmt = stmt.on_conflict_do_update(index_elements=[User.id], set_={"last_deck_id": deck_id})
+    await session.execute(stmt)
