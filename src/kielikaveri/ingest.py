@@ -75,30 +75,71 @@ def _chat_schema(note_schema: dict) -> dict:
     return {
         "type": "object",
         "additionalProperties": False,
-        "required": ["reply_ru", "candidates"],
+        "required": ["reply_ru", "needs_clarification", "candidates"],
         "properties": {
             "reply_ru": {"type": "string"},
+            "needs_clarification": {"type": "boolean"},
             "candidates": {"type": "array", "items": note_strict},
         },
     }
 
 
-def _chat_instructions() -> str:
-    return (
+def _chat_instructions(*, is_follow_up: bool) -> str:
+    """`is_follow_up=True`: this call carries a student's answer to a clarifying
+    question this same function asked on a previous turn (see build_chat_input()) -
+    the model must act now, not ask a second time.
+    """
+    text = (
         INSTRUCTIONS_PATH.read_text() + "\n\n---\n\n"
-        "Ты - разговорный ассистент по финскому в Telegram-боте. Пользователь "
-        "пишет одним сообщением одно из трёх: (1) финский текст, из которого "
-        "нужно набрать карточки; (2) свой перевод текста (на финский или с "
-        "финского) - сверь его с оригиналом или со смыслом и разбери "
-        "неточности; (3) обычный вопрос про язык.\n\n"
-        "В `reply_ru` - разговорный ответ на русском: для перевода - "
-        "перечисли неточности (что не так и почему) и дай исправленный "
-        "вариант; для текста - коротко скажи, что нашла; для вопроса - "
-        "ответь на него. В `candidates` - карточки по правилам выше на ЛЮБУЮ "
-        "лексику и конструкции в сообщении, которые могут быть незнакомы "
-        "ученику или использованы неуверенно - не отсеивай агрессивно, лучше "
-        "предложить лишнее, чем пропустить нужное. Пустой список, если "
-        "предлагать нечего (например, чистый вопрос без нового текста)."
+        "Ты - разговорный ассистент по финскому в Telegram-боте. Один ход - "
+        "одно сообщение ученика. Определи, что перед тобой, и веди себя по "
+        "одному из трёх сценариев:\n\n"
+        "1. **Сообщение уже содержит инструкцию** - свой перевод текста (на "
+        "финский или с финского) на проверку, явная просьба перевести "
+        "конкретное слово/фразу ('как будет...', 'переведи...'), или явная "
+        "просьба добавить конкретные слова в карточки. Действуй сразу: для "
+        "перевода на проверку - перечисли неточности (что не так и почему) и "
+        "дай исправленный вариант в `reply_ru`; для просьбы перевести - "
+        "переведи именно названное; для просьбы добавить - подтверди в "
+        "`reply_ru`. `needs_clarification: false`. В `candidates` - карточки "
+        "**только** по тем словам/фразам, которые ученик сам назвал или "
+        "перевёл неточно - никогда не добавляй лишнюю лексику из текста "
+        "'на всякий случай', даже если она выше уровня ученика.\n\n"
+        "2. **Голый финский текст или фраза без инструкции** - непонятно, "
+        "что с ним делать. Ничего не переводи и не разбирай. "
+        "`needs_clarification: true`, `candidates: []`, а в `reply_ru` - "
+        "короткий вопрос: пришлёт ли ученик свой перевод этого текста на "
+        "проверку, или сам назовёт слова/фразы, которые перевести или "
+        "добавить в карточки.\n\n"
+        "3. **Обычный вопрос про язык, не про новый текст** - ответь на него "
+        "в `reply_ru`. `needs_clarification: false`, `candidates: []`.\n\n"
+        "Важно для `lemma` и `example_fi` в любом кандидате: только финские "
+        "слова и предложения. Никогда не подставляй английский или русский "
+        "перевод вместо финской леммы (проверяй сам себя - лемма должна быть "
+        "словом финского языка, а не его переводом)."
+    )
+    if is_follow_up:
+        text += (
+            "\n\n---\n\nЭто продолжение диалога: на предыдущем ходу ты уже "
+            "получила сценарий 2 и спросила, что делать с текстом - входные "
+            "данные ниже содержат исходный текст и ответ ученика на твой "
+            "вопрос. Действуй по этому ответу как по сценарию 1 - "
+            "`needs_clarification` обязан быть false, второй раз "
+            "переспрашивать нельзя."
+        )
+    return text
+
+
+def build_chat_input(text: str, context_text: str | None) -> str:
+    """The literal model input for one turn - also the cache key basis (see
+    hash_text() callers in bot/add.py), so this is the single place that
+    combines a follow-up reply with the original text it answers.
+    """
+    if context_text is None:
+        return text
+    return (
+        f"Исходный текст ученика:\n{context_text}\n\n"
+        f"Ответ ученика на мой вопрос, что с ним сделать:\n{text}"
     )
 
 
@@ -114,20 +155,36 @@ def _usage_from(response) -> TokenUsage:
     )
 
 
-async def get_cached_chat(session: AsyncSession, text_hash: str) -> tuple[str, list[dict]] | None:
+async def get_cached_chat(
+    session: AsyncSession, text_hash: str
+) -> tuple[str, bool, list[dict]] | None:
     cached = await session.get(IngestCache, text_hash)
     # reply_ru is None for rows written before this field existed (see
     # models.py) - treat those as a miss rather than replaying an empty reply.
     if cached is None or cached.reply_ru is None:
         return None
-    return cached.reply_ru, cached.candidates
+    # needs_clarification is None for rows written before that column existed -
+    # those rows always came from a call that acted immediately, never asked
+    # back, so False reproduces their actual behavior.
+    return cached.reply_ru, bool(cached.needs_clarification), cached.candidates
 
 
 async def store_cached_chat(
-    session: AsyncSession, text_hash: str, model: str, reply_ru: str, candidates: list[dict]
+    session: AsyncSession,
+    text_hash: str,
+    model: str,
+    reply_ru: str,
+    needs_clarification: bool,
+    candidates: list[dict],
 ) -> None:
     session.add(
-        IngestCache(text_hash=text_hash, model=model, reply_ru=reply_ru, candidates=candidates)
+        IngestCache(
+            text_hash=text_hash,
+            model=model,
+            reply_ru=reply_ru,
+            needs_clarification=needs_clarification,
+            candidates=candidates,
+        )
     )
 
 
@@ -137,13 +194,19 @@ async def check_and_suggest(
     model: str,
     text: str,
     now: datetime,
-) -> tuple[str, list[dict], TokenUsage]:
-    """One chat message in, a reply plus note candidates out. Raises CircuitOpenError via breaker."""
+    context_text: str | None = None,
+) -> tuple[str, bool, list[dict], TokenUsage]:
+    """One chat message in, a reply plus note candidates out. Raises CircuitOpenError via breaker.
+
+    `context_text` is set only for a follow-up turn answering this function's
+    own previous clarifying question - see build_chat_input() and
+    _chat_instructions(is_follow_up=...).
+    """
     breaker.check(now)
     response = await client.responses.create(
         model=model,
-        instructions=_chat_instructions(),
-        input=text,
+        instructions=_chat_instructions(is_follow_up=context_text is not None),
+        input=build_chat_input(text, context_text),
         text={
             "format": {
                 "type": "json_schema",
@@ -157,14 +220,15 @@ async def check_and_suggest(
     usage = _usage_from(response)
     logger.info(
         "ingest.check_and_suggest model=%s input_tokens=%d output_tokens=%d total_tokens=%d "
-        "candidates=%d",
+        "needs_clarification=%s candidates=%d",
         model,
         usage.input_tokens,
         usage.output_tokens,
         usage.total_tokens,
+        payload["needs_clarification"],
         len(payload["candidates"]),
     )
-    return payload["reply_ru"], payload["candidates"], usage
+    return payload["reply_ru"], payload["needs_clarification"], payload["candidates"], usage
 
 
 async def resolve_ambiguous_forms(

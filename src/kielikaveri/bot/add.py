@@ -1,11 +1,20 @@
-"""Conversational card creation (plan 3.11, "Текст", v2).
+"""Conversational card creation (plan: /add redesign).
 
 Any plain message - pasted Finnish text, a translation attempt, a plain
 question - goes to one LLM call (ingest.check_and_suggest) that replies in
-chat *and* proposes note candidates in the same response. Candidates are
-shown all at once, each with its own "add" button - no forced one-by-one
-swipe, no filtering down to a fixed list the learner then has to click
-through hoping the word they wanted is in it.
+chat and decides for itself whether it has enough to act on. A bare Finnish
+text with no instruction gets a clarifying question instead of an unsolicited
+translation or a dumped candidate list (`needs_clarification`, see
+ingest._chat_instructions) - the student says what to do with it (translate
+it herself for checking, or name specific words/phrases to translate or add),
+and that answer is resolved in a follow-up call carrying the original text as
+context (AddStates.awaiting_instruction).
+
+Candidates only ever come from something the student explicitly asked for -
+never "extra vocabulary from the text, just in case". Saving them asks which
+deck first when there is more than one (AddStates.choosing_deck), then
+reports what actually landed where, rather than a silent per-candidate
+"add" button.
 
 Must fail honestly, never crash the bot, when OpenAI is unreachable or the
 breaker trips - /learn has no LLM dependency and must keep working regardless
@@ -23,16 +32,19 @@ import openai
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from kielikaveri.bot.text import split_message
 from kielikaveri.config import Settings
-from kielikaveri.db.decks import active_deck
-from kielikaveri.db.models import Note, Source, SourceType
+from kielikaveri.db.decks import active_deck, list_decks, set_active_deck
+from kielikaveri.db.models import Card, Deck, Note, Review, Source, SourceType
 from kielikaveri.import_cards import load_validator
 from kielikaveri.ingest import (
+    build_chat_input,
     build_full_note,
     canonical_key,
     check_and_suggest,
@@ -57,18 +69,11 @@ ADD_BUTTON_TEXT = "💬 Добавить"
 ADD_PROMPT = "Просто напиши мне текст на финском или свой перевод - отвечу в чате."
 
 
-def _render_candidate(candidate: dict) -> str:
-    pos = candidate.get("pos")
-    head = f"🇫🇮 {candidate['lemma']}" + (f" ({pos})" if pos else "")
-    return f"{head}\n{candidate['translation_ru']}\n\n{candidate['example_fi']}\n{candidate['example_ru']}"
-
-
-def _keep_keyboard(batch_id: str, idx: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Добавить", callback_data=f"chat:add:{batch_id}:{idx}")]
-        ]
-    )
+class AddStates(StatesGroup):
+    # Data: pending_text - the Finnish text the clarifying question was about.
+    awaiting_instruction = State()
+    # Data: batch_id, candidates, source_id - waiting for a deck pick before saving.
+    choosing_deck = State()
 
 
 @router.message(F.text == ADD_BUTTON_TEXT)
@@ -89,6 +94,101 @@ async def add_command(
         await message.answer(ADD_PROMPT)
         return
     await _handle_chat_turn(message, state, session_factory, settings, breaker, command.args)
+
+
+@router.message(Command("delete"))
+async def delete_command(
+    message: Message,
+    command: CommandObject,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    word = (command.args or "").strip()
+    if not word:
+        await message.answer("Какое слово удалить? Например: /delete naapuri")
+        return
+
+    user_id = message.from_user.id
+    async with session_factory() as session:
+        # Matched in Python, not SQL: SQLite's built-in lower() only folds
+        # ASCII, so func.lower('Äiti') stays 'Äiti' and would never match a
+        # user typing "äiti" - str.lower() handles Finnish's ä/ö/å correctly.
+        all_notes = (await session.scalars(select(Note).where(Note.user_id == user_id))).all()
+        word_lower = word.lower()
+        notes = [note for note in all_notes if note.lemma.lower() == word_lower]
+        if not notes:
+            await message.answer("Не нашла такое слово.")
+            return
+
+        rows = []
+        for note in notes:
+            deck = await session.get(Deck, note.deck_id) if note.deck_id else None
+            deck_name = deck.name if deck else "без колоды"
+            pos_suffix = f" ({note.pos})" if note.pos else ""
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=f"🗑 {note.lemma}{pos_suffix} - «{deck_name}»",
+                        callback_data=f"delnote:{note.id}",
+                    )
+                ]
+            )
+    rows.append([InlineKeyboardButton(text="Отмена", callback_data="delnote:cancel")])
+    await message.answer("Что удалить?", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data == "delnote:cancel")
+async def delete_cancel(callback: CallbackQuery) -> None:
+    await callback.answer("Отменено.")
+
+
+@router.callback_query(F.data.startswith("delnote:"))
+async def delete_confirm(
+    callback: CallbackQuery, session_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    note_id = callback.data.split(":", 1)[1]
+    async with session_factory() as session:
+        note = await session.get(Note, note_id)
+        if note is None or note.user_id != callback.from_user.id:
+            await callback.answer("Уже удалено.", show_alert=True)
+            return
+
+        lemma = note.lemma
+        deck_id = note.deck_id
+        deck = await session.get(Deck, deck_id) if deck_id else None
+        deck_name = deck.name if deck else "без колоды"
+
+        # Two callback_query updates for one genuine double-tap both pass the
+        # None-check above (neither has committed yet) - same race class as
+        # learn_rate/ingest_cache. There's no FSM state to claim ahead of the
+        # first await here (the note to delete isn't known until session.get()
+        # itself returns), so the DELETE's rowcount is the guard instead: only
+        # the invocation that actually removed a row may report success or
+        # touch its cards/reviews.
+        result = await session.execute(delete(Note).where(Note.id == note.id))
+        if result.rowcount == 0:
+            await session.rollback()
+            await callback.answer("Уже удалено.", show_alert=True)
+            return
+
+        # No ON DELETE CASCADE anywhere (db/models.py) - a Card left pointing
+        # at a deleted note_id would make learn.py's render_card crash on the
+        # next session.get(Note, ...) returning None.
+        card_ids = (await session.scalars(select(Card.id).where(Card.note_id == note.id))).all()
+        if card_ids:
+            await session.execute(delete(Review).where(Review.card_id.in_(card_ids)))
+            await session.execute(delete(Card).where(Card.id.in_(card_ids)))
+        await session.commit()
+
+        count = 0
+        if deck_id is not None:
+            count = await session.scalar(
+                select(func.count()).select_from(Note).where(Note.deck_id == deck_id)
+            )
+
+    await callback.answer()
+    await callback.message.answer(
+        f"Удалила «{lemma}» из колоды «{deck_name}». Осталось {count} слов."
+    )
 
 
 @router.message(F.text & ~F.text.startswith("/"))
@@ -117,20 +217,27 @@ async def _handle_chat_turn(
         await message.answer("Ответить не могу - не настроен OpenAI.")
         return
 
+    current_state = await state.get_state()
+    context_text: str | None = None
+    if current_state == AddStates.awaiting_instruction.state:
+        data = await state.get_data()
+        context_text = data.get("pending_text")
+        await state.clear()
+
     now = datetime.now(UTC)
-    text_hash = hash_text(text)
+    text_hash = hash_text(build_chat_input(text, context_text))
 
     async with session_factory() as session:
         cached = await get_cached_chat(session, text_hash)
 
     if cached is not None:
         logger.info("chat cache hit hash=%s", text_hash)
-        reply_ru, candidates = cached
+        reply_ru, needs_clarification, candidates = cached
     else:
         client = make_client(settings.openai_api_key, settings.openai_timeout_seconds)
         try:
-            reply_ru, candidates, _usage = await check_and_suggest(
-                client, breaker, settings.openai_text_model, text, now
+            reply_ru, needs_clarification, candidates, _usage = await check_and_suggest(
+                client, breaker, settings.openai_text_model, text, now, context_text=context_text
             )
         except CircuitOpenError:
             await message.answer(
@@ -147,12 +254,17 @@ async def _handle_chat_turn(
 
         async with session_factory() as session:
             await store_cached_chat(
-                session, text_hash, settings.openai_text_model, reply_ru, candidates
+                session,
+                text_hash,
+                settings.openai_text_model,
+                reply_ru,
+                needs_clarification,
+                candidates,
             )
             try:
                 await session.commit()
             except IntegrityError:
-                # A concurrent turn for the same text (double-tap, a resent
+                # A concurrent turn for the same input (double-tap, a resent
                 # message) already cached it first - text_hash is the PK.
                 # Our own freshly generated result is still valid to show,
                 # there's just nothing left to store.
@@ -168,17 +280,22 @@ async def _handle_chat_turn(
     for chunk in reply_chunks:
         await message.answer(chunk)
 
+    if needs_clarification:
+        # context_text is the text this very question is about, even on a
+        # (should-not-happen) second clarification round after a follow-up.
+        await state.set_state(AddStates.awaiting_instruction)
+        await state.update_data(pending_text=context_text or text)
+        return
+
     if not candidates:
         return
 
     user_id = message.from_user.id
     async with session_factory() as session:
         existing = await existing_note_keys(session, user_id)
-        deck = await active_deck(session, user_id)
-        await session.commit()  # active_deck() may have just created a default deck
 
     seen: set[tuple[str, str | None]] = set()
-    to_review: list[dict] = []
+    to_add: list[dict] = []
     duplicates = 0
     for candidate in candidates:
         key = canonical_key(candidate["lemma"], candidate.get("pos"))
@@ -186,128 +303,171 @@ async def _handle_chat_turn(
             duplicates += 1
             continue
         seen.add(key)
-        to_review.append(candidate)
+        to_add.append(candidate)
 
-    if not to_review:
+    if not to_add:
         if duplicates:
             await message.answer(f"Все {duplicates} кандидатов уже есть в базе.")
         return
 
-    # Created here, once, rather than lazily on the first "add" tap: unlike
-    # the old sequential swipe, candidates in a batch are all actionable at
-    # once, so two taps on different candidates can race - both would see
-    # source_id=None and create their own Source otherwise.
+    quote_text = context_text or text
     async with session_factory() as session:
         source = Source(
             type=SourceType.other,
             ref=f"Telegram чат, {now.date().isoformat()}",
-            context_fi=text[:SOURCE_QUOTE_CHARS],
+            context_fi=quote_text[:SOURCE_QUOTE_CHARS],
         )
         session.add(source)
         await session.commit()
         source_id = source.id
+        decks = await list_decks(session, user_id)
+
+    if len(decks) <= 1:
+        async with session_factory() as session:
+            deck = await active_deck(session, user_id)
+            await session.commit()
+        await _save_candidates_and_report(
+            message, session_factory, settings, breaker, user_id, deck.id, source_id, to_add
+        )
+        return
 
     batch_id = str(uuid.uuid4())
-    await state.update_data(
-        batch_id=batch_id,
-        candidates=to_review,
-        added=[],
-        source_id=source_id,
-        deck_id=deck.id,
+    await state.set_state(AddStates.choosing_deck)
+    await state.update_data(batch_id=batch_id, candidates=to_add, source_id=source_id)
+    await message.answer(
+        "В какую колоду добавить?", reply_markup=_deck_choice_keyboard(decks, batch_id)
     )
 
-    await message.answer(f"Добавляю в колоду «{deck.name}» (сменить: /decks):")
-    for idx, candidate in enumerate(to_review):
-        await message.answer(
-            _render_candidate(candidate), reply_markup=_keep_keyboard(batch_id, idx)
-        )
+
+def _deck_choice_keyboard(decks: list[Deck], batch_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=deck.name, callback_data=f"adddeck:{batch_id}:{deck.id}")]
+            for deck in decks
+        ]
+    )
 
 
-@router.callback_query(F.data.startswith("chat:add:"))
-async def chat_add_keep(
+@router.callback_query(F.data.startswith("adddeck:"), AddStates.choosing_deck)
+async def add_deck_choice(
     callback: CallbackQuery,
     state: FSMContext,
     session_factory: async_sessionmaker[AsyncSession],
     settings: Settings,
     breaker: CallBreaker,
 ) -> None:
-    _, _, batch_id, idx_raw = callback.data.split(":", 3)
-    idx = int(idx_raw)
+    _, batch_id, deck_id = callback.data.split(":", 2)
     data = await state.get_data()
-
-    candidates: list[dict] = data.get("candidates", [])
-    added: list[int] = data.get("added", [])
-    if data.get("batch_id") != batch_id or idx >= len(candidates):
+    if data.get("batch_id") != batch_id:
         await callback.answer(
             "Эта подборка уже неактуальна - пришли текст ещё раз.", show_alert=True
         )
         return
-    if idx in added:
-        await callback.answer("Уже добавлено.", show_alert=True)
-        return
 
-    # Claim the index before the first await - same double-tap race guard as
-    # learn.py's learn_rate: two callback_query updates for one genuine
-    # double-tap would otherwise both pass the checks above and both save.
-    await state.update_data(added=[*added, idx])
-
-    candidate = candidates[idx]
+    candidates: list[dict] = data.get("candidates", [])
+    source_id = data.get("source_id")
     user_id = callback.from_user.id
+    await state.clear()
+    await callback.answer()
+
+    await _save_candidates_and_report(
+        callback.message,
+        session_factory,
+        settings,
+        breaker,
+        user_id,
+        deck_id,
+        source_id,
+        candidates,
+    )
+
+
+@router.callback_query(F.data.startswith("adddeck:"))
+async def add_deck_choice_stray(callback: CallbackQuery) -> None:
+    # Reaches here only when the picker is tapped outside choosing_deck - a
+    # batch from a session that already resolved or expired.
+    await callback.answer("Эта подборка уже неактуальна - пришли текст ещё раз.", show_alert=True)
+
+
+async def _save_candidates_and_report(
+    answer_to: Message,
+    session_factory: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    breaker: CallBreaker,
+    user_id: int,
+    deck_id: str,
+    source_id: str,
+    candidates: list[dict],
+) -> None:
     now = datetime.now(UTC)
 
-    resolved = None
-    if candidate["kind"] == "word":
-        client = make_client(settings.openai_api_key, settings.openai_timeout_seconds)
-        try:
-            resolved, _usage = await resolve_note_forms(
-                client,
-                breaker,
-                settings.openai_text_model,
-                candidate["lemma"],
-                candidate["pos"],
-                now,
-            )
-        except CircuitOpenError:
-            await callback.answer(
-                "Предохранитель сработал - карточка не сохранена.", show_alert=True
-            )
-            return
-        except openai.APIError:
-            logger.exception("ingest.resolve_note_forms failed lemma=%s", candidate["lemma"])
-            await callback.answer(
-                "OpenAI недоступен - карточка не сохранена, попробуй позже.", show_alert=True
-            )
-            return
-
-    full_note = build_full_note(candidate, resolved)
-
-    try:
-        load_validator().validate(full_note)
-    except jsonschema.ValidationError:
-        logger.exception(
-            "ingest candidate failed schema validation lemma=%s", candidate.get("lemma")
-        )
-        await callback.answer(
-            "Не удалось сохранить - невалидные данные от модели.", show_alert=True
-        )
-        return
-
     async with session_factory() as session:
-        session.add(
-            Note(
-                id=full_note["id"],
-                user_id=user_id,
-                lemma=full_note["lemma"],
-                pos=full_note.get("pos"),
-                translation_ru=full_note["translation_ru"],
-                example_fi=full_note["example_fi"],
-                example_ru=full_note["example_ru"],
-                kind=full_note["kind"],
-                source_id=data["source_id"],
-                deck_id=data["deck_id"],
-                meta=full_note["meta"],
-            )
-        )
-        await session.commit()
+        deck = await session.get(Deck, deck_id)
+        deck_name = deck.name if deck else "?"
 
-    await callback.answer("Добавлено.")
+    saved: list[tuple[str, str]] = []
+    failed: list[tuple[str, str]] = []
+    for candidate in candidates:
+        resolved = None
+        if candidate["kind"] == "word":
+            client = make_client(settings.openai_api_key, settings.openai_timeout_seconds)
+            try:
+                resolved, _usage = await resolve_note_forms(
+                    client,
+                    breaker,
+                    settings.openai_text_model,
+                    candidate["lemma"],
+                    candidate.get("pos"),
+                    now,
+                )
+            except CircuitOpenError:
+                failed.append((candidate["lemma"], "предохранитель сработал"))
+                continue
+            except openai.APIError:
+                logger.exception("ingest.resolve_note_forms failed lemma=%s", candidate["lemma"])
+                failed.append((candidate["lemma"], "OpenAI недоступен"))
+                continue
+
+        full_note = build_full_note(candidate, resolved)
+        try:
+            load_validator().validate(full_note)
+        except jsonschema.ValidationError:
+            logger.exception(
+                "ingest candidate failed schema validation lemma=%s", candidate.get("lemma")
+            )
+            failed.append((candidate["lemma"], "невалидные данные от модели"))
+            continue
+
+        async with session_factory() as session:
+            session.add(
+                Note(
+                    id=full_note["id"],
+                    user_id=user_id,
+                    lemma=full_note["lemma"],
+                    pos=full_note.get("pos"),
+                    translation_ru=full_note["translation_ru"],
+                    example_fi=full_note["example_fi"],
+                    example_ru=full_note["example_ru"],
+                    kind=full_note["kind"],
+                    source_id=source_id,
+                    deck_id=deck_id,
+                    meta=full_note["meta"],
+                )
+            )
+            await session.commit()
+        saved.append((full_note["lemma"], full_note["translation_ru"]))
+
+    lines = [f"🇫🇮 {lemma} → {translation}" for lemma, translation in saved]
+    if saved:
+        async with session_factory() as session:
+            await set_active_deck(session, user_id, deck_id)
+            count = await session.scalar(
+                select(func.count()).select_from(Note).where(Note.deck_id == deck_id)
+            )
+            await session.commit()
+        lines.append(f"\nКолода «{deck_name}»: теперь {count} слов.")
+    for lemma, reason in failed:
+        lines.append(f"Не удалось сохранить «{lemma}» - {reason}.")
+
+    if lines:
+        await answer_to.answer("\n".join(lines))

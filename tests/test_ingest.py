@@ -78,7 +78,7 @@ def test_canonical_key_pattern_kind_uses_the_raw_construction():
 def test_chat_schema_wraps_the_note_schema_and_excludes_fst_fields():
     schema = _chat_schema(_load_note_schema())
     assert schema["additionalProperties"] is False
-    assert schema["required"] == ["reply_ru", "candidates"]
+    assert schema["required"] == ["reply_ru", "needs_clarification", "candidates"]
     note_item = schema["properties"]["candidates"]["items"]
     assert "principal_forms" not in note_item["properties"]["meta"]["properties"]
     assert "origin" not in note_item["properties"]["meta"]["properties"]
@@ -91,22 +91,53 @@ async def test_check_and_suggest_parses_the_response_and_returns_usage():
     client = MagicMock()
     client.responses.create = AsyncMock(
         return_value=fake_response(
-            {"reply_ru": "Нашла кое-что.", "candidates": [{"lemma": "hakea"}]}
+            {
+                "reply_ru": "Нашла кое-что.",
+                "needs_clarification": False,
+                "candidates": [{"lemma": "hakea"}],
+            }
         )
     )
     breaker = make_breaker()
 
-    reply_ru, candidates, usage = await check_and_suggest(
+    reply_ru, needs_clarification, candidates, usage = await check_and_suggest(
         client, breaker, "gpt-5.6-terra", "text", NOW
     )
 
     assert reply_ru == "Нашла кое-что."
+    assert needs_clarification is False
     assert candidates == [{"lemma": "hakea"}]
     assert usage.input_tokens == 10
     assert usage.output_tokens == 5
     assert usage.total_tokens == 15
     client.responses.create.assert_called_once()
     assert client.responses.create.call_args.kwargs["model"] == "gpt-5.6-terra"
+    assert client.responses.create.call_args.kwargs["input"] == "text"
+
+
+async def test_check_and_suggest_combines_context_and_reply_for_a_follow_up_turn():
+    client = MagicMock()
+    client.responses.create = AsyncMock(
+        return_value=fake_response(
+            {"reply_ru": "Готово.", "needs_clarification": False, "candidates": []}
+        )
+    )
+    breaker = make_breaker()
+
+    await check_and_suggest(
+        client,
+        breaker,
+        "gpt-5.6-terra",
+        "переведи naapuri",
+        NOW,
+        context_text="Naapurit auttavat talkoissa.",
+    )
+
+    sent_input = client.responses.create.call_args.kwargs["input"]
+    assert "Naapurit auttavat talkoissa." in sent_input
+    assert "переведи naapuri" in sent_input
+    sent_instructions = client.responses.create.call_args.kwargs["instructions"]
+    assert "продолжение диалога" in sent_instructions
 
 
 async def test_check_and_suggest_respects_a_tripped_breaker():
@@ -267,12 +298,25 @@ async def test_cache_round_trips(session_factory):
         assert await get_cached_chat(session, "abc") is None
 
         await store_cached_chat(
-            session, "abc", "gpt-5.6-terra", "Нашла кое-что.", [{"lemma": "hakea"}]
+            session, "abc", "gpt-5.6-terra", "Нашла кое-что.", False, [{"lemma": "hakea"}]
         )
         await session.commit()
 
     async with session_factory() as session:
-        assert await get_cached_chat(session, "abc") == ("Нашла кое-что.", [{"lemma": "hakea"}])
+        assert await get_cached_chat(session, "abc") == (
+            "Нашла кое-что.",
+            False,
+            [{"lemma": "hakea"}],
+        )
+
+
+async def test_cache_round_trips_needs_clarification(session_factory):
+    async with session_factory() as session:
+        await store_cached_chat(session, "xyz", "gpt-5.6-terra", "Что с этим сделать?", True, [])
+        await session.commit()
+
+    async with session_factory() as session:
+        assert await get_cached_chat(session, "xyz") == ("Что с этим сделать?", True, [])
 
 
 async def test_cache_treats_a_pre_reply_ru_row_as_a_miss(session_factory):

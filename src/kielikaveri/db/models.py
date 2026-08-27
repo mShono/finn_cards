@@ -12,7 +12,7 @@ import enum
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import JSON, Enum, ForeignKey, Integer, String, TypeDecorator
+from sqlalchemy import JSON, Boolean, Enum, ForeignKey, Integer, String, TypeDecorator
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -190,6 +190,11 @@ class IngestCache(Base):
     # rows written before this column existed have none; get_cached_chat()
     # treats those as a cache miss rather than crashing or returning empty text.
     reply_ru: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Whether reply_ru is a clarifying question rather than a finished answer
+    # (plan: /add redesign). Nullable for rows written before this column
+    # existed - get_cached_chat() reads NULL as False, matching those rows'
+    # actual behavior (they always acted immediately, never asked back).
+    needs_clarification: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=lambda: datetime.now(UTC))
 
 
