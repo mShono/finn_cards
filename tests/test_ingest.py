@@ -52,11 +52,37 @@ def fake_response(payload: dict, input_tokens=10, output_tokens=5) -> SimpleName
 
 
 def test_hash_text_is_stable_and_ignores_surrounding_whitespace():
-    assert hash_text("Haen töitä.") == hash_text("  Haen töitä.  ")
+    assert hash_text("Haen töitä.", "gpt-5.6-terra") == hash_text(
+        "  Haen töitä.  ", "gpt-5.6-terra"
+    )
 
 
 def test_hash_text_differs_for_different_text():
-    assert hash_text("Haen töitä.") != hash_text("Haen taloa.")
+    assert hash_text("Haen töitä.", "gpt-5.6-terra") != hash_text("Haen taloa.", "gpt-5.6-terra")
+
+
+def test_hash_text_differs_for_different_model():
+    # A model swap must miss the cache, not replay an old model's answer -
+    # previously `model` was recorded in IngestCache but never checked back.
+    assert hash_text("Haen töitä.", "gpt-5.6-terra") != hash_text("Haen töitä.", "gpt-6")
+
+
+def test_hash_text_differs_for_follow_up_vs_fresh_turn():
+    assert hash_text("Haen töitä.", "gpt-5.6-terra", is_follow_up=True) != hash_text(
+        "Haen töitä.", "gpt-5.6-terra", is_follow_up=False
+    )
+
+
+def test_hash_text_differs_when_the_prompt_text_changes(monkeypatch):
+    # Regression, found live 27.08.2026: editing _chat_instructions() (e.g. the
+    # "don't claim a save you haven't made" fix) must invalidate old cache rows
+    # for text sent before the edit - otherwise a resend of the same text keeps
+    # replaying the pre-fix answer forever, with no LLM call and no visible sign.
+    monkeypatch.setattr("kielikaveri.ingest._chat_instructions", lambda *, is_follow_up: "v1")
+    before = hash_text("Haen töitä.", "gpt-5.6-terra")
+    monkeypatch.setattr("kielikaveri.ingest._chat_instructions", lambda *, is_follow_up: "v2")
+    after = hash_text("Haen töitä.", "gpt-5.6-terra")
+    assert before != after
 
 
 def test_canonical_key_lemmatizes_an_inflected_llm_lemma():

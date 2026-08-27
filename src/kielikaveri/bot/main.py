@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import timedelta
 
 from aiogram import Bot, Dispatcher
@@ -74,6 +75,15 @@ async def run() -> None:
 
 
 def main() -> None:
+    # Without this, the root logger has no handler - every logger.info() call
+    # across the app (token-usage analytics, cache hits, ingest results) is
+    # silently dropped everywhere, not just hidden from journalctl's caller -
+    # found live 27.08.2026 while trying to read a log line that was never
+    # written. systemd (deploy/kielikaveri.service) captures stdout to the
+    # journal by default, no extra wiring needed once something is printed.
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
     asyncio.run(run())
 
 
