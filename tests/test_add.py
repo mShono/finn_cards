@@ -22,7 +22,7 @@ from kielikaveri.bot.add import (
     delete_confirm,
 )
 from kielikaveri.config import Settings
-from kielikaveri.db.decks import create_deck, set_active_deck
+from kielikaveri.db.decks import active_deck, create_deck, set_active_deck
 from kielikaveri.db.engine import create_all, make_engine, make_session_factory
 from kielikaveri.db.models import Card, IngestCache, Note, Review, User
 from kielikaveri.ingest import ResolvedForms, TokenUsage
@@ -317,11 +317,10 @@ async def test_chat_follow_up_clears_pending_state_even_on_error(session_factory
     assert await state.get_state() is None
 
 
-# --- saving: single deck saves straight away, multiple decks ask first -------------
+# --- saving: always asks which deck, even with just the default one ---------------
 
 
-async def test_chat_saves_straight_away_when_only_one_deck_exists(session_factory, monkeypatch):
-    patch_resolve_note_forms(monkeypatch, {"preesens_1s": "haen"})
+async def test_chat_asks_which_deck_even_when_only_one_exists(session_factory, monkeypatch):
     patch_check_and_suggest(monkeypatch, "Добавляю.", [WORD_CANDIDATE])
     message = make_message("добавь hakea")
     state = make_state()
@@ -329,19 +328,11 @@ async def test_chat_saves_straight_away_when_only_one_deck_exists(session_factor
     await chat_message(message, state, session_factory, make_settings(), make_breaker())
 
     async with session_factory() as session:
-        notes = (await session.scalars(select(Note))).all()
-    assert len(notes) == 1
-    assert notes[0].lemma == "hakea"
-    assert notes[0].deck_id is not None
-    assert notes[0].meta["principal_forms"] == {"preesens_1s": "haen"}
-
-    report = texts_of(message.answer)[-1]
-    assert "hakea" in report
-    assert "искать" in report
-    assert "Общая" in report
-    assert "1 слов" in report
-    # No deck picker shown - nothing left in state.
-    assert await state.get_state() is None
+        assert (await session.scalars(select(Note))).all() == []
+    assert await state.get_state() == AddStates.choosing_deck.state
+    keyboard = message.answer.call_args.kwargs["reply_markup"]
+    labels = {btn.text for row in keyboard.inline_keyboard for btn in row}
+    assert labels == {"Общая"}
 
 
 async def test_chat_asks_which_deck_when_more_than_one_exists(session_factory, monkeypatch):
@@ -434,13 +425,20 @@ async def test_chat_reports_a_failed_candidate_without_blocking_the_others(
     )
     patch_check_and_suggest(monkeypatch, "Добавляю.", [WORD_CANDIDATE, PATTERN_CANDIDATE])
     message = make_message("добавь hakea, hakea + partitiivi")
+    state = make_state()
 
-    await chat_message(message, make_state(), session_factory, make_settings(), make_breaker())
+    await chat_message(message, state, session_factory, make_settings(), make_breaker())
+
+    data = await state.get_data()
+    async with session_factory() as session:
+        deck_id = (await active_deck(session, 1)).id
+    callback = make_callback(f"adddeck:{data['batch_id']}:{deck_id}")
+    await add_deck_choice(callback, state, session_factory, make_settings(), make_breaker())
 
     async with session_factory() as session:
         notes = (await session.scalars(select(Note))).all()
     assert [n.lemma for n in notes] == ["hakea + partitiivi"]
-    report = texts_of(message.answer)[-1]
+    report = callback.message.answer.call_args.args[0]
     assert "Не удалось сохранить «hakea»" in report
     assert "hakea + partitiivi" in report
 

@@ -7,7 +7,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
 
-from kielikaveri.bot.decks import DeckStates, decks_activate, decks_list, decks_new_save
+from kielikaveri.bot.decks import DeckStates, decks_activate, decks_list, decks_new_save, decks_open
 from kielikaveri.db.decks import (
     active_deck,
     create_deck,
@@ -218,3 +218,67 @@ async def test_decks_activate_switches_the_active_deck(session_factory):
         current = await active_deck(session, 1)
     assert current.id == deck_b.id
     callback.answer.assert_awaited_once()
+
+
+async def test_decks_keyboard_offers_open_and_activate_for_every_deck(session_factory):
+    async with session_factory() as session:
+        await create_deck(session, 1, "Общая")
+        await create_deck(session, 1, "Из книги")
+        await session.commit()
+
+    message = make_message()
+    await decks_list(message, session_factory)
+
+    rows = message.answer.call_args.kwargs["reply_markup"].inline_keyboard
+    open_labels = {b.text for row in rows for b in row if b.callback_data.startswith("decks:open:")}
+    activate_rows = [row for row in rows if any("decks:activate:" in b.callback_data for b in row)]
+    assert open_labels == {"📂 Общая", "📂 Из книги"}
+    # The active deck ("Общая", created first) has no activate button - only
+    # the non-active one does.
+    assert len(activate_rows) == 1
+
+
+async def test_decks_open_lists_notes_with_an_edit_button_each(session_factory):
+    async with session_factory() as session:
+        deck = await create_deck(session, 1, "Общая")
+        await session.flush()
+        session.add(
+            Note(
+                id="n1",
+                user_id=1,
+                lemma="hakea",
+                pos="verbi",
+                translation_ru="искать",
+                example_fi="x",
+                example_ru="y",
+                kind=NoteKind.word,
+                deck_id=deck.id,
+                meta={},
+            )
+        )
+        await session.commit()
+
+    callback = make_callback(f"decks:open:{deck.id}")
+    await decks_open(callback, session_factory)
+
+    text = callback.message.answer.call_args.args[0]
+    assert "hakea" in text
+    assert "искать" in text
+    keyboard = callback.message.answer.call_args.kwargs["reply_markup"]
+    edit_buttons = [
+        b for row in keyboard.inline_keyboard for b in row if b.callback_data == "noteedit:n1"
+    ]
+    assert len(edit_buttons) == 1
+    callback.answer.assert_awaited_once()
+
+
+async def test_decks_open_rejects_a_deck_belonging_to_another_user(session_factory):
+    async with session_factory() as session:
+        deck = await create_deck(session, 2, "Чужая")
+        await session.commit()
+
+    callback = make_callback(f"decks:open:{deck.id}")
+    await decks_open(callback, session_factory)
+
+    callback.answer.assert_awaited_once_with("Не нашла колоду.", show_alert=True)
+    callback.message.answer.assert_not_awaited()
