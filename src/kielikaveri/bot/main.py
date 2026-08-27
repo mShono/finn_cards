@@ -8,6 +8,7 @@ from aiogram.types import BotCommand
 
 from kielikaveri.bot.add import router as add_router
 from kielikaveri.bot.decks import router as decks_router
+from kielikaveri.bot.edit import router as edit_router
 from kielikaveri.bot.handlers import router
 from kielikaveri.bot.learn import router as learn_router
 from kielikaveri.bot.middleware import WhitelistMiddleware
@@ -46,9 +47,11 @@ async def run() -> None:
     dp.include_router(router)
     dp.include_router(learn_router)
     dp.include_router(decks_router)
+    dp.include_router(edit_router)
     # add_router last - chat_message's plain-text catch-all would otherwise
     # shadow every other router's text/state-based message handlers (e.g.
-    # decks.py's DeckStates.naming prompt) registered after it.
+    # decks.py's DeckStates.naming prompt, edit.py's EditStates.awaiting_value
+    # prompt) registered after it.
     dp.include_router(add_router)
 
     # Schema is managed by alembic (`alembic upgrade head`), not created here.

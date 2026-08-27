@@ -303,6 +303,12 @@ async def _handle_chat_turn(
             duplicates += 1
             continue
         seen.add(key)
+        # canonical_key() lemmatizes to catch dupes even when the LLM handed
+        # back an inflected form as "lemma" (cards/instructions.md) - without
+        # this, the dedup check sees the corrected lemma but the saved card
+        # still gets the raw inflected string.
+        if key[0] != candidate["lemma"]:
+            candidate = {**candidate, "lemma": key[0]}
         to_add.append(candidate)
 
     if not to_add:
@@ -318,18 +324,13 @@ async def _handle_chat_turn(
             context_fi=quote_text[:SOURCE_QUOTE_CHARS],
         )
         session.add(source)
+        # active_deck() first - guarantees at least one deck (creating the
+        # default "Общая" for a brand new user) before the picker below is
+        # built, so it's never shown empty.
+        await active_deck(session, user_id)
         await session.commit()
         source_id = source.id
         decks = await list_decks(session, user_id)
-
-    if len(decks) <= 1:
-        async with session_factory() as session:
-            deck = await active_deck(session, user_id)
-            await session.commit()
-        await _save_candidates_and_report(
-            message, session_factory, settings, breaker, user_id, deck.id, source_id, to_add
-        )
-        return
 
     batch_id = str(uuid.uuid4())
     await state.set_state(AddStates.choosing_deck)
