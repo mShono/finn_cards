@@ -225,7 +225,11 @@ async def _handle_chat_turn(
         await state.clear()
 
     now = datetime.now(UTC)
-    text_hash = hash_text(build_chat_input(text, context_text))
+    text_hash = hash_text(
+        build_chat_input(text, context_text),
+        settings.openai_text_model,
+        is_follow_up=context_text is not None,
+    )
 
     async with session_factory() as session:
         cached = await get_cached_chat(session, text_hash)

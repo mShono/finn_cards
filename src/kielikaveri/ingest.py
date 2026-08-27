@@ -148,8 +148,19 @@ def build_chat_input(text: str, context_text: str | None) -> str:
     )
 
 
-def hash_text(text: str) -> str:
-    return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
+def hash_text(text: str, model: str, *, is_follow_up: bool = False) -> str:
+    """Cache key for one chat turn.
+
+    Folds in `model` and the exact instructions text, not just the student's
+    input - a cache keyed on input alone never invalidates when the prompt or
+    model changes (found live 27.08.2026: a prompt fix landed, but resending
+    the same text kept replaying the old, already-fixed answer from cache,
+    because check_and_suggest() was never called again for that text). This
+    also closes the model-mismatch gap noted in the plan for the same reason -
+    `store_cached_chat` already recorded `model`, but nothing compared it back.
+    """
+    composite = f"{model}\n{_chat_instructions(is_follow_up=is_follow_up)}\n{text.strip()}"
+    return hashlib.sha256(composite.encode("utf-8")).hexdigest()
 
 
 def _usage_from(response) -> TokenUsage:

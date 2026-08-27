@@ -230,7 +230,12 @@ async def test_chat_uses_the_cache_and_skips_the_llm_call(session_factory, monke
 
     async with session_factory() as session:
         await store_cached_chat(
-            session, hash_text("Haen töitä."), "gpt-5.6-terra", "Из кэша.", False, [WORD_CANDIDATE]
+            session,
+            hash_text("Haen töitä.", "gpt-5.6-terra", is_follow_up=False),
+            "gpt-5.6-terra",
+            "Из кэша.",
+            False,
+            [WORD_CANDIDATE],
         )
         await session.commit()
 
