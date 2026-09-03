@@ -1,7 +1,7 @@
 import asyncio
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import openai
 import pytest
@@ -340,6 +340,26 @@ async def test_chat_asks_which_deck_even_when_only_one_exists(session_factory, m
     assert labels == {"Общая"}
 
 
+async def test_deck_choice_callback_data_fits_telegrams_64_byte_limit(session_factory, monkeypatch):
+    # Regression, found live 27.08.2026: callback_data packed a full uuid4
+    # batch_id (36 chars) plus a full uuid4 deck id (36 chars) - 81 bytes,
+    # over Telegram's 64-byte cap. Telegram silently rejected the whole
+    # message (BUTTON_DATA_INVALID) and, since nothing caught that yet at
+    # the time, the user saw "Добавляю." and then nothing, ever - a mocked
+    # message.answer() in every other test never validates this, because
+    # only the real Telegram API enforces the limit.
+    patch_check_and_suggest(monkeypatch, "Добавляю.", [WORD_CANDIDATE])
+    message = make_message("добавь hakea")
+    state = make_state()
+
+    await chat_message(message, state, session_factory, make_settings(), make_breaker())
+
+    keyboard = message.answer.call_args.kwargs["reply_markup"]
+    for row in keyboard.inline_keyboard:
+        for btn in row:
+            assert len(btn.callback_data.encode("utf-8")) <= 64, btn.callback_data
+
+
 async def test_chat_asks_which_deck_when_more_than_one_exists(session_factory, monkeypatch):
     async with session_factory() as session:
         await create_deck(session, 1, "Общая")
@@ -446,6 +466,25 @@ async def test_chat_reports_a_failed_candidate_without_blocking_the_others(
     report = callback.message.answer.call_args.args[0]
     assert "Не удалось сохранить «hakea»" in report
     assert "hakea + partitiivi" in report
+
+
+async def test_chat_reports_an_honest_error_instead_of_dying_silently(session_factory, monkeypatch):
+    # Regression, found live 27.08.2026: an exception anywhere in the
+    # dedup-and-save path used to die silently after "Добавляю." - the user
+    # saw a confirmation-sounding reply and then nothing, with no way to
+    # tell whether anything was saved.
+    patch_check_and_suggest(monkeypatch, "Добавляю.", [WORD_CANDIDATE])
+    monkeypatch.setattr(
+        "kielikaveri.bot.add.canonical_key", MagicMock(side_effect=RuntimeError("fst exploded"))
+    )
+    message = make_message("добавь hakea")
+
+    await chat_message(message, make_state(), session_factory, make_settings(), make_breaker())
+
+    async with session_factory() as session:
+        assert (await session.scalars(select(Note))).all() == []
+    report = texts_of(message.answer)[-1]
+    assert "не получилось" in report.lower()
 
 
 # --- /delete ---------------------------------------------------------------------
