@@ -348,7 +348,14 @@ async def _handle_chat_turn(
             source_id = source.id
             decks = await list_decks(session, user_id)
 
-        batch_id = str(uuid.uuid4())
+        # Short, not a full uuid4 (36 chars) - callback_data below packs this
+        # plus a full deck id and Telegram caps callback_data at 64 bytes.
+        # "adddeck:" (8) + 12 hex chars + ":" (1) + a uuid4 deck id (36) = 57,
+        # comfortably under the limit. Found live 27.08.2026: the old 36-char
+        # batch_id pushed callback_data to 81 bytes, so Telegram rejected the
+        # whole picker message with BUTTON_DATA_INVALID - silently, since
+        # nothing here caught it yet at the time.
+        batch_id = uuid.uuid4().hex[:12]
         await state.set_state(AddStates.choosing_deck)
         await state.update_data(batch_id=batch_id, candidates=to_add, source_id=source_id)
         await message.answer(
