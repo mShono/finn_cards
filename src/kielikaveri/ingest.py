@@ -369,10 +369,23 @@ def canonical_key(lemma: str, pos: str | None) -> tuple[str, str | None]:
     return (lemmas[0], pos) if lemmas else (lemma, pos)
 
 
-async def existing_note_keys(session: AsyncSession, user_id: int) -> set[tuple[str, str | None]]:
-    rows = (
-        await session.execute(select(Note.lemma, Note.pos).where(Note.user_id == user_id))
-    ).all()
+async def existing_note_keys(
+    session: AsyncSession, user_id: int, deck_id: str | None = None
+) -> set[tuple[str, str | None]]:
+    """Dedup universe for one /add batch.
+
+    Scoped to `deck_id` when given (plan: per-deck dedup, requested
+    03.09.2026 - a word already in one deck should still be addable to
+    another; the same word shouldn't live twice in the *same* deck).
+    `deck_id=None` keeps the old global-per-user behaviour for callers that
+    don't yet know which deck (there are none left in bot/add.py, but the
+    parameter is optional rather than required so this isn't a breaking
+    change for any other future caller).
+    """
+    stmt = select(Note.lemma, Note.pos).where(Note.user_id == user_id)
+    if deck_id is not None:
+        stmt = stmt.where(Note.deck_id == deck_id)
+    rows = (await session.execute(stmt)).all()
     return {(lemma, pos) for lemma, pos in rows}
 
 

@@ -1,7 +1,7 @@
 import asyncio
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import openai
 import pytest
@@ -250,31 +250,6 @@ async def test_chat_uses_the_cache_and_skips_the_llm_call(session_factory, monke
     assert message.answer.call_args_list[0].args[0] == "Из кэша."
 
 
-async def test_chat_drops_duplicates_of_existing_notes(session_factory, monkeypatch):
-    async with session_factory() as session:
-        session.add(
-            Note(
-                id="n1",
-                user_id=1,
-                lemma="hakea",
-                pos="verbi",
-                translation_ru="искать",
-                example_fi="x",
-                example_ru="y",
-                kind="word",
-                meta={},
-            )
-        )
-        await session.commit()
-
-    patch_check_and_suggest(monkeypatch, "Нашла кое-что.", [WORD_CANDIDATE])
-    message = make_message("Haen töitä.")
-
-    await chat_message(message, make_state(), session_factory, make_settings(), make_breaker())
-
-    assert texts_of(message.answer) == ["Нашла кое-что.", "Все 1 кандидатов уже есть в базе."]
-
-
 # --- needs_clarification: bare text gets a question, not an unsolicited answer ------
 
 
@@ -412,6 +387,127 @@ async def test_add_deck_choice_saves_into_the_picked_deck_and_reports_the_new_co
     assert await state.get_state() is None
 
 
+async def test_add_deck_choice_drops_a_duplicate_already_in_the_target_deck(
+    session_factory, monkeypatch
+):
+    async with session_factory() as session:
+        deck = await create_deck(session, 1, "Общая")
+        session.add(
+            Note(
+                id="n1",
+                user_id=1,
+                lemma="hakea",
+                pos="verbi",
+                translation_ru="искать",
+                example_fi="x",
+                example_ru="y",
+                kind="word",
+                deck_id=deck.id,
+                meta={},
+            )
+        )
+        await session.commit()
+        source = await _make_source(session)
+
+    state = make_state()
+    await state.set_state(AddStates.choosing_deck)
+    await state.update_data(batch_id="batch-1", candidates=[WORD_CANDIDATE], source_id=source)
+    callback = make_callback(f"adddeck:batch-1:{deck.id}")
+
+    await add_deck_choice(callback, state, session_factory, make_settings(), make_breaker())
+
+    async with session_factory() as session:
+        notes = (await session.scalars(select(Note))).all()
+    assert len(notes) == 1  # only the pre-seeded one - nothing new added
+    report = callback.message.answer.call_args.args[0]
+    assert "Уже есть в «Общая», не дублирую: hakea." in report
+
+
+async def test_add_deck_choice_allows_a_word_already_in_a_different_deck(
+    session_factory, monkeypatch
+):
+    # The actual feature request, 03.09.2026: dedup used to check ALL of a
+    # user's decks - a word already in deck A silently blocked adding it to
+    # deck B too, even though decks are deliberately separate, user-named
+    # collections (bot/decks.py). Scoped to the target deck now.
+    patch_resolve_note_forms(monkeypatch)
+    async with session_factory() as session:
+        deck_a = await create_deck(session, 1, "Общая")
+        session.add(
+            Note(
+                id="n1",
+                user_id=1,
+                lemma="hakea",
+                pos="verbi",
+                translation_ru="искать",
+                example_fi="x",
+                example_ru="y",
+                kind="word",
+                deck_id=deck_a.id,
+                meta={},
+            )
+        )
+        deck_b = await create_deck(session, 1, "talkoot")
+        await session.commit()
+        source = await _make_source(session)
+
+    state = make_state()
+    await state.set_state(AddStates.choosing_deck)
+    await state.update_data(batch_id="batch-1", candidates=[WORD_CANDIDATE], source_id=source)
+    callback = make_callback(f"adddeck:batch-1:{deck_b.id}")
+
+    await add_deck_choice(callback, state, session_factory, make_settings(), make_breaker())
+
+    async with session_factory() as session:
+        notes = (await session.scalars(select(Note).where(Note.deck_id == deck_b.id))).all()
+    assert [n.lemma for n in notes] == ["hakea"]
+    report = callback.message.answer.call_args.args[0]
+    assert "hakea" in report
+    assert "не дублирую" not in report
+
+
+async def test_add_deck_choice_reports_duplicates_even_when_some_candidates_are_new(
+    session_factory, monkeypatch
+):
+    # Regression, found live 03.09.2026: the old code only reported
+    # duplicates when EVERY candidate was one - a mixed batch (1 new word,
+    # N already in the target deck) saved the new word silently and never
+    # mentioned the rest at all, leaving no way to tell "skipped as
+    # duplicate" apart from "the model dropped them" without server logs.
+    patch_resolve_note_forms(monkeypatch)
+    async with session_factory() as session:
+        deck = await create_deck(session, 1, "Общая")
+        session.add(
+            Note(
+                id="n1",
+                user_id=1,
+                lemma="hakea",
+                pos="verbi",
+                translation_ru="искать",
+                example_fi="x",
+                example_ru="y",
+                kind="word",
+                deck_id=deck.id,
+                meta={},
+            )
+        )
+        await session.commit()
+        source = await _make_source(session)
+
+    state = make_state()
+    await state.set_state(AddStates.choosing_deck)
+    await state.update_data(
+        batch_id="batch-1", candidates=[WORD_CANDIDATE, PATTERN_CANDIDATE], source_id=source
+    )
+    callback = make_callback(f"adddeck:batch-1:{deck.id}")
+
+    await add_deck_choice(callback, state, session_factory, make_settings(), make_breaker())
+
+    report = callback.message.answer.call_args.args[0]
+    assert "hakea + partitiivi" in report
+    assert "Уже есть в «Общая», не дублирую: hakea." in report
+
+
 async def test_add_deck_choice_rejects_a_stale_batch(session_factory):
     state = make_state()
     await state.set_state(AddStates.choosing_deck)
@@ -470,12 +566,15 @@ async def test_chat_reports_a_failed_candidate_without_blocking_the_others(
 
 async def test_chat_reports_an_honest_error_instead_of_dying_silently(session_factory, monkeypatch):
     # Regression, found live 27.08.2026: an exception anywhere in the
-    # dedup-and-save path used to die silently after "Добавляю." - the user
+    # picker-building path used to die silently after "Добавляю." - the user
     # saw a confirmation-sounding reply and then nothing, with no way to
-    # tell whether anything was saved.
+    # tell whether anything was saved. Dedup itself moved to
+    # _save_candidates_and_report (03.09.2026, per-deck dedup) so it's no
+    # longer in this try block - active_deck() stands in as "something in
+    # here can still fail" instead.
     patch_check_and_suggest(monkeypatch, "Добавляю.", [WORD_CANDIDATE])
     monkeypatch.setattr(
-        "kielikaveri.bot.add.canonical_key", MagicMock(side_effect=RuntimeError("fst exploded"))
+        "kielikaveri.bot.add.active_deck", AsyncMock(side_effect=RuntimeError("db exploded"))
     )
     message = make_message("добавь hakea")
 
