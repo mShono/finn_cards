@@ -296,49 +296,10 @@ async def _handle_chat_turn(
 
     user_id = message.from_user.id
     try:
-        async with session_factory() as session:
-            existing = await existing_note_keys(session, user_id)
-
-        seen: set[tuple[str, str | None]] = set()
-        to_add: list[dict] = []
-        duplicate_lemmas: list[str] = []
-        for candidate in candidates:
-            key = canonical_key(candidate["lemma"], candidate.get("pos"))
-            if key in existing or key in seen:
-                duplicate_lemmas.append(key[0])
-                continue
-            seen.add(key)
-            # canonical_key() lemmatizes to catch dupes even when the LLM
-            # handed back an inflected form as "lemma" (cards/instructions.md)
-            # - without this, the dedup check sees the corrected lemma but
-            # the saved card still gets the raw inflected string.
-            if key[0] != candidate["lemma"]:
-                candidate = {**candidate, "lemma": key[0]}
-            to_add.append(candidate)
-
-        # Found live 27.08.2026: with only a token-count log line, "the model
-        # said candidates=4 but nothing got saved" took three round-trips to
-        # even start narrowing down. This one line pins the exact stage - did
-        # dedup eat everything, or did nothing even reach dedup.
-        logger.info(
-            "chat_message dedup candidates=%d to_add=%d duplicates=%d",
-            len(candidates),
-            len(to_add),
-            len(duplicate_lemmas),
-        )
-
-        # Found live 03.09.2026: this used to report duplicates only when
-        # EVERY candidate was one (`if not to_add`) - a partial case (1 new
-        # word, 3 already in the base) saved the new one silently and never
-        # mentioned the other 3 at all, leaving no way to tell "skipped as
-        # duplicate" apart from "the model silently dropped them" without
-        # digging through server logs. Report it whenever it happens.
-        if duplicate_lemmas:
-            await message.answer(f"Уже есть в базе, не дублирую: {', '.join(duplicate_lemmas)}.")
-
-        if not to_add:
-            return
-
+        # Dedup happens after the deck is picked (_save_candidates_and_report),
+        # not here - whether a word is "already there" depends on which deck
+        # you're adding to (plan: per-deck dedup, requested 03.09.2026, was
+        # global-per-user before). Nothing to filter on yet at this point.
         quote_text = context_text or text
         async with session_factory() as session:
             source = Source(
@@ -364,7 +325,7 @@ async def _handle_chat_turn(
         # nothing here caught it yet at the time.
         batch_id = uuid.uuid4().hex[:12]
         await state.set_state(AddStates.choosing_deck)
-        await state.update_data(batch_id=batch_id, candidates=to_add, source_id=source_id)
+        await state.update_data(batch_id=batch_id, candidates=candidates, source_id=source_id)
         await message.answer(
             "В какую колоду добавить?", reply_markup=_deck_choice_keyboard(decks, batch_id)
         )
@@ -445,10 +406,36 @@ async def _save_candidates_and_report(
     async with session_factory() as session:
         deck = await session.get(Deck, deck_id)
         deck_name = deck.name if deck else "?"
+        existing = await existing_note_keys(session, user_id, deck_id=deck_id)
+
+    seen: set[tuple[str, str | None]] = set()
+    to_add: list[dict] = []
+    duplicate_lemmas: list[str] = []
+    for candidate in candidates:
+        key = canonical_key(candidate["lemma"], candidate.get("pos"))
+        if key in existing or key in seen:
+            duplicate_lemmas.append(key[0])
+            continue
+        seen.add(key)
+        # canonical_key() lemmatizes to catch dupes even when the LLM handed
+        # back an inflected form as "lemma" (cards/instructions.md) - without
+        # this, the dedup check sees the corrected lemma but the saved card
+        # still gets the raw inflected string.
+        if key[0] != candidate["lemma"]:
+            candidate = {**candidate, "lemma": key[0]}
+        to_add.append(candidate)
+
+    logger.info(
+        "add.save dedup deck=%s candidates=%d to_add=%d duplicates=%d",
+        deck_id,
+        len(candidates),
+        len(to_add),
+        len(duplicate_lemmas),
+    )
 
     saved: list[tuple[str, str]] = []
     failed: list[tuple[str, str]] = []
-    for candidate in candidates:
+    for candidate in to_add:
         resolved = None
         if candidate["kind"] == "word":
             client = make_client(settings.openai_api_key, settings.openai_timeout_seconds)
@@ -507,6 +494,8 @@ async def _save_candidates_and_report(
             )
             await session.commit()
         lines.append(f"\nКолода «{deck_name}»: теперь {count} слов.")
+    if duplicate_lemmas:
+        lines.append(f"Уже есть в «{deck_name}», не дублирую: {', '.join(duplicate_lemmas)}.")
     for lemma, reason in failed:
         lines.append(f"Не удалось сохранить «{lemma}» - {reason}.")
 
