@@ -301,11 +301,11 @@ async def _handle_chat_turn(
 
         seen: set[tuple[str, str | None]] = set()
         to_add: list[dict] = []
-        duplicates = 0
+        duplicate_lemmas: list[str] = []
         for candidate in candidates:
             key = canonical_key(candidate["lemma"], candidate.get("pos"))
             if key in existing or key in seen:
-                duplicates += 1
+                duplicate_lemmas.append(key[0])
                 continue
             seen.add(key)
             # canonical_key() lemmatizes to catch dupes even when the LLM
@@ -324,12 +324,19 @@ async def _handle_chat_turn(
             "chat_message dedup candidates=%d to_add=%d duplicates=%d",
             len(candidates),
             len(to_add),
-            duplicates,
+            len(duplicate_lemmas),
         )
 
+        # Found live 03.09.2026: this used to report duplicates only when
+        # EVERY candidate was one (`if not to_add`) - a partial case (1 new
+        # word, 3 already in the base) saved the new one silently and never
+        # mentioned the other 3 at all, leaving no way to tell "skipped as
+        # duplicate" apart from "the model silently dropped them" without
+        # digging through server logs. Report it whenever it happens.
+        if duplicate_lemmas:
+            await message.answer(f"Уже есть в базе, не дублирую: {', '.join(duplicate_lemmas)}.")
+
         if not to_add:
-            if duplicates:
-                await message.answer(f"Все {duplicates} кандидатов уже есть в базе.")
             return
 
         quote_text = context_text or text

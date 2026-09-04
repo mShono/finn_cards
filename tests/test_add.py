@@ -272,7 +272,50 @@ async def test_chat_drops_duplicates_of_existing_notes(session_factory, monkeypa
 
     await chat_message(message, make_state(), session_factory, make_settings(), make_breaker())
 
-    assert texts_of(message.answer) == ["Нашла кое-что.", "Все 1 кандидатов уже есть в базе."]
+    assert texts_of(message.answer) == [
+        "Нашла кое-что.",
+        "Уже есть в базе, не дублирую: hakea.",
+    ]
+
+
+async def test_chat_reports_duplicates_even_when_some_candidates_are_new(
+    session_factory, monkeypatch
+):
+    # Regression, found live 03.09.2026: the old code only reported
+    # duplicates when EVERY candidate was one - a mixed batch (1 new word,
+    # N already in the base) saved the new word silently and never mentioned
+    # the rest at all, leaving no way to tell "skipped as duplicate" apart
+    # from "the model dropped them" without digging through server logs.
+    async with session_factory() as session:
+        session.add(
+            Note(
+                id="n1",
+                user_id=1,
+                lemma="hakea",
+                pos="verbi",
+                translation_ru="искать",
+                example_fi="x",
+                example_ru="y",
+                kind="word",
+                meta={},
+            )
+        )
+        await session.commit()
+
+    patch_resolve_note_forms(monkeypatch)
+    patch_check_and_suggest(monkeypatch, "Добавляю.", [WORD_CANDIDATE, PATTERN_CANDIDATE])
+    message = make_message("добавь hakea и hakea + partitiivi")
+    state = make_state()
+
+    await chat_message(message, state, session_factory, make_settings(), make_breaker())
+
+    reports = texts_of(message.answer)
+    assert "Уже есть в базе, не дублирую: hakea." in reports
+    # The genuinely new candidate (the pattern) still goes on to the picker -
+    # a partial duplicate must not block the rest of the batch.
+    assert await state.get_state() == AddStates.choosing_deck.state
+    data = await state.get_data()
+    assert data["candidates"] == [PATTERN_CANDIDATE]
 
 
 # --- needs_clarification: bare text gets a question, not an unsolicited answer ------
