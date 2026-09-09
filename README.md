@@ -1,11 +1,9 @@
 # finn-cards
 
-> **Kielikaveri** - a Telegram bot for learning Finnish: FST-verified flashcards generated from your own mistakes, FSRS scheduling, voice practice.
-
-FST-verified Finnish flashcard schema and morphology wrapper (phase 0),
-plus the bot itself (phase 1+). "Kielikaveri" is the project's working
-name - this repo, `finn-cards`, is its only home; there's no separate
-`kielikaveri` repo.
+**Kielikaveri** - a Telegram bot for learning Finnish: FST-verified
+flashcards generated from your own mistakes, FSRS scheduling, voice
+practice. "Kielikaveri" is the project's working name; this repo,
+`finn-cards`, is its only home.
 
 ## Why
 

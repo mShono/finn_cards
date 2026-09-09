@@ -16,15 +16,19 @@ from kielikaveri.bot.add import (
     add_command,
     add_deck_choice,
     add_deck_choice_stray,
+    add_new_deck_prompt,
+    add_new_deck_prompt_stray,
+    add_new_deck_save,
     chat_message,
     delete_cancel,
     delete_command,
     delete_confirm,
 )
+from kielikaveri.bot.decks import NEW_DECK_PROMPT
 from kielikaveri.config import Settings
 from kielikaveri.db.decks import active_deck, create_deck, set_active_deck
 from kielikaveri.db.engine import create_all, make_engine, make_session_factory
-from kielikaveri.db.models import Card, IngestCache, Note, Review, User
+from kielikaveri.db.models import Card, Deck, IngestCache, Note, Review, User
 from kielikaveri.ingest import ResolvedForms, TokenUsage
 from kielikaveri.llm.breaker import CallBreaker, CircuitOpenError
 
@@ -312,7 +316,7 @@ async def test_chat_asks_which_deck_even_when_only_one_exists(session_factory, m
     assert await state.get_state() == AddStates.choosing_deck.state
     keyboard = message.answer.call_args.kwargs["reply_markup"]
     labels = {btn.text for row in keyboard.inline_keyboard for btn in row}
-    assert labels == {"Общая"}
+    assert labels == {"Общая", "➕ Новая колода"}
 
 
 async def test_deck_choice_callback_data_fits_telegrams_64_byte_limit(session_factory, monkeypatch):
@@ -355,7 +359,7 @@ async def test_chat_asks_which_deck_when_more_than_one_exists(session_factory, m
     # The keyboard offers both decks.
     keyboard = message.answer.call_args.kwargs["reply_markup"]
     labels = {btn.text for row in keyboard.inline_keyboard for btn in row}
-    assert labels == {"Общая", "Из книги"}
+    assert labels == {"Общая", "Из книги", "➕ Новая колода"}
 
 
 async def test_add_deck_choice_saves_into_the_picked_deck_and_reports_the_new_count(
@@ -531,6 +535,81 @@ async def test_add_deck_choice_stray_callback_is_rejected_outside_the_state():
     callback.answer.assert_awaited_once_with(
         "Эта подборка уже неактуальна - пришли текст ещё раз.", show_alert=True
     )
+
+
+async def test_add_new_deck_prompt_asks_for_a_name():
+    state = make_state()
+    await state.set_state(AddStates.choosing_deck)
+    await state.update_data(batch_id="batch-1", candidates=[WORD_CANDIDATE], source_id="src")
+    callback = make_callback("addnewdeck:batch-1")
+
+    await add_new_deck_prompt(callback, state)
+
+    assert await state.get_state() == AddStates.naming_new_deck.state
+    # batch_id/candidates/source_id survive the state change untouched.
+    data = await state.get_data()
+    assert data["candidates"] == [WORD_CANDIDATE]
+    callback.message.answer.assert_awaited_once_with(NEW_DECK_PROMPT)
+    callback.answer.assert_awaited_once()
+
+
+async def test_add_new_deck_prompt_rejects_a_stale_batch():
+    state = make_state()
+    await state.set_state(AddStates.choosing_deck)
+    await state.update_data(batch_id="batch-1", candidates=[WORD_CANDIDATE], source_id="src")
+    callback = make_callback("addnewdeck:old-batch")
+
+    await add_new_deck_prompt(callback, state)
+
+    assert await state.get_state() == AddStates.choosing_deck.state
+    callback.answer.assert_awaited_once_with(
+        "Эта подборка уже неактуальна - пришли текст ещё раз.", show_alert=True
+    )
+
+
+async def test_add_new_deck_prompt_stray_callback_is_rejected_outside_the_state():
+    callback = make_callback("addnewdeck:batch-1")
+
+    await add_new_deck_prompt_stray(callback)
+
+    callback.answer.assert_awaited_once_with(
+        "Эта подборка уже неактуальна - пришли текст ещё раз.", show_alert=True
+    )
+
+
+async def test_add_new_deck_save_creates_the_deck_and_saves_into_it(session_factory, monkeypatch):
+    patch_resolve_note_forms(monkeypatch)
+    async with session_factory() as session:
+        source = await _make_source(session)
+
+    state = make_state()
+    await state.set_state(AddStates.naming_new_deck)
+    await state.update_data(batch_id="batch-1", candidates=[WORD_CANDIDATE], source_id=source)
+    message = make_message("Из книги")
+
+    await add_new_deck_save(message, state, session_factory, make_settings(), make_breaker())
+
+    async with session_factory() as session:
+        note = (await session.scalars(select(Note))).one()
+        user = await session.get(User, 1)
+        deck = await session.get(Deck, note.deck_id)
+    assert deck.name == "Из книги"
+    assert user.last_deck_id == deck.id
+    report = message.answer.call_args_list[-1].args[0]
+    assert "1 слов" in report
+    assert await state.get_state() is None
+
+
+async def test_add_new_deck_save_reprompts_on_an_empty_name(session_factory):
+    state = make_state()
+    await state.set_state(AddStates.naming_new_deck)
+    await state.update_data(batch_id="batch-1", candidates=[WORD_CANDIDATE], source_id="src")
+    message = make_message("   ")
+
+    await add_new_deck_save(message, state, session_factory, make_settings(), make_breaker())
+
+    message.answer.assert_awaited_once_with(NEW_DECK_PROMPT)
+    assert await state.get_state() == AddStates.naming_new_deck.state
 
 
 async def test_chat_reports_a_failed_candidate_without_blocking_the_others(
