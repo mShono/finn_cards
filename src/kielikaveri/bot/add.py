@@ -38,9 +38,10 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from kielikaveri.bot.decks import NEW_DECK_PROMPT
 from kielikaveri.bot.text import split_message
 from kielikaveri.config import Settings
-from kielikaveri.db.decks import active_deck, list_decks, set_active_deck
+from kielikaveri.db.decks import active_deck, create_deck, list_decks, set_active_deck
 from kielikaveri.db.models import Card, Deck, Note, Review, Source, SourceType
 from kielikaveri.import_cards import load_validator
 from kielikaveri.ingest import (
@@ -74,6 +75,8 @@ class AddStates(StatesGroup):
     awaiting_instruction = State()
     # Data: batch_id, candidates, source_id - waiting for a deck pick before saving.
     choosing_deck = State()
+    # Data: same as choosing_deck, carried over - waiting for the new deck's name.
+    naming_new_deck = State()
 
 
 @router.message(F.text == ADD_BUTTON_TEXT)
@@ -342,12 +345,14 @@ async def _handle_chat_turn(
 
 
 def _deck_choice_keyboard(decks: list[Deck], batch_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=deck.name, callback_data=f"adddeck:{batch_id}:{deck.id}")]
-            for deck in decks
-        ]
+    rows = [
+        [InlineKeyboardButton(text=deck.name, callback_data=f"adddeck:{batch_id}:{deck.id}")]
+        for deck in decks
+    ]
+    rows.append(
+        [InlineKeyboardButton(text="➕ Новая колода", callback_data=f"addnewdeck:{batch_id}")]
     )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 @router.callback_query(F.data.startswith("adddeck:"), AddStates.choosing_deck)
@@ -389,6 +394,59 @@ async def add_deck_choice_stray(callback: CallbackQuery) -> None:
     # Reaches here only when the picker is tapped outside choosing_deck - a
     # batch from a session that already resolved or expired.
     await callback.answer("Эта подборка уже неактуальна - пришли текст ещё раз.", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("addnewdeck:"), AddStates.choosing_deck)
+async def add_new_deck_prompt(callback: CallbackQuery, state: FSMContext) -> None:
+    _, batch_id = callback.data.split(":", 1)
+    data = await state.get_data()
+    if data.get("batch_id") != batch_id:
+        await callback.answer(
+            "Эта подборка уже неактуальна - пришли текст ещё раз.", show_alert=True
+        )
+        return
+
+    # batch_id/candidates/source_id stay in state data - set_state() alone
+    # doesn't touch them, only the name reply below needs to read them back.
+    await state.set_state(AddStates.naming_new_deck)
+    await callback.message.answer(NEW_DECK_PROMPT)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("addnewdeck:"))
+async def add_new_deck_prompt_stray(callback: CallbackQuery) -> None:
+    await callback.answer("Эта подборка уже неактуальна - пришли текст ещё раз.", show_alert=True)
+
+
+@router.message(AddStates.naming_new_deck)
+async def add_new_deck_save(
+    message: Message,
+    state: FSMContext,
+    session_factory: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    breaker: CallBreaker,
+) -> None:
+    name = (message.text or "").strip()
+    if not name:
+        await message.answer(NEW_DECK_PROMPT)
+        return
+
+    data = await state.get_data()
+    candidates: list[dict] = data.get("candidates", [])
+    source_id = data.get("source_id")
+    user_id = message.from_user.id
+
+    async with session_factory() as session:
+        deck = await create_deck(session, user_id, name)
+        await set_active_deck(session, user_id, deck.id)
+        await session.commit()
+        deck_id = deck.id
+
+    await state.clear()
+    await message.answer(f"Колода «{deck.name}» создана и стала активной.")
+    await _save_candidates_and_report(
+        message, session_factory, settings, breaker, user_id, deck_id, source_id, candidates
+    )
 
 
 async def _save_candidates_and_report(
