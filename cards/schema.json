@@ -63,7 +63,7 @@
         "id": { "type": "string", "format": "uuid" },
         "lemma": {
           "type": "string",
-          "description": "Dictionary form for kind=word. The construction itself for kind=pattern, e.g. 'hakea + partitiivi'."
+          "description": "Dictionary form for kind=word. The construction itself for kind=pattern, e.g. 'selvitä + -ssa/-ssä' - case as its ending, not its name (see cards/instructions.md; partitiivi/illatiivi are the exception, no single ending)."
         },
         "pos": { "$ref": "#/$defs/pos" },
         "translation_ru": { "type": "string" },
@@ -98,7 +98,10 @@
               "type": "boolean",
               "description": "false means principal_forms must not be used in inflection exercises (phase 2+)."
             },
-            "rektio": { "type": ["string", "null"] },
+            "rektio": {
+              "type": ["string", "null"],
+              "description": "Verb government, e.g. 'pitää + -sta/-stä' - case as its ending, not its name (see cards/instructions.md; partitiivi/illatiivi are the exception, no single ending)."
+            },
             "cognates": {
               "type": "array",
               "items": { "$ref": "#/$defs/cognate" }
