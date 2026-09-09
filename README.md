@@ -45,38 +45,39 @@ See `cards/instructions.md` for the exact algorithm and its rationale.
 
 ## Setup
 
-This project shares the venv at `~/yki/.venv` (Python 3.12), which already
-has the Finnish FST models downloaded - `uralicNLP` stores them inside its
-own `site-packages` folder, so a fresh venv would re-download them.
+Requires Python 3.12. First install downloads the Finnish FST models via
+`uralicNLP`, so it can take a minute.
 
 ```bash
-uv pip install --python ~/yki/.venv/bin/python -e ".[dev]"
+python3.12 -m venv .venv
+source .venv/bin/activate
+uv pip install -e ".[dev]"
 cp .env.example .env  # fill in BOT_TOKEN, WHITELIST_USER_IDS at minimum
-~/yki/.venv/bin/alembic upgrade head
+alembic upgrade head
 ```
 
 ## Running the bot
 
 ```bash
-~/yki/.venv/bin/python -m kielikaveri.bot.main
+python -m kielikaveri.bot.main
 ```
 
 ## Importing phase 0 cards
 
 ```bash
-~/yki/.venv/bin/python -m kielikaveri.import_cards --user-id <your telegram id>
+python -m kielikaveri.import_cards --user-id <your telegram id>
 ```
 
 ## Tests
 
 ```bash
-~/yki/.venv/bin/pytest
+pytest
 ```
 
 ## Lint
 
 ```bash
-~/yki/.venv/bin/ruff check .
+ruff check .
 ```
 
 ## License
