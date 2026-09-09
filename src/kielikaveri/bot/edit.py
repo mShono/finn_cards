@@ -44,12 +44,16 @@ class EditStates(StatesGroup):
 
 
 def _field_keyboard(note_id: str) -> InlineKeyboardMarkup:
+    # 🗑 reuses delnote: (bot/add.py's delete_confirm) rather than a new
+    # handler here - same note-scoped delete-and-cleanup-cards-and-reviews
+    # logic /delete already uses, no reason for a second copy of it.
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(text="✍️ Слово", callback_data=f"noteeditfield:{note_id}:lm"),
                 InlineKeyboardButton(text="✍️ Перевод", callback_data=f"noteeditfield:{note_id}:tr"),
             ],
+            [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delnote:{note_id}")],
             [InlineKeyboardButton(text="Отмена", callback_data="noteeditcancel")],
         ]
     )

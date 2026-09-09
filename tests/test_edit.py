@@ -96,7 +96,7 @@ async def test_note_edit_menu_shows_field_buttons(session_factory):
     assert "hakea" in text and "искать" in text
     keyboard = callback.message.answer.call_args.kwargs["reply_markup"]
     codes = {b.callback_data for row in keyboard.inline_keyboard for b in row}
-    assert codes == {"noteeditfield:n1:lm", "noteeditfield:n1:tr", "noteeditcancel"}
+    assert codes == {"noteeditfield:n1:lm", "noteeditfield:n1:tr", "delnote:n1", "noteeditcancel"}
 
 
 async def test_note_edit_menu_rejects_another_users_note(session_factory):
