@@ -67,9 +67,11 @@ async def note_edit_menu(
     async with session_factory() as session:
         note = await session.get(Note, note_id)
     if note is None or note.user_id != callback.from_user.id:
+        logger.debug("event=edit.not_found note_id=%s", note_id)
         await callback.answer("Не нашла эту карточку.", show_alert=True)
         return
 
+    logger.debug("event=edit.menu note_id=%s lemma=%s", note_id, note.lemma)
     pos_suffix = f" ({note.pos})" if note.pos else ""
     await callback.message.answer(
         f"«{note.lemma}{pos_suffix} - {note.translation_ru}» - что править?",
@@ -100,6 +102,7 @@ async def note_edit_field_choice(
         return
 
     current = note.lemma if field == "lemma" else note.translation_ru
+    logger.debug("event=edit.field_choice note_id=%s field=%s", note_id, field)
     await state.set_state(EditStates.awaiting_value)
     await state.update_data(note_id=note_id, field=field)
     await callback.message.answer(
@@ -121,6 +124,7 @@ async def note_edit_apply(
         await message.answer("Пустое значение не сохраню - пришли текст ещё раз.")
         return
     if value.lower() in CANCEL_WORDS:
+        logger.debug("event=edit.cancelled")
         await state.clear()
         await message.answer("Отменено.")
         return
@@ -132,6 +136,7 @@ async def note_edit_apply(
     async with session_factory() as session:
         note = await session.get(Note, note_id)
     if note is None or note.user_id != message.from_user.id:
+        logger.debug("event=edit.not_found note_id=%s", note_id)
         await message.answer("Не нашла эту карточку - её уже удалили.")
         return
 
@@ -141,6 +146,13 @@ async def note_edit_apply(
             note = await session.get(Note, note_id)
             note.translation_ru = value
             await session.commit()
+        logger.info(
+            "event=edit.save note_id=%s field=translation_ru lemma=%s old=%r new=%r",
+            note_id,
+            note.lemma,
+            old,
+            value,
+        )
         await message.answer(f"Перевод «{note.lemma}»: «{old}» → «{value}».")
         return
 
@@ -171,6 +183,12 @@ async def _apply_lemma_edit(
             )
         )
     if clash is not None:
+        logger.debug(
+            "event=edit.lemma_clash note_id=%s new_lemma=%s clash_note_id=%s",
+            note.id,
+            new_lemma,
+            clash.id,
+        )
         await message.answer(
             f"«{new_lemma}» уже есть в базе отдельной карточкой - сначала удали одну из них."
         )
@@ -185,12 +203,13 @@ async def _apply_lemma_edit(
                 client, breaker, settings.openai_text_model, new_lemma, note.pos, datetime.now(UTC)
             )
         except CircuitOpenError:
+            logger.warning("event=edit.lemma_forms_skipped reason=breaker_open lemma=%s", new_lemma)
             await message.answer(
                 "Слово сохраню, но формы не пересчитала - предохранитель сработал. "
                 "Повтори позже, если нужны формы для склонения."
             )
         except openai.APIError:
-            logger.exception("edit.resolve_note_forms failed lemma=%s", new_lemma)
+            logger.exception("event=llm.error op=resolve_note_forms lemma=%s", new_lemma)
             await message.answer("Слово сохраню, но формы не пересчитала - OpenAI недоступен.")
 
     async with session_factory() as session:
@@ -204,4 +223,11 @@ async def _apply_lemma_edit(
             note.meta = new_meta
         await session.commit()
 
+    logger.info(
+        "event=edit.save note_id=%s field=lemma old=%r new=%r forms_source=%s",
+        note.id,
+        old_lemma,
+        new_lemma,
+        resolved.forms_source if resolved is not None else "unchanged",
+    )
     await message.answer(f"Слово: «{old_lemma}» → «{new_lemma}».")

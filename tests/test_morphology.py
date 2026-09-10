@@ -1,6 +1,8 @@
+import logging
 import threading
 
 import pytest
+from conftest import log_fields
 
 from finn_cards.morphology import (
     detect_pos,
@@ -70,6 +72,17 @@ def test_generate_forms_unambiguous_verb():
     assert result.forms_source == "fst"
     assert result.forms_verified is True
     assert result.ambiguous == {}
+
+
+def test_generate_forms_logs_fst_resolve_with_duration(caplog):
+    with caplog.at_level(logging.DEBUG, logger="finn_cards.morphology"):
+        generate_forms("hakea", "verbi")
+
+    events = [log_fields(r.message) for r in caplog.records]
+    resolved = next(f for f in events if f.get("event") == "fst.resolve")
+    assert resolved["lemma"] == "hakea"
+    assert resolved["forms_source"] == "fst"
+    assert int(resolved["duration_ms"]) >= 0
 
 
 def test_generate_forms_dictionary_forms_avoids_archaic_plural():

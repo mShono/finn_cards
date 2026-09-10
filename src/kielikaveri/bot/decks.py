@@ -11,6 +11,7 @@ picker lives in bot/learn.py.
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 
 from aiogram import F, Router
@@ -24,6 +25,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from kielikaveri.db.decks import active_deck, create_deck, list_decks, set_active_deck
 from kielikaveri.db.models import Deck, Note
 from kielikaveri.srs.queue import overdue_count
+
+logger = logging.getLogger(__name__)
 
 router = Router(name="decks")
 
@@ -81,6 +84,7 @@ async def _decks_list_text_and_keyboard(
 @router.message(Command("decks"))
 @router.message(F.text == "🗂 Колоды")
 async def decks_list(message: Message, session_factory: async_sessionmaker[AsyncSession]) -> None:
+    logger.debug("event=decks.list")
     text, keyboard = await _decks_list_text_and_keyboard(
         session_factory, message.from_user.id, datetime.now(UTC)
     )
@@ -105,10 +109,12 @@ async def decks_open(
     deck_id = callback.data.split(":", 2)[2]
     user_id = callback.from_user.id
     now = datetime.now(UTC)
+    logger.debug("event=decks.open deck_id=%s", deck_id)
 
     async with session_factory() as session:
         deck = await session.get(Deck, deck_id)
         if deck is None or deck.user_id != user_id:
+            logger.debug("event=decks.not_found deck_id=%s", deck_id)
             await callback.answer("Не нашла колоду.", show_alert=True)
             return
 
@@ -158,11 +164,13 @@ async def decks_activate(
     async with session_factory() as session:
         await set_active_deck(session, user_id, deck_id)
         await session.commit()
+    logger.info("event=decks.activate deck_id=%s", deck_id)
     await callback.answer("Готово - новое пойдёт сюда.")
 
 
 @router.callback_query(F.data == "decks:new")
 async def decks_new_prompt(callback: CallbackQuery, state: FSMContext) -> None:
+    logger.debug("event=decks.new_prompt")
     await state.set_state(DeckStates.naming)
     await callback.message.answer(NEW_DECK_PROMPT)
     await callback.answer()
@@ -183,5 +191,6 @@ async def decks_new_save(
         await set_active_deck(session, user_id, deck.id)
         await session.commit()
 
+    logger.info("event=decks.create deck_id=%s name=%r", deck.id, deck.name)
     await state.clear()
     await message.answer(f"Колода «{deck.name}» создана и стала активной - новое пойдёт туда.")

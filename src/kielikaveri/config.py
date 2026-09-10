@@ -27,6 +27,12 @@ class Settings(BaseSettings):
 
     database_url: str = "sqlite+aiosqlite:///./kielikaveri.db"
 
+    log_level: str = "INFO"
+    # Relative to the process's working directory (deploy/kielikaveri.service
+    # sets that to the repo root) - rotated daily, 14 days kept. Empty
+    # disables the file handler and logs to stdout only.
+    log_file: str = "logs/kielikaveri.log"
+
     # Hour (0-23, Europe/Helsinki) a new study day starts for `due`
     # scheduling and the daily new-card limit - see srs/queue.py.
     day_boundary_hour: int = 4

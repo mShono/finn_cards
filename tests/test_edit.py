@@ -1,3 +1,4 @@
+import logging
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -6,6 +7,7 @@ import pytest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
+from conftest import log_fields
 
 from kielikaveri.bot.edit import (
     EditStates,
@@ -270,3 +272,52 @@ async def test_note_edit_apply_lemma_on_a_pattern_note_skips_forms_recompute(
         note = await session.get(Note, "n1")
     assert note.lemma == "hakea + elatiivi"
     mock.assert_not_awaited()
+
+
+# --- application-level logging ---------------------------------------------
+
+
+async def test_note_edit_apply_translation_logs_save_event(session_factory, caplog):
+    await _add_note(session_factory)
+    state = make_state()
+    await state.set_state(EditStates.awaiting_value)
+    await state.update_data(note_id="n1", field="translation_ru")
+    message = make_message("подавать заявление")
+
+    with caplog.at_level(logging.INFO, logger="kielikaveri.bot.edit"):
+        await note_edit_apply(message, state, session_factory, make_settings(), make_breaker())
+
+    saves = [
+        log_fields(r.message)
+        for r in caplog.records
+        if log_fields(r.message).get("event") == "edit.save"
+    ]
+    assert len(saves) == 1
+    assert saves[0]["field"] == "translation_ru"
+    assert saves[0]["note_id"] == "n1"
+
+
+async def test_note_edit_apply_lemma_breaker_trip_logs_warning(
+    session_factory, monkeypatch, caplog
+):
+    await _add_note(session_factory)
+    monkeypatch.setattr(
+        "kielikaveri.bot.edit.resolve_note_forms",
+        AsyncMock(side_effect=CircuitOpenError("stopped")),
+    )
+    state = make_state()
+    await state.set_state(EditStates.awaiting_value)
+    await state.update_data(note_id="n1", field="lemma")
+    message = make_message("mennä")
+
+    with caplog.at_level(logging.WARNING, logger="kielikaveri.bot.edit"):
+        await note_edit_apply(message, state, session_factory, make_settings(), make_breaker())
+
+    warnings = [
+        log_fields(r.message)
+        for r in caplog.records
+        if r.levelno == logging.WARNING
+        and log_fields(r.message).get("event") == "edit.lemma_forms_skipped"
+    ]
+    assert len(warnings) == 1
+    assert warnings[0]["reason"] == "breaker_open"

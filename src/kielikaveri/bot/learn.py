@@ -8,6 +8,7 @@ this must keep working when OpenAI is unreachable (see plan 3.10).
 
 from __future__ import annotations
 
+import logging
 import random
 from datetime import UTC, datetime
 
@@ -33,6 +34,8 @@ from kielikaveri.srs.queue import build_session_queue, defer_overdue_tail, overd
 from kielikaveri.srs.scheduler import RATING_LABELS, Rating, SrsState
 from kielikaveri.srs.scheduler import review as apply_review
 from kielikaveri.tts import synthesize_speech
+
+logger = logging.getLogger(__name__)
 
 router = Router(name="learn")
 
@@ -125,10 +128,12 @@ async def _start_session(
         )
 
     if not queue:
+        logger.info("event=learn.session_empty deck_id=%s", deck_id)
         await state.clear()
         await answer_to.answer("Нечего повторять - все карточки выучены на сегодня.")
         return
 
+    logger.info("event=learn.session_start deck_id=%s queue=%d", deck_id, len(queue))
     await state.set_state(LearnStates.reviewing)
     await state.update_data(
         queue=queue,
@@ -155,6 +160,19 @@ async def _show_next_card(
         or elapsed_minutes >= data["session_max_minutes"]
     ):
         remaining = len(queue)
+        reason = (
+            "queue_empty"
+            if not queue
+            else "max_cards"
+            if reviewed_count >= data["session_max_cards"]
+            else "max_minutes"
+        )
+        logger.info(
+            "event=learn.session_end reason=%s reviewed=%d remaining=%d",
+            reason,
+            reviewed_count,
+            remaining,
+        )
         await state.clear()
         text = f"Сессия окончена: {reviewed_count} карточек пройдено"
         text += (
@@ -189,6 +207,12 @@ async def _proceed_past_deck_choice(
         overdue = await overdue_count(session, user_id, now, deck_id=deck_id)
 
     if overdue > settings.debt_threshold:
+        logger.info(
+            "event=learn.debt_prompt deck_id=%s overdue=%d threshold=%d",
+            deck_id,
+            overdue,
+            settings.debt_threshold,
+        )
         await state.set_state(LearnStates.debt_choice)
         await state.update_data(debt_now=now.isoformat(), deck_id=deck_id)
         await answer_to.answer(
@@ -216,6 +240,7 @@ async def learn_start(
     async with session_factory() as session:
         decks = await list_decks(session, user_id)
 
+    logger.debug("event=learn.start decks=%d", len(decks))
     if len(decks) <= 1:
         # Nothing to actually choose between - skip straight to the session.
         await _proceed_past_deck_choice(
@@ -239,6 +264,7 @@ async def learn_deck_choice(
     user_id = callback.from_user.id
     now = datetime.now(UTC)
 
+    logger.debug("event=learn.deck_choice deck_id=%s", deck_id)
     await callback.answer()
     await _proceed_past_deck_choice(
         callback.message, state, session_factory, settings, user_id, now, deck_id
@@ -269,9 +295,12 @@ async def learn_debt_choice(
                 deck_id=deck_id,
             )
             await session.commit()
+        logger.info("event=learn.debt_choice action=defer postponed=%d", postponed)
         await callback.message.answer(
             f"Отложено {postponed} карточек на {settings.debt_postpone_days} дн."
         )
+    else:
+        logger.debug("event=learn.debt_choice action=%s", action)
 
     await callback.answer()
     await _start_session(callback.message, state, session_factory, settings, user_id, now, deck_id)
@@ -283,6 +312,7 @@ async def learn_reveal(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     card_id = callback.data.split(":", 2)[2]
+    logger.debug("event=learn.reveal card_id=%s", card_id)
     async with session_factory() as session:
         card = await session.get(Card, card_id)
         note = await session.get(Note, card.note_id)
@@ -308,6 +338,7 @@ async def learn_rate(
         # doesn't disable a button once it's used, so the old keyboard stays
         # live; applying it again would silently record a phantom review the
         # user never actually made and corrupt that card's FSRS history.
+        logger.debug("event=learn.rate_stale card_id=%s", card_id)
         await callback.answer("Эта карточка уже учтена.", show_alert=True)
         return
 
@@ -352,6 +383,7 @@ async def learn_rate(
         await ensure_card_types(session, note, now)
         await session.commit()
 
+    logger.info("event=db.save entity=review card_id=%s rating=%d", card_id, rating.value)
     await callback.answer(f"Записано: {RATING_LABELS[rating]}")
     await _show_next_card(callback.message, state, session_factory)
 
@@ -371,6 +403,7 @@ async def learn_listen(
         card = await session.get(Card, card_id)
         note = await session.get(Note, card.note_id)
 
+    logger.debug("event=learn.listen card_id=%s", card_id)
     client = OpenAI(api_key=settings.openai_api_key)
     audio = synthesize_speech(client, settings.openai_tts_model, note.example_fi)
     await callback.message.answer_audio(BufferedInputFile(audio, filename="example.mp3"))
@@ -381,6 +414,7 @@ async def learn_listen(
 async def learn_stray_callback(callback: CallbackQuery) -> None:
     # Reaches here only when reveal/rate/debt fired outside their expected
     # state - e.g. a button from a session already ended by the time-limit.
+    logger.debug("event=learn.stray_callback")
     await callback.answer(
         "Эта сессия уже неактуальна - начните заново через /learn", show_alert=True
     )

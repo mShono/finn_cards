@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 from datetime import timedelta
 
 from aiogram import Bot, Dispatcher
@@ -12,10 +11,11 @@ from kielikaveri.bot.decks import router as decks_router
 from kielikaveri.bot.edit import router as edit_router
 from kielikaveri.bot.handlers import router
 from kielikaveri.bot.learn import router as learn_router
-from kielikaveri.bot.middleware import WhitelistMiddleware
-from kielikaveri.config import load_settings
+from kielikaveri.bot.middleware import RequestLoggingMiddleware, WhitelistMiddleware
+from kielikaveri.config import Settings, load_settings
 from kielikaveri.db.engine import make_engine, make_session_factory
 from kielikaveri.llm.breaker import CallBreaker
+from kielikaveri.logging_config import setup_logging
 
 # Shown behind Telegram's "/" menu button. Kept short - the persistent
 # keyboard (bot/handlers.py's MAIN_KEYBOARD) is the primary way in.
@@ -29,8 +29,7 @@ BOT_COMMANDS = [
 ]
 
 
-async def run() -> None:
-    settings = load_settings()
+async def run(settings: Settings) -> None:
     if not settings.bot_token:
         raise RuntimeError("BOT_TOKEN is not set - see .env.example")
     if not settings.whitelist:
@@ -42,8 +41,11 @@ async def run() -> None:
     bot = Bot(token=settings.bot_token)
     await bot.set_my_commands(BOT_COMMANDS)
     dp = Dispatcher()
-    # Registered after construction, so it runs after the Dispatcher's own
+    # Registered after construction, so both run after the Dispatcher's own
     # UserContextMiddleware and can rely on event_from_user being set.
+    # RequestLoggingMiddleware first - it must wrap WhitelistMiddleware to
+    # log request_completed for updates the whitelist check blocks too.
+    dp.update.outer_middleware(RequestLoggingMiddleware())
     dp.update.outer_middleware(WhitelistMiddleware(settings.whitelist))
     dp.include_router(router)
     dp.include_router(learn_router)
@@ -75,16 +77,15 @@ async def run() -> None:
 
 
 def main() -> None:
-    # Without this, the root logger has no handler - every logger.info() call
-    # across the app (token-usage analytics, cache hits, ingest results) is
-    # silently dropped everywhere, not just hidden from journalctl's caller -
-    # found live 27.08.2026 while trying to read a log line that was never
-    # written. systemd (deploy/kielikaveri.service) captures stdout to the
-    # journal by default, no extra wiring needed once something is printed.
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-    )
-    asyncio.run(run())
+    settings = load_settings()
+    # Without a handler, every logger.info() call across the app (token-usage
+    # analytics, cache hits, ingest results) is silently dropped everywhere,
+    # not just hidden from journalctl's caller - found live 27.08.2026 while
+    # trying to read a log line that was never written. setup_logging wires
+    # both a console handler (systemd/journald captures stdout) and a
+    # rotated file, so history survives past journald's own retention.
+    setup_logging(settings.log_level, settings.log_file)
+    asyncio.run(run(settings))
 
 
 if __name__ == "__main__":

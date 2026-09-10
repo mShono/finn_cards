@@ -8,10 +8,14 @@ uralicNLP returns is often archaic or colloquial (e.g. "oon" before "olen").
 
 from __future__ import annotations
 
+import logging
 import threading
+import time
 from dataclasses import dataclass
 
 from uralicNLP import uralicApi
+
+logger = logging.getLogger(__name__)
 
 LANG = "fin"
 
@@ -82,6 +86,7 @@ class FormsResult:
 
 def generate_forms(lemma: str, pos: str) -> FormsResult:
     """Resolve every principal form of `pos` via the FST, without guessing on ambiguity."""
+    start = time.monotonic()
     tag_prefix = POS_TAG.get(pos)
     if tag_prefix is None:
         raise ValueError(f"no FST tag for pos={pos!r}")
@@ -119,6 +124,19 @@ def generate_forms(lemma: str, pos: str) -> FormsResult:
         source = "fst+llm"
     else:
         source = "fst"
+
+    duration_ms = int((time.monotonic() - start) * 1000)
+    logger.debug(
+        "event=fst.resolve lemma=%s pos=%s forms_source=%s resolved=%d ambiguous=%d "
+        "missing=%s duration_ms=%d",
+        lemma,
+        pos,
+        source,
+        len(resolved),
+        len(ambiguous),
+        any_missing,
+        duration_ms,
+    )
 
     return FormsResult(
         principal_forms=resolved,

@@ -24,6 +24,7 @@ breaker trips - /learn has no LLM dependency and must keep working regardless
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 from datetime import UTC, datetime
 
@@ -227,6 +228,11 @@ async def _handle_chat_turn(
         context_text = data.get("pending_text")
         await state.clear()
 
+    # Raw text itself is already in middleware's update_received.detail
+    # (DEBUG) - this line only adds the business-level fact middleware can't
+    # know: whether this turn answers a pending clarifying question.
+    logger.debug("event=add.chat_turn follow_up=%s", context_text is not None)
+
     now = datetime.now(UTC)
     text_hash = hash_text(
         build_chat_input(text, context_text),
@@ -238,9 +244,10 @@ async def _handle_chat_turn(
         cached = await get_cached_chat(session, text_hash)
 
     if cached is not None:
-        logger.info("chat cache hit hash=%s", text_hash)
+        logger.info("event=chat.cache_hit hash=%s", text_hash)
         reply_ru, needs_clarification, candidates = cached
     else:
+        logger.debug("event=chat.cache_miss hash=%s route=llm", text_hash)
         client = make_client(settings.openai_api_key, settings.openai_timeout_seconds)
         try:
             reply_ru, needs_clarification, candidates, _usage = await check_and_suggest(
@@ -277,6 +284,12 @@ async def _handle_chat_turn(
                 # there's just nothing left to store.
                 await session.rollback()
 
+    logger.debug(
+        "event=chat.decision needs_clarification=%s candidates=%d",
+        needs_clarification,
+        len(candidates),
+    )
+
     # reply_ru is a required schema field but strict mode can't enforce
     # non-empty - fall back rather than silently sending nothing back, which
     # would look like the bot ignored the message entirely.
@@ -288,6 +301,7 @@ async def _handle_chat_turn(
         await message.answer(chunk)
 
     if needs_clarification:
+        logger.debug("event=chat.awaiting_clarification")
         # context_text is the text this very question is about, even on a
         # (should-not-happen) second clarification round after a follow-up.
         await state.set_state(AddStates.awaiting_instruction)
@@ -295,6 +309,7 @@ async def _handle_chat_turn(
         return
 
     if not candidates:
+        logger.debug("event=chat.no_candidates")
         return
 
     user_id = message.from_user.id
@@ -327,6 +342,12 @@ async def _handle_chat_turn(
         # whole picker message with BUTTON_DATA_INVALID - silently, since
         # nothing here caught it yet at the time.
         batch_id = uuid.uuid4().hex[:12]
+        logger.debug(
+            "event=add.deck_prompt batch_id=%s candidates=%d decks=%d",
+            batch_id,
+            len(candidates),
+            len(decks),
+        )
         await state.set_state(AddStates.choosing_deck)
         await state.update_data(batch_id=batch_id, candidates=candidates, source_id=source_id)
         await message.answer(
@@ -337,7 +358,7 @@ async def _handle_chat_turn(
         # user would see "Добавляю." and then nothing, ever, with no error
         # anywhere they could see (found live 27.08.2026). Better to admit
         # failure than to leave them guessing whether it worked.
-        logger.exception("chat_message failed while saving candidates")
+        logger.exception("event=add.error stage=save_candidates")
         await message.answer(
             "Не получилось сохранить - что-то пошло не так на моей стороне. "
             "Попробуй прислать список ещё раз."
@@ -460,6 +481,7 @@ async def _save_candidates_and_report(
     candidates: list[dict],
 ) -> None:
     now = datetime.now(UTC)
+    start = time.monotonic()
 
     async with session_factory() as session:
         deck = await session.get(Deck, deck_id)
@@ -484,7 +506,7 @@ async def _save_candidates_and_report(
         to_add.append(candidate)
 
     logger.info(
-        "add.save dedup deck=%s candidates=%d to_add=%d duplicates=%d",
+        "event=add.dedup deck=%s candidates=%d to_add=%d duplicates=%d",
         deck_id,
         len(candidates),
         len(to_add),
@@ -494,6 +516,7 @@ async def _save_candidates_and_report(
     saved: list[tuple[str, str]] = []
     failed: list[tuple[str, str]] = []
     for candidate in to_add:
+        logger.debug("event=add.candidate lemma=%s kind=%s", candidate["lemma"], candidate["kind"])
         resolved = None
         if candidate["kind"] == "word":
             client = make_client(settings.openai_api_key, settings.openai_timeout_seconds)
@@ -510,7 +533,9 @@ async def _save_candidates_and_report(
                 failed.append((candidate["lemma"], "предохранитель сработал"))
                 continue
             except openai.APIError:
-                logger.exception("ingest.resolve_note_forms failed lemma=%s", candidate["lemma"])
+                logger.exception(
+                    "event=llm.error op=resolve_note_forms lemma=%s", candidate["lemma"]
+                )
                 failed.append((candidate["lemma"], "OpenAI недоступен"))
                 continue
 
@@ -518,9 +543,7 @@ async def _save_candidates_and_report(
         try:
             load_validator().validate(full_note)
         except jsonschema.ValidationError:
-            logger.exception(
-                "ingest candidate failed schema validation lemma=%s", candidate.get("lemma")
-            )
+            logger.exception("event=ingest.schema_invalid lemma=%s", candidate.get("lemma"))
             failed.append((candidate["lemma"], "невалидные данные от модели"))
             continue
 
@@ -542,6 +565,16 @@ async def _save_candidates_and_report(
             )
             await session.commit()
         saved.append((full_note["lemma"], full_note["translation_ru"]))
+
+    duration_ms = int((time.monotonic() - start) * 1000)
+    logger.info(
+        "event=add.save deck=%s saved=%d duplicates=%d failed=%d duration_ms=%d",
+        deck_id,
+        len(saved),
+        len(duplicate_lemmas),
+        len(failed),
+        duration_ms,
+    )
 
     lines = [f"🇫🇮 {lemma} → {translation}" for lemma, translation in saved]
     if saved:

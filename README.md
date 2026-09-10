@@ -62,6 +62,19 @@ alembic upgrade head
 python -m kielikaveri.bot.main
 ```
 
+## Logs
+
+Logs go to stdout (captured by `journalctl -u kielikaveri` under systemd)
+and to a daily-rotated file at `LOG_FILE` (default `logs/kielikaveri.log`,
+14 days kept):
+
+```bash
+tail -f logs/kielikaveri.log
+```
+
+Set `LOG_LEVEL=DEBUG` in `.env` to also see the per-request lines `httpx`/
+`openai` log for every OpenAI call.
+
 ## Importing phase 0 cards
 
 ```bash

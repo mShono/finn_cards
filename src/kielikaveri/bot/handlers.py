@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 
 from aiogram import F, Router
@@ -10,6 +11,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from kielikaveri.bot.text import split_message
 from kielikaveri.db.models import Card, Note
+
+logger = logging.getLogger(__name__)
 
 router = Router(name="core")
 
@@ -64,6 +67,7 @@ async def stats(message: Message, session_factory: async_sessionmaker[AsyncSessi
             .where(Card.user_id == user_id, Card.due <= datetime.now(UTC))
         )
 
+    logger.info("event=stats.query notes=%d due_cards=%d", notes_count, due_cards_count)
     text = f"Заметок: {notes_count}\nКарточек к повторению: {due_cards_count}"
     for chunk in split_message(text):
         await message.answer(chunk)

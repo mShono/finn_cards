@@ -1,15 +1,20 @@
 import json
+import logging
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from conftest import log_fields
 
 from kielikaveri.db.engine import create_all, make_engine, make_session_factory
 from kielikaveri.db.models import Note, NoteKind
 from kielikaveri.ingest import (
+    TokenUsage,
     _chat_schema,
     _load_note_schema,
+    _log_llm_request,
+    _log_llm_response,
     build_full_note,
     canonical_key,
     check_and_suggest,
@@ -233,6 +238,164 @@ async def test_resolve_note_forms_handles_a_pos_with_no_forms_table():
     assert resolved.principal_forms == {}
     assert usage is None
     client.responses.create.assert_not_called()
+
+
+# --- application-level logging -----------------------------------------------------
+
+
+async def test_check_and_suggest_logs_request_and_response_with_duration_and_usage(caplog):
+    client = MagicMock()
+    client.responses.create = AsyncMock(
+        return_value=fake_response(
+            {"reply_ru": "Нашла кое-что.", "needs_clarification": False, "candidates": []}
+        )
+    )
+    breaker = make_breaker()
+
+    with caplog.at_level(logging.DEBUG, logger="kielikaveri.ingest"):
+        await check_and_suggest(client, breaker, "gpt-5.6-terra", "text", NOW)
+
+    events = [log_fields(r.message) for r in caplog.records]
+    request = next(f for f in events if f.get("event") == "llm.request")
+    assert request["op"] == "check_and_suggest"
+    assert request["model"] == "gpt-5.6-terra"
+
+    response = next(f for f in events if f.get("event") == "llm.response")
+    assert response["op"] == "check_and_suggest"
+    assert response["total_tokens"] == "15"
+    assert int(response["duration_ms"]) >= 0
+
+
+# The fixed field set every op=llm.request / op=llm.response must carry,
+# regardless of which LLM call produced it - this is what _log_llm_request/
+# _log_llm_response exist to guarantee structurally, not just by convention.
+_LLM_REQUEST_CORE_FIELDS = {"event", "op", "model"}
+_LLM_RESPONSE_CORE_FIELDS = {
+    "event",
+    "op",
+    "model",
+    "duration_ms",
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+}
+
+
+def test_log_llm_request_always_carries_the_core_fields(caplog):
+    with caplog.at_level(logging.DEBUG, logger="kielikaveri.ingest"):
+        _log_llm_request("some_future_op", "gpt-5.6-terra", extra_field="whatever")
+
+    fields = log_fields(caplog.records[0].message)
+    assert _LLM_REQUEST_CORE_FIELDS <= fields.keys()
+    assert fields["op"] == "some_future_op"
+    assert fields["model"] == "gpt-5.6-terra"
+
+
+def test_log_llm_response_always_carries_the_core_fields(caplog):
+    usage = TokenUsage(input_tokens=1, output_tokens=2, total_tokens=3)
+
+    with caplog.at_level(logging.INFO, logger="kielikaveri.ingest"):
+        _log_llm_response("some_future_op", "gpt-5.6-terra", 42, usage, extra_field="whatever")
+
+    fields = log_fields(caplog.records[0].message)
+    assert _LLM_RESPONSE_CORE_FIELDS <= fields.keys()
+    assert fields["duration_ms"] == "42"
+    assert fields["total_tokens"] == "3"
+
+
+async def test_llm_response_core_fields_match_across_different_ops(caplog):
+    """The actual regression this guards against: check_and_suggest and
+    resolve_ambiguous_forms are two independent call sites - nothing but
+    _log_llm_response stops one of them from quietly dropping a field
+    (e.g. model, or total_tokens) that the other still has."""
+    client = MagicMock()
+    client.responses.create = AsyncMock(
+        return_value=fake_response(
+            {"reply_ru": "Ok.", "needs_clarification": False, "candidates": []}
+        )
+    )
+    breaker = make_breaker()
+
+    with caplog.at_level(logging.INFO, logger="kielikaveri.ingest"):
+        await check_and_suggest(client, breaker, "gpt-5.6-terra", "text", NOW)
+    check_and_suggest_fields = log_fields(
+        next(r.message for r in caplog.records if "event=llm.response" in r.message)
+    )
+    caplog.clear()
+
+    client2 = MagicMock()
+    client2.responses.create = AsyncMock(
+        return_value=fake_response({"monikon_genetiivi": "hampaiden"})
+    )
+    with caplog.at_level(logging.INFO, logger="kielikaveri.ingest"):
+        await resolve_ambiguous_forms(
+            client2,
+            breaker,
+            "gpt-5.6-terra",
+            "hammas",
+            "substantiivi",
+            {"monikon_genetiivi": ["hampaiden"]},
+            NOW,
+        )
+    resolve_ambiguous_forms_fields = log_fields(
+        next(r.message for r in caplog.records if "event=llm.response" in r.message)
+    )
+
+    # Same core field set present on both - the exact values differ (different
+    # calls), but neither op is missing a field the other one has.
+    assert _LLM_RESPONSE_CORE_FIELDS <= check_and_suggest_fields.keys()
+    assert _LLM_RESPONSE_CORE_FIELDS <= resolve_ambiguous_forms_fields.keys()
+
+
+async def test_resolve_note_forms_fst_only_logs_fst_resolve_from_morphology(caplog):
+    client = MagicMock()
+    client.responses.create = AsyncMock()
+    breaker = make_breaker()
+
+    with caplog.at_level(logging.DEBUG, logger="finn_cards.morphology"):
+        await resolve_note_forms(client, breaker, "gpt-5.6-terra", "hakea", "verbi", NOW)
+
+    events = [log_fields(r.message) for r in caplog.records]
+    resolve_events = [f for f in events if f.get("event") == "fst.resolve"]
+    assert len(resolve_events) == 1
+    assert resolve_events[0]["lemma"] == "hakea"
+    assert resolve_events[0]["forms_source"] == "fst"
+
+
+async def test_resolve_note_forms_ambiguous_logs_debug_not_warning(caplog):
+    client = MagicMock()
+    client.responses.create = AsyncMock(
+        return_value=fake_response({"monikon_genetiivi": "hampaiden"})
+    )
+    breaker = make_breaker()
+
+    with caplog.at_level(logging.DEBUG, logger="kielikaveri.ingest"):
+        await resolve_note_forms(client, breaker, "gpt-5.6-terra", "hammas", "substantiivi", NOW)
+
+    ambiguous = [
+        r
+        for r in caplog.records
+        if log_fields(r.message).get("event") == "resolve_note_forms.ambiguous"
+    ]
+    assert len(ambiguous) == 1
+    assert ambiguous[0].levelno == logging.DEBUG
+
+
+async def test_resolve_note_forms_missing_table_logs_warning_fallback(caplog):
+    client = MagicMock()
+    client.responses.create = AsyncMock()
+    breaker = make_breaker()
+
+    with caplog.at_level(logging.WARNING, logger="kielikaveri.ingest"):
+        await resolve_note_forms(client, breaker, "gpt-5.6-terra", "kuitenkin", "adverbi", NOW)
+
+    fallbacks = [
+        log_fields(r.message)
+        for r in caplog.records
+        if log_fields(r.message).get("event") == "resolve_note_forms.fallback"
+    ]
+    assert len(fallbacks) == 1
+    assert fallbacks[0]["reason"] == "no_fst_table"
 
 
 async def test_resolve_note_forms_handles_a_missing_pos():
