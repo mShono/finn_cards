@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -9,6 +10,7 @@ from aiogram.filters import CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
+from conftest import log_fields
 from sqlalchemy import select
 
 from kielikaveri.bot.add import (
@@ -816,3 +818,84 @@ async def test_delete_cancel_deletes_nothing():
     await delete_cancel(callback)
 
     callback.answer.assert_awaited_once_with("Отменено.")
+
+
+# --- application-level logging ---------------------------------------------
+
+
+async def test_chat_cache_hit_logs_event_and_skips_the_llm_call(
+    session_factory, monkeypatch, caplog
+):
+    from kielikaveri.ingest import hash_text, store_cached_chat
+
+    async with session_factory() as session:
+        await store_cached_chat(
+            session,
+            hash_text("Haen töitä.", "gpt-5.6-terra", is_follow_up=False),
+            "gpt-5.6-terra",
+            "Из кэша.",
+            False,
+            [],
+        )
+        await session.commit()
+
+    mock = AsyncMock()
+    monkeypatch.setattr("kielikaveri.bot.add.check_and_suggest", mock)
+    message = make_message("Haen töitä.")
+
+    with caplog.at_level(logging.INFO, logger="kielikaveri.bot.add"):
+        await chat_message(message, make_state(), session_factory, make_settings(), make_breaker())
+
+    mock.assert_not_called()
+    events = [log_fields(r.message).get("event") for r in caplog.records]
+    assert "chat.cache_hit" in events
+    assert "chat.cache_miss" not in events
+
+
+async def test_chat_cache_miss_logs_decision_with_candidate_count(
+    session_factory, monkeypatch, caplog
+):
+    patch_check_and_suggest(monkeypatch, "Нашла кое-что.", [WORD_CANDIDATE])
+    message = make_message("Haen töitä uniikki-lause.")
+
+    with caplog.at_level(logging.DEBUG, logger="kielikaveri.bot.add"):
+        await chat_message(message, make_state(), session_factory, make_settings(), make_breaker())
+
+    decisions = [
+        log_fields(r.message)
+        for r in caplog.records
+        if log_fields(r.message).get("event") == "chat.decision"
+    ]
+    assert len(decisions) == 1
+    assert decisions[0]["needs_clarification"] == "False"
+    assert decisions[0]["candidates"] == "1"
+
+
+async def test_add_save_logs_event_with_saved_and_duplicate_counts(
+    session_factory, monkeypatch, caplog
+):
+    patch_resolve_note_forms(monkeypatch)
+    async with session_factory() as session:
+        deck = await create_deck(session, 1, "Общая")
+        await set_active_deck(session, 1, deck.id)
+        await session.commit()
+        source = await _make_source(session)
+
+    state = make_state()
+    await state.set_state(AddStates.choosing_deck)
+    await state.update_data(batch_id="batch-1", candidates=[WORD_CANDIDATE], source_id=source)
+    callback = make_callback(f"adddeck:batch-1:{deck.id}")
+
+    with caplog.at_level(logging.INFO, logger="kielikaveri.bot.add"):
+        await add_deck_choice(callback, state, session_factory, make_settings(), make_breaker())
+
+    saves = [
+        log_fields(r.message)
+        for r in caplog.records
+        if log_fields(r.message).get("event") == "add.save"
+    ]
+    assert len(saves) == 1
+    assert saves[0]["saved"] == "1"
+    assert saves[0]["duplicates"] == "0"
+    assert saves[0]["failed"] == "0"
+    assert int(saves[0]["duration_ms"]) >= 0

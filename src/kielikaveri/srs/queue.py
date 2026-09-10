@@ -4,6 +4,7 @@ limit and the debt (backlog) threshold. DB-facing, no Telegram here.
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -11,6 +12,8 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from kielikaveri.db.models import Card, Note, Review
+
+logger = logging.getLogger(__name__)
 
 # The study day boundary is defined in Europe/Helsinki regardless of where
 # the server runs (see plan 3.10) - it's the learner's day that matters, not
@@ -106,6 +109,14 @@ async def build_session_queue(
         queue.append(card.id)
         if len(queue) >= session_max_cards:
             break
+
+    logger.debug(
+        "event=learn.queue_built candidates=%d queue=%d new_used=%d new_budget=%d",
+        len(candidates),
+        len(queue),
+        new_used,
+        new_budget,
+    )
     return queue
 
 
@@ -123,4 +134,7 @@ async def defer_overdue_tail(
     tail = cards[keep_n:]
     for card in tail:
         card.due = now + timedelta(days=postpone_days)
+    logger.debug(
+        "event=learn.debt_deferred overdue=%d kept=%d deferred=%d", len(cards), keep_n, len(tail)
+    )
     return len(tail)

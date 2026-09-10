@@ -9,8 +9,11 @@ always means a bug, not real usage.
 
 from __future__ import annotations
 
+import logging
 from collections import deque
 from datetime import datetime, timedelta
+
+logger = logging.getLogger(__name__)
 
 
 class CircuitOpenError(Exception):
@@ -29,6 +32,11 @@ class CallBreaker:
         while self._calls and self._calls[0] < cutoff:
             self._calls.popleft()
         if len(self._calls) >= self._max_calls:
+            logger.warning(
+                "event=breaker.trip max_calls=%d window_minutes=%s",
+                self._max_calls,
+                self._window,
+            )
             raise CircuitOpenError(
                 f"more than {self._max_calls} OpenAI calls in {self._window} - stopped"
             )

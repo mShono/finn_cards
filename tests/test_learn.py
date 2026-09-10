@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -7,6 +8,7 @@ import pytest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
+from conftest import log_fields
 from sqlalchemy import select
 
 from kielikaveri.bot.learn import (
@@ -616,3 +618,131 @@ async def test_learn_debt_choice_batch_starts_a_session_without_deferring_anythi
     messages = [call.args[0] for call in callback.message.answer.call_args_list]
     assert not any("Отложено" in m for m in messages)
     assert await state.get_state() == LearnStates.reviewing
+
+
+# --- application-level logging ------------------------------------------------
+
+
+async def test_learn_start_single_deck_logs_session_start(session_factory, caplog):
+    async with session_factory() as session:
+        session.add(User(id=1))
+        deck = await create_deck(session, 1, "Общая")
+        await session.flush()
+        session.add(make_note(deck_id=deck.id))
+        await session.flush()
+        session.add(make_card("card-A", "note-1", 1, due=NOW - timedelta(days=1)))
+        await session.commit()
+
+    state = make_state()
+    message = make_message()
+
+    with caplog.at_level(logging.INFO, logger="kielikaveri.bot.learn"):
+        await learn_start(message, state, session_factory, make_settings())
+
+    events = [log_fields(r.message) for r in caplog.records]
+    start = next(f for f in events if f.get("event") == "learn.session_start")
+    assert start["queue"] == "1"
+
+
+async def test_learn_start_with_no_due_cards_logs_session_empty(session_factory, caplog):
+    async with session_factory() as session:
+        session.add(User(id=1))
+        await session.commit()
+
+    state = make_state()
+    message = make_message()
+
+    with caplog.at_level(logging.INFO, logger="kielikaveri.bot.learn"):
+        await learn_start(message, state, session_factory, make_settings())
+
+    events = [log_fields(r.message) for r in caplog.records]
+    assert any(f.get("event") == "learn.session_empty" for f in events)
+
+
+async def test_show_next_card_logs_session_end_with_reason_and_counts(session_factory, caplog):
+    async with session_factory() as session:
+        session.add(User(id=1))
+        session.add(make_note())
+        await session.flush()
+        session.add(make_card("card-A", "note-1", 1, due=NOW))
+        session.add(make_card("card-B", "note-1", 1, due=NOW))
+        await session.commit()
+
+    state = make_state()
+    await state.update_data(
+        queue=["card-A", "card-B"],
+        reviewed_count=2,
+        session_started_at=datetime.now(UTC).isoformat(),
+        session_max_cards=2,
+        session_max_minutes=10,
+    )
+    answer_to = SimpleNamespace(answer=AsyncMock())
+
+    with caplog.at_level(logging.INFO, logger="kielikaveri.bot.learn"):
+        await _show_next_card(answer_to, state, session_factory)
+
+    events = [log_fields(r.message) for r in caplog.records]
+    end = next(f for f in events if f.get("event") == "learn.session_end")
+    assert end["reason"] == "max_cards"
+    assert end["reviewed"] == "2"
+    assert end["remaining"] == "2"
+
+
+async def test_learn_reveal_logs_reveal_event(session_factory, caplog):
+    async with session_factory() as session:
+        session.add(User(id=1))
+        session.add(make_note())
+        await session.flush()
+        session.add(make_card("card-A", "note-1", 1, due=NOW))
+        await session.commit()
+
+    callback = make_callback("learn:reveal:card-A")
+
+    with caplog.at_level(logging.DEBUG, logger="kielikaveri.bot.learn"):
+        await learn_reveal(callback, session_factory)
+
+    events = [log_fields(r.message) for r in caplog.records]
+    reveal = next(f for f in events if f.get("event") == "learn.reveal")
+    assert reveal["card_id"] == "card-A"
+
+
+async def test_learn_rate_logs_db_save_with_rating(session_factory, caplog):
+    async with session_factory() as session:
+        session.add(User(id=1))
+        session.add(make_note())
+        await session.flush()
+        session.add(make_card("card-A", "note-1", 1, due=NOW))
+        await session.commit()
+
+    state = make_state()
+    await state.update_data(
+        queue=["card-A"],
+        reviewed_count=0,
+        session_started_at=datetime.now(UTC).isoformat(),
+        session_max_cards=20,
+        session_max_minutes=10,
+    )
+    callback = make_callback("learn:rate:card-A:3")
+
+    with caplog.at_level(logging.INFO, logger="kielikaveri.bot.learn"):
+        await learn_rate(callback, state, session_factory)
+
+    events = [log_fields(r.message) for r in caplog.records]
+    saved = next(f for f in events if f.get("event") == "db.save")
+    assert saved["entity"] == "review"
+    assert saved["card_id"] == "card-A"
+    assert saved["rating"] == "3"
+
+
+async def test_learn_rate_stale_button_logs_debug_not_a_save(session_factory, caplog):
+    await _seed_reviewed_card(session_factory, "card-A")
+    state = make_state()
+    await state.update_data(queue=["card-B"], reviewed_count=1)
+    callback = make_callback("learn:rate:card-A:3")
+
+    with caplog.at_level(logging.DEBUG, logger="kielikaveri.bot.learn"):
+        await learn_rate(callback, state, session_factory)
+
+    events = [log_fields(r.message) for r in caplog.records]
+    assert any(f.get("event") == "learn.rate_stale" for f in events)
+    assert not any(f.get("event") == "db.save" for f in events)

@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -180,6 +181,36 @@ def _usage_from(response) -> TokenUsage:
     )
 
 
+def _log_llm_request(op: str, model: str, **extra: object) -> None:
+    """Every LLM call logs through here, never logger.debug() directly - the
+    point is that op/model can't silently go missing at a future call site
+    the way two hand-written logger calls eventually would (found while
+    auditing: check_and_suggest and resolve_ambiguous_forms already agreed
+    by coincidence, not by anything enforcing it)."""
+    suffix = "".join(f" {key}={value}" for key, value in extra.items())
+    logger.debug("event=llm.request op=%s model=%s%s", op, model, suffix)
+
+
+def _log_llm_response(
+    op: str, model: str, duration_ms: int, usage: TokenUsage, **extra: object
+) -> None:
+    """Counterpart to _log_llm_request() - op/model/duration_ms/token counts
+    are always present and always in this order; extra is only for fields
+    specific to one op (e.g. lemma, needs_clarification)."""
+    suffix = "".join(f" {key}={value}" for key, value in extra.items())
+    logger.info(
+        "event=llm.response op=%s model=%s duration_ms=%d input_tokens=%d output_tokens=%d "
+        "total_tokens=%d%s",
+        op,
+        model,
+        duration_ms,
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.total_tokens,
+        suffix,
+    )
+
+
 async def get_cached_chat(
     session: AsyncSession, text_hash: str
 ) -> tuple[str, bool, list[dict]] | None:
@@ -228,6 +259,8 @@ async def check_and_suggest(
     _chat_instructions(is_follow_up=...).
     """
     breaker.check(now)
+    _log_llm_request("check_and_suggest", model)
+    start = time.monotonic()
     response = await client.responses.create(
         model=model,
         instructions=_chat_instructions(is_follow_up=context_text is not None),
@@ -241,17 +274,16 @@ async def check_and_suggest(
             }
         },
     )
+    duration_ms = int((time.monotonic() - start) * 1000)
     payload = json.loads(response.output_text)
     usage = _usage_from(response)
-    logger.info(
-        "ingest.check_and_suggest model=%s input_tokens=%d output_tokens=%d total_tokens=%d "
-        "needs_clarification=%s candidates=%d",
+    _log_llm_response(
+        "check_and_suggest",
         model,
-        usage.input_tokens,
-        usage.output_tokens,
-        usage.total_tokens,
-        payload["needs_clarification"],
-        len(payload["candidates"]),
+        duration_ms,
+        usage,
+        needs_clarification=payload["needs_clarification"],
+        candidates=len(payload["candidates"]),
     )
     return payload["reply_ru"], payload["needs_clarification"], payload["candidates"], usage
 
@@ -275,6 +307,8 @@ async def resolve_ambiguous_forms(
             name: {"type": "string", "enum": candidates} for name, candidates in ambiguous.items()
         },
     }
+    _log_llm_request("resolve_ambiguous_forms", model, lemma=lemma)
+    start = time.monotonic()
     response = await client.responses.create(
         model=model,
         instructions=(
@@ -293,17 +327,10 @@ async def resolve_ambiguous_forms(
             }
         },
     )
+    duration_ms = int((time.monotonic() - start) * 1000)
     chosen = json.loads(response.output_text)
     usage = _usage_from(response)
-    logger.info(
-        "ingest.resolve_ambiguous_forms model=%s lemma=%s input_tokens=%d output_tokens=%d "
-        "total_tokens=%d",
-        model,
-        lemma,
-        usage.input_tokens,
-        usage.output_tokens,
-        usage.total_tokens,
-    )
+    _log_llm_response("resolve_ambiguous_forms", model, duration_ms, usage, lemma=lemma)
     return chosen, usage
 
 
@@ -329,6 +356,14 @@ async def resolve_note_forms(
     try:
         result: FormsResult = generate_forms(lemma, pos)
     except ValueError:
+        # Always forms_verified=False - a real degradation (unverified LLM
+        # guess stands in for the FST), not a routine branch.
+        logger.warning(
+            "event=resolve_note_forms.fallback reason=no_fst_table lemma=%s pos=%s "
+            "forms_source=llm",
+            lemma,
+            pos,
+        )
         return ResolvedForms({}, "llm", False), None
     covered = result.principal_forms.keys() | result.ambiguous.keys()
     missing = set(forms_for_pos(pos)) - covered
@@ -336,6 +371,15 @@ async def resolve_note_forms(
     forms = dict(result.principal_forms)
     usage: TokenUsage | None = None
     if result.ambiguous:
+        # Routine, not a degradation: the FST did resolve every form, it just
+        # returned several equally-weighted candidates for some of them - the
+        # follow-up LLM call still only picks among real FST output.
+        logger.debug(
+            "event=resolve_note_forms.ambiguous lemma=%s pos=%s forms=%s",
+            lemma,
+            pos,
+            list(result.ambiguous),
+        )
         chosen, usage = await resolve_ambiguous_forms(
             client, breaker, model, lemma, pos, result.ambiguous, now
         )
@@ -343,11 +387,24 @@ async def resolve_note_forms(
 
     if missing:
         forms_source, forms_verified = "llm", False
+        logger.warning(
+            "event=resolve_note_forms.fallback reason=fst_missing lemma=%s pos=%s missing=%s",
+            lemma,
+            pos,
+            sorted(missing),
+        )
     elif result.ambiguous:
         forms_source, forms_verified = "fst+llm", True
     else:
         forms_source, forms_verified = "fst", True
 
+    logger.debug(
+        "event=resolve_note_forms.decision lemma=%s pos=%s forms_source=%s forms_verified=%s",
+        lemma,
+        pos,
+        forms_source,
+        forms_verified,
+    )
     return ResolvedForms(forms, forms_source, forms_verified), usage
 
 

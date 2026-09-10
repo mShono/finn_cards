@@ -1,6 +1,8 @@
+import logging
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from conftest import log_fields
 
 from kielikaveri.llm.breaker import CallBreaker, CircuitOpenError
 
@@ -41,3 +43,22 @@ def test_old_calls_fall_out_of_the_window_and_free_up_budget():
 
     # Past the window - the first call has aged out, budget is free again.
     breaker.check(NOW + timedelta(minutes=11))
+
+
+def test_trip_logs_a_warning_event(caplog):
+    breaker = CallBreaker(max_calls=1, window=timedelta(minutes=10))
+    breaker.check(NOW)
+
+    with (
+        caplog.at_level(logging.WARNING, logger="kielikaveri.llm.breaker"),
+        pytest.raises(CircuitOpenError),
+    ):
+        breaker.check(NOW + timedelta(seconds=1))
+
+    trips = [
+        log_fields(r.message)
+        for r in caplog.records
+        if r.levelno == logging.WARNING and log_fields(r.message).get("event") == "breaker.trip"
+    ]
+    assert len(trips) == 1
+    assert trips[0]["max_calls"] == "1"
