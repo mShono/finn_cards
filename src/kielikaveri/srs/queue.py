@@ -5,13 +5,14 @@ limit and the debt (backlog) threshold. DB-facing, no Telegram here.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from kielikaveri.db.models import Card, Note, Review
+from kielikaveri.db.models import Card, CardStatus, Note, Review
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +39,9 @@ async def due_cards(
     deck_id: str | None = None,
     reviewed_only: bool = False,
 ) -> list[Card]:
-    stmt = select(Card).where(Card.user_id == user_id, Card.due <= now)
+    stmt = select(Card).where(
+        Card.user_id == user_id, Card.due <= now, Card.status == CardStatus.introduced
+    )
     if reviewed_only:
         stmt = stmt.where(Card.reps > 0)
     if deck_id is not None:
@@ -63,12 +66,53 @@ async def overdue_count(
     the backlog prompt on day one. The deck screen leaves it off: there
     "к повторению" does mean everything due, new cards included.
     """
-    stmt = select(func.count()).select_from(Card).where(Card.user_id == user_id, Card.due <= now)
+    stmt = (
+        select(func.count())
+        .select_from(Card)
+        .where(Card.user_id == user_id, Card.due <= now, Card.status == CardStatus.introduced)
+    )
     if reviewed_only:
         stmt = stmt.where(Card.reps > 0)
     if deck_id is not None:
         stmt = stmt.join(Note, Card.note_id == Note.id).where(Note.deck_id == deck_id)
     return await session.scalar(stmt)
+
+
+@dataclass(frozen=True)
+class CardCounters:
+    """What a deck actually contains, kept as separate numbers on purpose.
+
+    `total` is not a workload: most of it can be forms the curriculum has
+    not opened yet. Only `due` asks anything of the learner today, and only
+    `overdue` is debt.
+    """
+
+    total: int
+    introduced: int
+    due: int
+    overdue: int
+    not_introduced: int
+
+
+async def card_counters(
+    session: AsyncSession, user_id: int, now: datetime, deck_id: str | None = None
+) -> CardCounters:
+    def count(*conditions) -> object:
+        stmt = select(func.count()).select_from(Card).where(Card.user_id == user_id, *conditions)
+        if deck_id is not None:
+            stmt = stmt.join(Note, Card.note_id == Note.id).where(Note.deck_id == deck_id)
+        return stmt
+
+    introduced = Card.status == CardStatus.introduced
+    return CardCounters(
+        total=await session.scalar(count()),
+        introduced=await session.scalar(count(introduced)),
+        due=await session.scalar(count(introduced, Card.due <= now)),
+        # Debt: a review that came due and was missed. A card that has never
+        # been shown is not late, it simply has not come up yet.
+        overdue=await session.scalar(count(introduced, Card.due <= now, Card.reps > 0)),
+        not_introduced=await session.scalar(count(Card.status == CardStatus.not_introduced)),
+    )
 
 
 async def count_new_cards_today(
@@ -100,9 +144,15 @@ async def build_session_queue(
 ) -> list[str]:
     """Card ids for one /learn session, oldest-due first.
 
+    Only `introduced` cards are candidates: a form the curriculum has not
+    opened yet has no due date worth honouring, and a suspended one is
+    parked. Opening them is srs/curriculum.py's job, run before this.
+
     Caps total size at `session_max_cards`, and caps how many never-reviewed
     (reps == 0) cards it admits at whatever's left of `daily_new_limit` for
     today's study window - review cards are never held back by this limit.
+    That limit is the defensive one, counted over cards of every type;
+    `daily_new_forms` separately governs how fast new grammar opens.
     `deck_id` narrows candidates to one deck; the daily new-card budget stays
     global across decks on purpose - it's a "don't overload the learner today"
     cap, not a per-deck one.

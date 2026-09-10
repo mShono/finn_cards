@@ -1,5 +1,5 @@
 from finn_cards.morphology import NOMINAL_FORMS, VERB_FORMS
-from kielikaveri.grammar import FORM_TASKS, NOT_QUIZZED, FormCategory
+from kielikaveri.grammar import FORM_TASKS, NEVER_ASKED, FormCategory
 
 
 def test_every_fst_form_is_either_quizzed_or_explicitly_excluded():
@@ -8,8 +8,8 @@ def test_every_fst_form_is_either_quizzed_or_explicitly_excluded():
     # ("rientää → nut_partisiippi?"). Now it must be one or the other.
     all_forms = set(VERB_FORMS) | set(NOMINAL_FORMS)
 
-    assert set(FORM_TASKS) | NOT_QUIZZED == all_forms
-    assert set(FORM_TASKS) & NOT_QUIZZED == set()
+    assert set(FORM_TASKS) | NEVER_ASKED == all_forms
+    assert set(FORM_TASKS) & NEVER_ASKED == set()
 
 
 def test_no_task_leaks_a_technical_term_into_the_cue():
@@ -29,7 +29,7 @@ def test_every_task_names_the_category_on_the_back():
 
 
 def test_nominative_is_not_quizzed_because_it_equals_the_lemma():
-    assert "nominatiivi" in NOT_QUIZZED
+    assert "nominatiivi" in NEVER_ASKED
     assert "nominatiivi" not in FORM_TASKS
 
 

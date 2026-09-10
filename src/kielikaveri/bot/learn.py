@@ -29,6 +29,7 @@ from kielikaveri.config import Settings
 from kielikaveri.db.decks import list_decks
 from kielikaveri.db.models import Card, CardType, Deck, Note, Review
 from kielikaveri.grammar import FORM_TASKS
+from kielikaveri.srs.curriculum import introduce_due_forms
 from kielikaveri.srs.graduation import ensure_card_types, sync_user_card_types
 from kielikaveri.srs.queue import build_session_queue, defer_overdue_tail, overdue_count
 from kielikaveri.srs.scheduler import RATING_LABELS, Rating, SrsState
@@ -207,6 +208,16 @@ async def _proceed_past_deck_choice(
 ) -> None:
     async with session_factory() as session:
         await sync_user_card_types(session, user_id, now)
+        # Cards first, then the curriculum decides which of the new forms
+        # the learner actually meets today - see srs/curriculum.py.
+        await introduce_due_forms(
+            session,
+            user_id,
+            now,
+            daily_new_forms=settings.daily_new_forms,
+            boundary_hour=settings.day_boundary_hour,
+            deck_id=deck_id,
+        )
         await session.commit()
         overdue = await overdue_count(session, user_id, now, deck_id=deck_id, reviewed_only=True)
 

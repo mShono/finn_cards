@@ -24,7 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from kielikaveri.db.decks import active_deck, create_deck, list_decks, set_active_deck
 from kielikaveri.db.models import Deck, Note
-from kielikaveri.srs.queue import overdue_count
+from kielikaveri.srs.queue import card_counters
 
 logger = logging.getLogger(__name__)
 
@@ -72,9 +72,9 @@ async def _decks_list_text_and_keyboard(
             notes_count = await session.scalar(
                 select(func.count()).select_from(Note).where(Note.deck_id == deck.id)
             )
-            due = await overdue_count(session, user_id, now, deck_id=deck.id)
+            counters = await card_counters(session, user_id, now, deck_id=deck.id)
             marker = "📌 " if deck.id == current.id else "• "
-            lines.append(f"{marker}{deck.name} - слов: {notes_count}, к повторению: {due}")
+            lines.append(f"{marker}{deck.name} - слов: {notes_count}, к повторению: {counters.due}")
 
     text = "Твои колоды:\n" + "\n".join(lines) if lines else "Колод пока нет."
     text += f"\n\nСейчас новое сохраняется в «{current.name}» - нажми 📂, чтобы открыть колоду."
@@ -131,9 +131,12 @@ async def decks_open(
         total = await session.scalar(
             select(func.count()).select_from(Note).where(Note.deck_id == deck_id)
         )
-        due = await overdue_count(session, user_id, now, deck_id=deck_id)
+        counters = await card_counters(session, user_id, now, deck_id=deck_id)
 
-    lines = [f"📂 «{deck.name}» - слов: {total}, к повторению: {due}"]
+    lines = [
+        f"📂 «{deck.name}» - слов: {total}, к повторению: {counters.due}",
+        f"формы: изучается {counters.introduced}, ещё не открыто {counters.not_introduced}",
+    ]
     if not notes:
         lines.append("\nКарточек пока нет.")
     else:

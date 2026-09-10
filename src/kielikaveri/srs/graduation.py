@@ -19,7 +19,7 @@ from datetime import datetime
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from kielikaveri.db.models import Card, CardType, Note
+from kielikaveri.db.models import Card, CardStatus, CardType, Note
 from kielikaveri.grammar import FORM_TASKS
 
 PRODUCTION_STABILITY_THRESHOLD_DAYS = 3.0
@@ -36,7 +36,14 @@ async def ensure_card_types(session: AsyncSession, note: Note, now: datetime) ->
     created: list[Card] = []
 
     if CardType.recognition not in by_type:
-        card = Card(note_id=note.id, user_id=note.user_id, type=CardType.recognition, due=now)
+        card = Card(
+            note_id=note.id,
+            user_id=note.user_id,
+            type=CardType.recognition,
+            due=now,
+            status=CardStatus.introduced,
+            introduced_at=now,
+        )
         session.add(card)
         created.append(card)
         by_type[CardType.recognition] = card
@@ -47,7 +54,16 @@ async def ensure_card_types(session: AsyncSession, note: Note, now: datetime) ->
         and recognition is not None
         and (recognition.stability or 0.0) >= PRODUCTION_STABILITY_THRESHOLD_DAYS
     ):
-        card = Card(note_id=note.id, user_id=note.user_id, type=CardType.production, due=now)
+        # One card per note, opened by a condition of its own - no need to
+        # route it through the curriculum's form budget.
+        card = Card(
+            note_id=note.id,
+            user_id=note.user_id,
+            type=CardType.production,
+            due=now,
+            status=CardStatus.introduced,
+            introduced_at=now,
+        )
         session.add(card)
         created.append(card)
 
@@ -60,7 +76,12 @@ async def ensure_card_types(session: AsyncSession, note: Note, now: datetime) ->
 def _ensure_inflection_cards(
     session: AsyncSession, note: Note, existing: Sequence[Card], now: datetime
 ) -> list[Card]:
-    """One inflection card per quizzable principal form, created at most once each."""
+    """One inflection card per quizzable principal form, created at most once each.
+
+    Created `not_introduced`: existing is cheap, being shown is not. Which
+    of them the learner actually meets, and when, is srs/curriculum.py's
+    call - see CardStatus.
+    """
     forms: dict = note.meta.get("principal_forms") or {}
     wanted = [name for name in forms if name in FORM_TASKS]
     inflection = [card for card in existing if card.type == CardType.inflection]
@@ -79,7 +100,12 @@ def _ensure_inflection_cards(
         if name in covered:
             continue
         card = Card(
-            note_id=note.id, user_id=note.user_id, type=CardType.inflection, form=name, due=now
+            note_id=note.id,
+            user_id=note.user_id,
+            type=CardType.inflection,
+            form=name,
+            due=now,
+            status=CardStatus.not_introduced,
         )
         session.add(card)
         created.append(card)

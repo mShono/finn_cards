@@ -76,6 +76,26 @@ class CardState(str, enum.Enum):
     relearning = "relearning"
 
 
+class CardStatus(str, enum.Enum):
+    """Whether a card has entered the learner's rotation at all.
+
+    A separate axis from CardState: CardState belongs to py-fsrs and every
+    card carries one from birth, so it cannot express "exists but has never
+    been shown". Existing is cheap (a noun opens 12 form cards at once);
+    being introduced is what costs the learner attention, and only
+    introduced cards are due, count as debt, or reach FSRS:
+
+        not_introduced             created, waiting for the curriculum
+        introduced + learning      in the FSRS learning steps
+        introduced + review        scheduled by FSRS
+        suspended                  parked by hand, never shown
+    """
+
+    not_introduced = "not_introduced"
+    introduced = "introduced"
+    suspended = "suspended"
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -156,6 +176,15 @@ class Card(Base):
     # card drawing a random form each time, "easy" on the illative would
     # push the translative out by the same interval.
     form: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Defaults to `introduced` so a card created without a thought about the
+    # curriculum behaves the way every card did before this column existed;
+    # inflection cards are the ones created not_introduced on purpose.
+    status: Mapped[CardStatus] = mapped_column(
+        Enum(CardStatus, native_enum=False), default=CardStatus.introduced, index=True
+    )
+    # When the curriculum let this card in. NULL for cards that never were -
+    # used to count today's introductions against the daily form budget.
+    introduced_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True, default=None)
 
     # SRS state - schema's card.srs, flattened. Written by phase 2 (py-fsrs);
     # phase 1 only needs the columns to exist.
