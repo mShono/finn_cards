@@ -45,6 +45,13 @@ NOMINAL_FORMS = {
     "genetiivi": "+Sg+Gen",
     "partitiivi": "+Sg+Par",
     "illatiivi": "+Sg+Ill",
+    "inessiivi": "+Sg+Ine",
+    "elatiivi": "+Sg+Ela",
+    "adessiivi": "+Sg+Ade",
+    "ablatiivi": "+Sg+Abl",
+    "allatiivi": "+Sg+All",
+    "essiivi": "+Sg+Ess",
+    "translatiivi": "+Sg+Tra",
     "monikon_genetiivi": "+Pl+Gen",
     "monikon_partitiivi": "+Pl+Par",
 }
