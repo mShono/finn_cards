@@ -162,8 +162,15 @@ class WhitelistMiddleware(BaseMiddleware):
                 return await handler(event, data)
             logger.warning("event=route.blocked reason=whitelist user_id=%s", user.id)
             data["_route_blocked"] = True
-            if isinstance(event, Update) and event.message is not None:
-                await event.message.answer(DECLINE_TEXT)
+            if isinstance(event, Update):
+                if event.message is not None:
+                    await event.message.answer(DECLINE_TEXT)
+                elif event.callback_query is not None:
+                    # Telegram shows a spinning loader on the tapped button
+                    # until answerCallbackQuery is called - without this, a
+                    # blocked callback_query leaves it stuck spinning until
+                    # Telegram's own client-side timeout.
+                    await event.callback_query.answer(DECLINE_TEXT)
             return None
 
         if isinstance(event, Update) and any(

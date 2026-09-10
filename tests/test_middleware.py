@@ -72,6 +72,22 @@ async def test_non_whitelisted_user_is_declined_without_calling_handler():
     message.answer.assert_awaited_once_with(DECLINE_TEXT)
 
 
+async def test_non_whitelisted_callback_query_is_declined_without_calling_handler():
+    # A blocked callback_query must still get answered - otherwise Telegram
+    # leaves the tapped button's loading spinner stuck until its own timeout.
+    middleware = WhitelistMiddleware({1})
+    update = make_callback_update()
+    handler = AsyncMock()
+    data = {"event_from_user": SimpleNamespace(id=999)}
+
+    result = await middleware(handler, update, data)
+
+    assert result is None
+    handler.assert_not_awaited()
+    update.callback_query.answer.assert_awaited_once_with(DECLINE_TEXT)
+    update.callback_query.message.answer.assert_not_called()
+
+
 async def test_channel_post_passes_through():
     # A channel post is authored by the channel, not a Telegram user - there
     # is no from_user, and thus nothing to check against the whitelist.
