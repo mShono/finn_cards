@@ -36,6 +36,12 @@ VERB_FORMS = {
     "preesens_1s": "+Act+Ind+Prs+Sg1",
     "preesens_3s": "+Act+Ind+Prs+Sg3",
     "imperfekti_3s": "+Act+Ind+Prt+Sg3",
+    "konditionaali_1s": "+Act+Cond+Sg1",
+    # Ambiguous for the same verbs preesens_1s already is (olla, tulla,
+    # mennä, tarvita - the FST offers the colloquial "mee" beside "mene"),
+    # so it costs no note its inflection card: those go through the same
+    # LLM tie-break in ingest.resolve_note_forms().
+    "imperatiivi_2s": "+Act+Imprt+Sg2",
     "nut_partisiippi": "+Act+PrfPrc+Sg+Nom",
     "passiivi": "+Pss+Ind+Prs+Pe4",
 }

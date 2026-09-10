@@ -29,6 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from kielikaveri.config import Settings
 from kielikaveri.db.decks import list_decks
 from kielikaveri.db.models import Card, CardType, Deck, Note, Review
+from kielikaveri.grammar import FORM_TASKS
 from kielikaveri.srs.graduation import ensure_card_types, sync_user_card_types
 from kielikaveri.srs.queue import build_session_queue, defer_overdue_tail, overdue_count
 from kielikaveri.srs.scheduler import RATING_LABELS, Rating, SrsState
@@ -56,9 +57,14 @@ def render_card(card: Card, note: Note) -> tuple[str, str]:
         return f"🇷🇺 {note.translation_ru}", f"{note.lemma}\n\n{note.example_fi}"
     if card.type == CardType.inflection:
         forms: dict = note.meta.get("principal_forms") or {}
-        if forms:
-            form_name, form_value = random.choice(list(forms.items()))
-            return f"{note.lemma} → {form_name}?", form_value
+        # A form with no FORM_TASKS entry is skipped rather than shown: the
+        # front must never carry a bare key like "nut_partisiippi", and the
+        # nominative is excluded outright (it equals the lemma on the front).
+        quizzable = [(name, value) for name, value in forms.items() if name in FORM_TASKS]
+        if quizzable:
+            form_name, form_value = random.choice(quizzable)
+            task = FORM_TASKS[form_name]
+            return f"{note.lemma} → {task.cue}", f"{form_value}\n\n✅ {task.label}"
         return note.lemma, note.lemma
     return note.lemma, note.translation_ru
 

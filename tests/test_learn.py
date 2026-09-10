@@ -130,7 +130,7 @@ def test_render_card_production_shows_translation_front_and_finnish_back():
     assert back == "hakea\n\nHaen töitä."
 
 
-def test_render_card_inflection_quizzes_one_of_the_principal_forms():
+def test_render_card_inflection_asks_by_context_not_by_the_forms_name():
     note = make_note()
     card = make_card("card-A", "note-1", 1, due=NOW)
     card.type = CardType.inflection
@@ -140,8 +140,38 @@ def test_render_card_inflection_quizzes_one_of_the_principal_forms():
 
     front, back = render_card(card, note)
 
-    assert front == "hakea → preesens_1s?"
-    assert back == "haen"
+    # The front must not name the category - that is what the card is
+    # testing, and it is only revealed on the back.
+    assert front == "hakea → minä, nyt → ?"
+    assert "preesens" not in front
+    assert back.startswith("haen")
+    assert "preesens, 1. persoona yksikkö (minä)" in back
+
+
+def test_render_card_inflection_skips_forms_with_no_task_defined():
+    # The nominative equals the lemma already shown on the front, so it is
+    # never quizzed - here it is the only other form, and the quizzable one
+    # must win.
+    note = make_note()
+    card = make_card("card-A", "note-1", 1, due=NOW)
+    card.type = CardType.inflection
+    note.meta = {"principal_forms": {"nominatiivi": "kauppa", "illatiivi": "kauppaan"}}
+
+    front, back = render_card(card, note)
+
+    assert front == "hakea → mihin?"
+    assert back.startswith("kauppaan")
+
+
+def test_render_card_inflection_falls_back_when_only_unquizzable_forms_exist():
+    note = make_note()
+    card = make_card("card-A", "note-1", 1, due=NOW)
+    card.type = CardType.inflection
+    note.meta = {"principal_forms": {"nominatiivi": "hakea"}}
+
+    front, back = render_card(card, note)
+
+    assert front == back == "hakea"
 
 
 def test_render_card_inflection_without_principal_forms_falls_back_to_the_lemma():
