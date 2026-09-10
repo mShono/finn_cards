@@ -15,10 +15,10 @@ from openai import OpenAI
 logger = logging.getLogger(__name__)
 
 
-def synthesize_speech(client: OpenAI, model: str, text: str) -> bytes:
-    logger.debug("event=tts.request model=%s", model)
+def synthesize_speech(client: OpenAI, model: str, text: str, speed: float = 1.0) -> bytes:
+    logger.debug("event=tts.request model=%s speed=%s", model, speed)
     start = time.monotonic()
-    response = client.audio.speech.create(model=model, voice="alloy", input=text)
+    response = client.audio.speech.create(model=model, voice="alloy", input=text, speed=speed)
     audio = response.read()
     duration_ms = int((time.monotonic() - start) * 1000)
     logger.info(

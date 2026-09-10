@@ -14,7 +14,18 @@ def test_synthesize_speech_passes_model_and_text_and_returns_bytes():
 
     assert result == b"fake-mp3-bytes"
     client.audio.speech.create.assert_called_once_with(
-        model="tts-1", voice="alloy", input="Haen töitä."
+        model="tts-1", voice="alloy", input="Haen töitä.", speed=1.0
+    )
+
+
+def test_synthesize_speech_passes_custom_speed():
+    client = MagicMock()
+    client.audio.speech.create.return_value.read.return_value = b"fake-mp3-bytes"
+
+    synthesize_speech(client, "tts-1", "Haen töitä.", speed=0.8)
+
+    client.audio.speech.create.assert_called_once_with(
+        model="tts-1", voice="alloy", input="Haen töitä.", speed=0.8
     )
 
 

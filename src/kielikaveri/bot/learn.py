@@ -405,7 +405,9 @@ async def learn_listen(
 
     logger.debug("event=learn.listen card_id=%s", card_id)
     client = OpenAI(api_key=settings.openai_api_key)
-    audio = synthesize_speech(client, settings.openai_tts_model, note.example_fi)
+    audio = synthesize_speech(
+        client, settings.openai_tts_model, note.example_fi, speed=settings.openai_tts_speed
+    )
     await callback.message.answer_audio(BufferedInputFile(audio, filename="example.mp3"))
     await callback.answer()
 

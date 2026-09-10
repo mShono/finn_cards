@@ -17,6 +17,8 @@ class Settings(BaseSettings):
     openai_text_model: str = "gpt-5.6-terra"
     openai_stt_model: str = "whisper-1"
     openai_tts_model: str = "tts-1"
+    # tts-1 at 1.0 reads short sentences too fast to follow at B2 level.
+    openai_tts_speed: float = 0.8
     openai_timeout_seconds: float = 60.0
 
     # Plan 3.8 point 3: the in-process circuit breaker. More calls than this

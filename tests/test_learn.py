@@ -393,7 +393,7 @@ async def test_learn_listen_sends_synthesized_audio_of_the_example_sentence(
 
     monkeypatch.setattr(
         "kielikaveri.bot.learn.synthesize_speech",
-        lambda client, model, text: b"fake-mp3-bytes",
+        lambda client, model, text, speed: b"fake-mp3-bytes",
     )
     callback = make_callback("learn:listen:card-A")
     settings = make_settings(openai_api_key="sk-test", openai_tts_model="tts-1")
