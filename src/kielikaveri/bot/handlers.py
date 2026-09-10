@@ -1,18 +1,8 @@
 from __future__ import annotations
 
-import logging
-from datetime import UTC, datetime
-
-from aiogram import F, Router
+from aiogram import Router
 from aiogram.filters import Command
 from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
-from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-
-from kielikaveri.bot.text import split_message
-from kielikaveri.db.models import Card, Note
-
-logger = logging.getLogger(__name__)
 
 router = Router(name="core")
 
@@ -23,7 +13,7 @@ router = Router(name="core")
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📚 Учить"), KeyboardButton(text="💬 Добавить")],
-        [KeyboardButton(text="🗂 Колоды"), KeyboardButton(text="📊 Статистика")],
+        [KeyboardButton(text="🗂 Колоды")],
     ],
     resize_keyboard=True,
 )
@@ -33,7 +23,7 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
 async def start(message: Message) -> None:
     await message.answer(
         "Привет! Kielikaveri на связи - бот для практики финского.\n"
-        "Кнопки внизу - учить, добавлять слова, колоды, статистика. "
+        "Кнопки внизу - учить, добавлять слова, колоды. "
         "Добавлять можно и просто текстом: напиши мне слово, текст на "
         "финском или свой перевод - отвечу в чате.",
         reply_markup=MAIN_KEYBOARD,
@@ -45,29 +35,8 @@ async def help_(message: Message) -> None:
     await message.answer(
         "/start - поздороваться\n"
         "/help - эта справка\n"
-        "/stats - сколько заметок и карточек к повторению\n"
         "/learn - повторить карточки, которым пора\n"
         "/decks - список колод, создать новую, переключить активную\n"
         "/add <текст> - то же самое, что просто написать текст в чат\n"
         "/delete <слово> - удалить слово из колоды"
     )
-
-
-@router.message(Command("stats"))
-@router.message(F.text == "📊 Статистика")
-async def stats(message: Message, session_factory: async_sessionmaker[AsyncSession]) -> None:
-    user_id = message.from_user.id
-    async with session_factory() as session:
-        notes_count = await session.scalar(
-            select(func.count()).select_from(Note).where(Note.user_id == user_id)
-        )
-        due_cards_count = await session.scalar(
-            select(func.count())
-            .select_from(Card)
-            .where(Card.user_id == user_id, Card.due <= datetime.now(UTC))
-        )
-
-    logger.info("event=stats.query notes=%d due_cards=%d", notes_count, due_cards_count)
-    text = f"Заметок: {notes_count}\nКарточек к повторению: {due_cards_count}"
-    for chunk in split_message(text):
-        await message.answer(chunk)
