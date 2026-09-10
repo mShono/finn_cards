@@ -150,6 +150,12 @@ class Card(Base):
     note_id: Mapped[str] = mapped_column(ForeignKey("notes.id"))
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
     type: Mapped[CardType] = mapped_column(Enum(CardType, native_enum=False))
+    # Which principal form an inflection card quizzes (a key of
+    # kielikaveri.grammar.FORM_TASKS); NULL on every other type. One card
+    # per form, because FSRS schedules whatever it rates: with a single
+    # card drawing a random form each time, "easy" on the illative would
+    # push the translative out by the same interval.
+    form: Mapped[str | None] = mapped_column(String, nullable=True)
 
     # SRS state - schema's card.srs, flattened. Written by phase 2 (py-fsrs);
     # phase 1 only needs the columns to exist.

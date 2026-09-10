@@ -9,7 +9,6 @@ this must keep working when OpenAI is unreachable (see plan 3.10).
 from __future__ import annotations
 
 import logging
-import random
 from datetime import UTC, datetime
 
 from aiogram import F, Router
@@ -57,14 +56,13 @@ def render_card(card: Card, note: Note) -> tuple[str, str]:
         return f"🇷🇺 {note.translation_ru}", f"{note.lemma}\n\n{note.example_fi}"
     if card.type == CardType.inflection:
         forms: dict = note.meta.get("principal_forms") or {}
-        # A form with no FORM_TASKS entry is skipped rather than shown: the
-        # front must never carry a bare key like "nut_partisiippi", and the
-        # nominative is excluded outright (it equals the lemma on the front).
-        quizzable = [(name, value) for name, value in forms.items() if name in FORM_TASKS]
-        if quizzable:
-            form_name, form_value = random.choice(quizzable)
-            task = FORM_TASKS[form_name]
-            return f"{note.lemma} → {task.cue}", f"{form_value}\n\n✅ {task.label}"
+        # The card names its own form (one card per form), so the question
+        # is stable across reviews and its FSRS interval means something.
+        # A form with no FORM_TASKS entry is never asked - the front must
+        # not carry a bare key like "nut_partisiippi".
+        task = FORM_TASKS.get(card.form)
+        if task is not None and card.form in forms:
+            return f"{note.lemma} → {task.cue}", f"{forms[card.form]}\n\n✅ {task.label}"
         return note.lemma, note.lemma
     return note.lemma, note.translation_ru
 
@@ -210,7 +208,7 @@ async def _proceed_past_deck_choice(
     async with session_factory() as session:
         await sync_user_card_types(session, user_id, now)
         await session.commit()
-        overdue = await overdue_count(session, user_id, now, deck_id=deck_id)
+        overdue = await overdue_count(session, user_id, now, deck_id=deck_id, reviewed_only=True)
 
     if overdue > settings.debt_threshold:
         logger.info(

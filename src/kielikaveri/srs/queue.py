@@ -36,8 +36,11 @@ async def due_cards(
     now: datetime,
     limit: int | None,
     deck_id: str | None = None,
+    reviewed_only: bool = False,
 ) -> list[Card]:
     stmt = select(Card).where(Card.user_id == user_id, Card.due <= now)
+    if reviewed_only:
+        stmt = stmt.where(Card.reps > 0)
     if deck_id is not None:
         stmt = stmt.join(Note, Card.note_id == Note.id).where(Note.deck_id == deck_id)
     result = await session.scalars(stmt.order_by(Card.due).limit(limit))
@@ -45,9 +48,24 @@ async def due_cards(
 
 
 async def overdue_count(
-    session: AsyncSession, user_id: int, now: datetime, deck_id: str | None = None
+    session: AsyncSession,
+    user_id: int,
+    now: datetime,
+    deck_id: str | None = None,
+    reviewed_only: bool = False,
 ) -> int:
+    """How many of the user's cards are due.
+
+    `reviewed_only` is what the debt (backlog) prompt asks for: debt means
+    reviews you owe, and a card you have never seen isn't late - it is
+    waiting its turn under the daily new-card limit. Since one note now
+    opens an inflection card per form, counting those as debt would fire
+    the backlog prompt on day one. The deck screen leaves it off: there
+    "к повторению" does mean everything due, new cards included.
+    """
     stmt = select(func.count()).select_from(Card).where(Card.user_id == user_id, Card.due <= now)
+    if reviewed_only:
+        stmt = stmt.where(Card.reps > 0)
     if deck_id is not None:
         stmt = stmt.join(Note, Card.note_id == Note.id).where(Note.deck_id == deck_id)
     return await session.scalar(stmt)
@@ -129,8 +147,13 @@ async def defer_overdue_tail(
     deck_id: str | None = None,
 ) -> int:
     """Push every overdue card past the first `keep_n` (oldest-due) forward
-    by `postpone_days`. Returns how many cards were postponed."""
-    cards = await due_cards(session, user_id, now, limit=None, deck_id=deck_id)
+    by `postpone_days`. Returns how many cards were postponed.
+
+    Only cards that have been reviewed, matching the count the debt prompt
+    showed - postponing a never-seen card would delay work that was never
+    late in the first place.
+    """
+    cards = await due_cards(session, user_id, now, limit=None, deck_id=deck_id, reviewed_only=True)
     tail = cards[keep_n:]
     for card in tail:
         card.due = now + timedelta(days=postpone_days)

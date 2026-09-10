@@ -219,3 +219,46 @@ async def test_defer_overdue_tail_postpones_everything_past_keep_n(session_facto
 
     assert postponed == 3
     assert remaining_overdue == 2
+
+
+async def test_debt_ignores_cards_that_have_never_been_reviewed(session_factory):
+    # A note now opens an inflection card per form, all due immediately. If
+    # those counted as debt, the backlog prompt would fire on day one over
+    # cards the user has simply not reached yet.
+    now = datetime(2026, 8, 24, 10, 0, tzinfo=UTC)
+    async with session_factory() as session:
+        session.add(User(id=1))
+        session.add(make_note("note-1", 1))
+        await session.flush()
+        session.add(make_card("seen", "note-1", 1, due=now - timedelta(days=3), reps=4))
+        for i in range(12):
+            session.add(make_card(f"new-{i}", "note-1", 1, due=now, reps=0))
+        await session.commit()
+
+        everything_due = await overdue_count(session, 1, now)
+        debt = await overdue_count(session, 1, now, reviewed_only=True)
+
+    assert everything_due == 13  # the deck screen still counts them all
+    assert debt == 1
+
+
+async def test_defer_overdue_tail_leaves_never_reviewed_cards_alone(session_factory):
+    now = datetime(2026, 8, 24, 10, 0, tzinfo=UTC)
+    async with session_factory() as session:
+        session.add(User(id=1))
+        session.add(make_note("note-1", 1))
+        await session.flush()
+        for i in range(3):
+            session.add(
+                make_card(f"seen-{i}", "note-1", 1, due=now - timedelta(days=3 - i), reps=2)
+            )
+        session.add(make_card("fresh", "note-1", 1, due=now, reps=0))
+        await session.commit()
+
+        postponed = await defer_overdue_tail(session, 1, now, keep_n=1, postpone_days=7)
+        await session.commit()
+
+        fresh = await session.get(Card, "fresh")
+
+    assert postponed == 2
+    assert fresh.due == now

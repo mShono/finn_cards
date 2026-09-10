@@ -134,8 +134,7 @@ def test_render_card_inflection_asks_by_context_not_by_the_forms_name():
     note = make_note()
     card = make_card("card-A", "note-1", 1, due=NOW)
     card.type = CardType.inflection
-    # A single-entry dict makes random.choice's pick deterministic, so the
-    # test doesn't depend on which form gets quizzed.
+    card.form = "preesens_1s"
     note.meta = {"principal_forms": {"preesens_1s": "haen"}}
 
     front, back = render_card(card, note)
@@ -148,30 +147,32 @@ def test_render_card_inflection_asks_by_context_not_by_the_forms_name():
     assert "preesens, 1. persoona yksikkö (minä)" in back
 
 
-def test_render_card_inflection_skips_forms_with_no_task_defined():
-    # The nominative equals the lemma already shown on the front, so it is
-    # never quizzed - here it is the only other form, and the quizzable one
-    # must win.
+def test_render_card_inflection_asks_the_form_the_card_is_scheduled_for():
+    # The question is fixed per card, not drawn at random: that is what
+    # makes the card's own FSRS interval mean anything.
     note = make_note()
+    note.meta = {"principal_forms": {"genetiivi": "kaupan", "illatiivi": "kauppaan"}}
     card = make_card("card-A", "note-1", 1, due=NOW)
     card.type = CardType.inflection
-    note.meta = {"principal_forms": {"nominatiivi": "kauppa", "illatiivi": "kauppaan"}}
+    card.form = "illatiivi"
 
-    front, back = render_card(card, note)
+    assert [render_card(card, note) for _ in range(5)] == [
+        ("hakea → mihin?", "kauppaan\n\n✅ illatiivi - mihin? sisään (-Vn, -seen, -hVn)")
+    ] * 5
 
-    assert front == "hakea → mihin?"
-    assert back.startswith("kauppaan")
 
-
-def test_render_card_inflection_falls_back_when_only_unquizzable_forms_exist():
+def test_render_card_inflection_falls_back_when_the_card_has_no_usable_form():
+    # Defensive: a card left form-less (pre-migration row not yet adopted)
+    # or pointing at a form the note no longer has must not crash /learn.
     note = make_note()
+    note.meta = {"principal_forms": {"genetiivi": "kaupan"}}
     card = make_card("card-A", "note-1", 1, due=NOW)
     card.type = CardType.inflection
-    note.meta = {"principal_forms": {"nominatiivi": "hakea"}}
 
-    front, back = render_card(card, note)
+    assert render_card(card, note) == ("hakea", "hakea")
 
-    assert front == back == "hakea"
+    card.form = "translatiivi"
+    assert render_card(card, note) == ("hakea", "hakea")
 
 
 def test_render_card_inflection_without_principal_forms_falls_back_to_the_lemma():
@@ -464,7 +465,9 @@ async def test_learn_start_offers_debt_choice_when_overdue_exceeds_threshold(ses
         session.add(make_note())
         await session.flush()
         for i in range(3):
-            session.add(make_card(f"card-{i}", "note-1", 1, due=NOW - timedelta(days=1)))
+            # reps=1 - only missed reviews count as debt, see
+            # _seed_five_overdue_cards.
+            session.add(make_card(f"card-{i}", "note-1", 1, due=NOW - timedelta(days=1), reps=1))
         await session.commit()
 
     state = make_state()
@@ -594,12 +597,18 @@ async def test_learn_deck_choice_all_queues_cards_from_every_deck(session_factor
 
 
 async def _seed_five_overdue_cards(session_factory, now: datetime) -> None:
+    # reps=1: debt means reviews that came due and were missed. Cards that
+    # have never been reviewed are new material waiting under the daily
+    # new-card limit, and neither the prompt nor the defer touches them
+    # (see tests/test_queue.py).
     async with session_factory() as session:
         session.add(User(id=1))
         session.add(make_note())
         await session.flush()
         for i in range(5):
-            session.add(make_card(f"card-{i}", "note-1", 1, due=now - timedelta(days=5 - i)))
+            session.add(
+                make_card(f"card-{i}", "note-1", 1, due=now - timedelta(days=5 - i), reps=1)
+            )
         await session.commit()
 
 
