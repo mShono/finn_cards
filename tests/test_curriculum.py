@@ -261,6 +261,90 @@ async def test_two_correct_answers_open_the_first_forms(session_factory):
     ]
 
 
+@pytest.mark.parametrize(
+    ("ratings", "unlocks"),
+    [
+        ([Rating.Good, Rating.Good], True),
+        ([Rating.Good, Rating.Easy], True),
+        ([Rating.Easy, Rating.Easy], True),
+        ([Rating.Hard, Rating.Good], False),
+        ([Rating.Hard, Rating.Hard], False),
+        ([Rating.Again, Rating.Good], False),
+        ([Rating.Again, Rating.Hard, Rating.Good], False),
+    ],
+    ids=[
+        "good+good",
+        "good+easy",
+        "easy+easy",
+        "hard+good",
+        "hard+hard",
+        "again+good",
+        "again+hard+good",
+    ],
+)
+async def test_only_good_and_easy_count_toward_the_unlock_threshold(
+    session_factory, ratings, unlocks
+):
+    # The gate asks one question: was this word recalled, twice, without a
+    # struggle? "Трудно" means the answer was dragged up with effort, so it
+    # counts no more than "Забыл" does - building twelve inflections on a
+    # word that keeps coming back as Hard is what this rules out.
+    await seed_three_nouns(session_factory)
+    recognition = (await cards_of(session_factory, "n0", type=CardType.recognition))[0]
+    await answer(session_factory, recognition.id, ratings)
+
+    async with session_factory() as session:
+        introduced = await introduce_due_forms(session, 1, NOW, daily_new_forms=4, boundary_hour=4)
+        await session.commit()
+
+    assert bool(introduced) is unlocks
+
+
+async def test_the_second_good_answer_is_what_opens_the_gate(session_factory):
+    # Hard answers can accumulate forever without opening anything; it is the
+    # second Good/Easy specifically that moves the word over the threshold.
+    await seed_three_nouns(session_factory)
+    recognition = (await cards_of(session_factory, "n0", type=CardType.recognition))[0]
+    await answer(session_factory, recognition.id, [Rating.Hard, Rating.Hard, Rating.Good])
+
+    async with session_factory() as session:
+        blocked = await introduce_due_forms(session, 1, NOW, daily_new_forms=4, boundary_hour=4)
+        await session.commit()
+
+    assert blocked == []
+
+    await answer(session_factory, recognition.id, [Rating.Easy], at=FIRST_SEEN + timedelta(days=1))
+
+    async with session_factory() as session:
+        opened = await introduce_due_forms(session, 1, NOW, daily_new_forms=4, boundary_hour=4)
+        await session.commit()
+
+    assert len(opened) == 4
+
+
+async def test_hard_still_drives_fsrs_even_though_it_unlocks_nothing(session_factory):
+    # The change is to the curriculum gate alone: Hard remains an ordinary
+    # FSRS rating that counts as a rep, keeps the card out of lapses and
+    # pushes the due date forward. Only the unlock threshold ignores it.
+    await seed_three_nouns(session_factory)
+    recognition = (await cards_of(session_factory, "n0", type=CardType.recognition))[0]
+    await answer(session_factory, recognition.id, [Rating.Hard, Rating.Hard])
+
+    async with session_factory() as session:
+        card = await session.get(Card, recognition.id)
+        reviews = (
+            await session.scalars(select(Review).where(Review.card_id == recognition.id))
+        ).all()
+        introduced = await introduce_due_forms(session, 1, NOW, daily_new_forms=4, boundary_hour=4)
+        await session.commit()
+
+    assert card.reps == 2  # both answers are reps for FSRS
+    assert card.lapses == 0  # Hard is not a lapse
+    assert card.stability is not None and card.due > FIRST_SEEN  # schedule moved
+    assert len(reviews) == 2  # and both are in the review log
+    assert introduced == []  # yet no grammar opened
+
+
 async def test_a_forgotten_answer_does_not_count_toward_the_threshold(session_factory):
     await seed_three_nouns(session_factory)
     recognition = (await cards_of(session_factory, "n0", type=CardType.recognition))[0]
