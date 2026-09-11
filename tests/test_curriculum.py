@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -5,15 +6,32 @@ from sqlalchemy import select
 
 from finn_cards.morphology import NOMINAL_FORMS
 from kielikaveri.db.engine import create_all, make_engine, make_session_factory
-from kielikaveri.db.models import Card, CardState, CardStatus, CardType, Note, NoteKind, User
+from kielikaveri.db.models import (
+    Card,
+    CardStatus,
+    CardType,
+    Note,
+    NoteKind,
+    Review,
+    User,
+)
 from kielikaveri.grammar import FORM_TASKS, CurriculumLevel
-from kielikaveri.srs.curriculum import MASTERY_STABILITY_DAYS, eligible_forms, introduce_due_forms
+from kielikaveri.srs.curriculum import (
+    SUCCESSFUL_ANSWERS_TO_UNLOCK,
+    eligible_forms,
+    introduce_due_forms,
+)
 from kielikaveri.srs.graduation import sync_user_card_types
 from kielikaveri.srs.queue import build_session_queue, card_counters, overdue_count
 from kielikaveri.srs.scheduler import Rating, SrsState
 from kielikaveri.srs.scheduler import review as apply_review
 
 NOW = datetime(2026, 9, 10, 9, 0, tzinfo=UTC)
+# When the tests' simulated learner first met a card. Far enough back that
+# two correct answers still leave it due again by NOW: FSRS hands out long
+# intervals very fast (two "Хорошо" in one sitting already buy months),
+# which is exactly why the curriculum stopped depending on them.
+FIRST_SEEN = NOW - timedelta(days=200)
 
 CORE_NOUN_FORMS = [n for n, t in FORM_TASKS.items() if t.level is CurriculumLevel.core]
 QUIZZABLE_NOUN_FORMS = [n for n in NOMINAL_FORMS if n in FORM_TASKS]
@@ -53,31 +71,51 @@ async def seed_three_nouns(session_factory) -> None:
         await session.commit()
 
 
-async def master_recognition(session_factory, note_id: str) -> None:
-    """Bring a note's recognition card past the curriculum's unlock threshold."""
+async def answer(
+    session_factory,
+    card_id: str,
+    ratings: Sequence[Rating],
+    at: datetime = FIRST_SEEN,
+) -> None:
+    """Review a card for real, the way bot/learn.py's rating handler does:
+    FSRS moves the schedule and every answer is written to `reviews`, which
+    is the history the curriculum reads."""
     async with session_factory() as session:
-        card = (
-            await session.scalars(
-                select(Card).where(Card.note_id == note_id, Card.type == CardType.recognition)
+        card = await session.get(Card, card_id)
+        for i, rating in enumerate(ratings):
+            # The first answer lands at `at`, every following one when the
+            # card actually came up again - answering a card a minute after
+            # seeing it would hand FSRS a near-perfect recall and a wildly
+            # long interval, which is not what a learner's history looks like.
+            when = at if i == 0 else card.due
+            updated = apply_review(
+                SrsState(
+                    state=card.state,
+                    due=card.due,
+                    stability=card.stability,
+                    difficulty=card.difficulty,
+                    reps=card.reps,
+                    lapses=card.lapses,
+                    step=card.step,
+                ),
+                rating,
+                when,
             )
-        ).one()
-        card.stability = MASTERY_STABILITY_DAYS + 1
-        card.state = CardState.review
-        card.reps = 2
-        await session.commit()
-
-
-async def master_introduced_forms(session_factory) -> None:
-    """Make every already-introduced inflection card count as retained."""
-    async with session_factory() as session:
-        for card in (
-            await session.scalars(
-                select(Card).where(
-                    Card.type == CardType.inflection, Card.status == CardStatus.introduced
+            card.state = updated.state
+            card.due = updated.due
+            card.stability = updated.stability
+            card.difficulty = updated.difficulty
+            card.reps = updated.reps
+            card.lapses = updated.lapses
+            card.step = updated.step
+            session.add(
+                Review(
+                    card_id=card.id,
+                    user_id=card.user_id,
+                    rating=rating.value,
+                    reviewed_at=when,
                 )
             )
-        ).all():
-            card.stability = MASTERY_STABILITY_DAYS + 1
         await session.commit()
 
 
@@ -87,6 +125,57 @@ async def cards_of(session_factory, note_id: str, **filters) -> list[Card]:
         for column, value in filters.items():
             stmt = stmt.where(getattr(Card, column) == value)
         return list((await session.scalars(stmt.order_by(Card.form))).all())
+
+
+async def learn_word(
+    session_factory, note_id: str, times: int = SUCCESSFUL_ANSWERS_TO_UNLOCK
+) -> None:
+    """Answer a note's recognition card correctly `times` times - the
+    curriculum's gate for opening any of that note's forms."""
+    recognition = (await cards_of(session_factory, note_id, type=CardType.recognition))[0]
+    await answer(session_factory, recognition.id, [Rating.Good] * times)
+
+
+async def learn_introduced_forms(session_factory, note_id: str | None = None) -> None:
+    """Answer every already-introduced inflection card often enough to count
+    as known - what the level ladder waits for before opening the next one."""
+    async with session_factory() as session:
+        stmt = select(Card).where(
+            Card.type == CardType.inflection, Card.status == CardStatus.introduced
+        )
+        if note_id is not None:
+            stmt = stmt.where(Card.note_id == note_id)
+        card_ids = [card.id for card in (await session.scalars(stmt)).all()]
+
+    for card_id in card_ids:
+        await answer(session_factory, card_id, [Rating.Good] * SUCCESSFUL_ANSWERS_TO_UNLOCK)
+
+
+def _recognition_card(card_id: str, stability: float | None) -> Card:
+    return Card(
+        id=card_id,
+        note_id="n",
+        user_id=1,
+        type=CardType.recognition,
+        due=NOW,
+        stability=stability,
+        status=CardStatus.introduced,
+    )
+
+
+def _form_cards(*names: str) -> list[Card]:
+    return [
+        Card(
+            id=name,
+            note_id="n",
+            user_id=1,
+            type=CardType.inflection,
+            form=name,
+            due=NOW,
+            status=CardStatus.not_introduced,
+        )
+        for name in names
+    ]
 
 
 # --- 1-2: the cards exist, the learner is not buried in them ------------------
@@ -130,7 +219,7 @@ async def test_not_introduced_forms_are_neither_due_nor_overdue(session_factory)
 
 async def test_no_form_opens_while_the_word_itself_is_still_new(session_factory):
     # Drilling the cases of a word you cannot yet recognise is pointless -
-    # the note's recognition card has to mature first.
+    # the note's recognition card has to be answered first.
     await seed_three_nouns(session_factory)
 
     async with session_factory() as session:
@@ -140,9 +229,78 @@ async def test_no_form_opens_while_the_word_itself_is_still_new(session_factory)
     assert introduced == []
 
 
+async def test_one_correct_answer_is_not_enough_to_open_forms(session_factory):
+    # A word answered right once has been read, not learned: the first
+    # correct answer is mostly the echo of having just seen the card. The
+    # curriculum wants a short period of acquaintance first.
+    await seed_three_nouns(session_factory)
+    await learn_word(session_factory, "n0", times=1)
+
+    async with session_factory() as session:
+        introduced = await introduce_due_forms(session, 1, NOW, daily_new_forms=4, boundary_hour=4)
+        await session.commit()
+
+    assert introduced == []
+
+
+async def test_two_correct_answers_open_the_first_forms(session_factory):
+    await seed_three_nouns(session_factory)
+    await learn_word(session_factory, "n0", times=2)
+
+    async with session_factory() as session:
+        introduced = await introduce_due_forms(session, 1, NOW, daily_new_forms=4, boundary_hour=4)
+        await session.commit()
+
+    # kauppa is recalled twice, so its grammar starts - core forms, in
+    # FORM_TASKS order, as far as today's budget reaches.
+    assert [c.form for c in introduced] == [
+        "genetiivi",
+        "partitiivi",
+        "illatiivi",
+        "monikon_genetiivi",
+    ]
+
+
+async def test_a_forgotten_answer_does_not_count_toward_the_threshold(session_factory):
+    await seed_three_nouns(session_factory)
+    recognition = (await cards_of(session_factory, "n0", type=CardType.recognition))[0]
+
+    # Wrong, wrong, right: three reviews but one correct answer.
+    await answer(session_factory, recognition.id, [Rating.Again, Rating.Again, Rating.Good])
+
+    async with session_factory() as session:
+        blocked = await introduce_due_forms(session, 1, NOW, daily_new_forms=4, boundary_hour=4)
+        await session.commit()
+
+    assert blocked == []
+
+    # The second correct answer is what opens the gate, not the third review.
+    await answer(session_factory, recognition.id, [Rating.Good], at=FIRST_SEEN + timedelta(days=1))
+
+    async with session_factory() as session:
+        opened = await introduce_due_forms(session, 1, NOW, daily_new_forms=4, boundary_hour=4)
+        await session.commit()
+
+    assert len(opened) == 4
+
+
+def test_opening_forms_no_longer_waits_on_an_fsrs_interval():
+    # The old rule was `stability >= 3 days`, which tied grammar to whichever
+    # intervals FSRS happened to hand out. Now a word recalled twice opens
+    # its forms however short its interval is, and a long interval with no
+    # correct answers behind it opens nothing.
+    recalled_twice = _recognition_card("recalled", stability=0.1)
+    long_interval = _recognition_card("long", stability=30.0)
+
+    opened = eligible_forms([recalled_twice, *_form_cards("genetiivi")], {"recalled": 2})
+
+    assert [c.form for c in opened] == ["genetiivi"]
+    assert eligible_forms([long_interval, *_form_cards("genetiivi")], {}) == []
+
+
 async def test_core_forms_open_first_and_only_up_to_the_daily_form_budget(session_factory):
     await seed_three_nouns(session_factory)
-    await master_recognition(session_factory, "n0")
+    await learn_word(session_factory, "n0")
 
     async with session_factory() as session:
         introduced = await introduce_due_forms(session, 1, NOW, daily_new_forms=3, boundary_hour=4)
@@ -154,7 +312,7 @@ async def test_core_forms_open_first_and_only_up_to_the_daily_form_budget(sessio
 
 async def test_the_form_budget_is_spent_once_per_study_day(session_factory):
     await seed_three_nouns(session_factory)
-    await master_recognition(session_factory, "n0")
+    await learn_word(session_factory, "n0")
 
     async with session_factory() as session:
         first = await introduce_due_forms(session, 1, NOW, daily_new_forms=3, boundary_hour=4)
@@ -170,16 +328,16 @@ async def test_the_form_budget_is_spent_once_per_study_day(session_factory):
     assert len(first) == 3
     assert again == []
     # Two, not three: n0 has five core forms and three are already open, while
-    # extended stays shut until the core ones are retained and the other two
-    # notes are still unknown words. The budget is a ceiling, not a quota.
+    # extended stays shut until the core ones are answered right and the other
+    # two notes are still unknown words. The budget is a ceiling, not a quota.
     assert len(third) == 2
 
 
-async def test_extended_forms_wait_until_the_core_ones_are_mastered(session_factory):
+async def test_extended_forms_wait_until_the_core_ones_are_known(session_factory):
     await seed_three_nouns(session_factory)
-    await master_recognition(session_factory, "n0")
+    await learn_word(session_factory, "n0")
 
-    # Open every core form, but leave them fragile.
+    # Open every core form, but leave them unanswered.
     async with session_factory() as session:
         await introduce_due_forms(session, 1, NOW, daily_new_forms=99, boundary_hour=4)
         await session.commit()
@@ -195,20 +353,9 @@ async def test_extended_forms_wait_until_the_core_ones_are_mastered(session_fact
             session, 1, tomorrow, daily_new_forms=99, boundary_hour=4
         )
         await session.commit()
-    assert blocked == []  # core is open but not yet retained
+    assert blocked == []  # core is open but not yet recalled twice
 
-    async with session_factory() as session:
-        for card in (
-            await session.scalars(
-                select(Card).where(
-                    Card.note_id == "n0",
-                    Card.type == CardType.inflection,
-                    Card.status == CardStatus.introduced,
-                )
-            )
-        ).all():
-            card.stability = MASTERY_STABILITY_DAYS + 1
-        await session.commit()
+    await learn_introduced_forms(session_factory, "n0")
 
     async with session_factory() as session:
         opened = await introduce_due_forms(session, 1, tomorrow, daily_new_forms=2, boundary_hour=4)
@@ -222,17 +369,11 @@ async def test_a_grammatical_group_opens_together_rather_than_scattered(session_
     # missä? / mistä? are one system - they should arrive back to back, not
     # months apart.
     await seed_three_nouns(session_factory)
-    await master_recognition(session_factory, "n0")
+    await learn_word(session_factory, "n0")
     async with session_factory() as session:
         await introduce_due_forms(session, 1, NOW, daily_new_forms=99, boundary_hour=4)
-        for card in (
-            await session.scalars(
-                select(Card).where(Card.note_id == "n0", Card.type == CardType.inflection)
-            )
-        ).all():
-            if card.status == CardStatus.introduced:
-                card.stability = MASTERY_STABILITY_DAYS + 1
         await session.commit()
+    await learn_introduced_forms(session_factory, "n0")
 
     async with session_factory() as session:
         opened = await introduce_due_forms(
@@ -269,7 +410,7 @@ async def test_suspended_cards_are_never_shown(session_factory):
 
 async def test_reviewing_one_form_moves_only_that_forms_schedule(session_factory):
     await seed_three_nouns(session_factory)
-    await master_recognition(session_factory, "n0")
+    await learn_word(session_factory, "n0")
     async with session_factory() as session:
         await introduce_due_forms(session, 1, NOW, daily_new_forms=99, boundary_hour=4)
         await session.commit()
@@ -321,7 +462,7 @@ async def test_reviewing_one_form_moves_only_that_forms_schedule(session_factory
 
 async def test_an_unintroduced_form_has_no_schedule_to_be_moved(session_factory):
     await seed_three_nouns(session_factory)
-    await master_recognition(session_factory, "n0")
+    await learn_word(session_factory, "n0")
     async with session_factory() as session:
         await introduce_due_forms(session, 1, NOW, daily_new_forms=99, boundary_hour=4)
         await session.commit()
@@ -341,7 +482,7 @@ async def test_an_unintroduced_form_has_no_schedule_to_be_moved(session_factory)
 
 async def test_a_form_joins_fsrs_once_introduced(session_factory):
     await seed_three_nouns(session_factory)
-    await master_recognition(session_factory, "n0")
+    await learn_word(session_factory, "n0")
 
     async with session_factory() as session:
         before = await build_session_queue(
@@ -357,13 +498,45 @@ async def test_a_form_joins_fsrs_once_introduced(session_factory):
     assert opened[0].id in after
 
 
+async def test_forms_already_introduced_are_left_alone_by_later_runs(session_factory):
+    # The gate only ever decides what opens *next*: an open form keeps its
+    # status, its introduction date and whatever FSRS has made of it.
+    await seed_three_nouns(session_factory)
+    await learn_word(session_factory, "n0")
+    async with session_factory() as session:
+        opened = await introduce_due_forms(session, 1, NOW, daily_new_forms=2, boundary_hour=4)
+        opened_ids = [c.id for c in opened]
+        await session.commit()
+
+    await answer(session_factory, opened_ids[0], [Rating.Good], at=NOW)
+
+    async with session_factory() as session:
+        before = {
+            c.id: (c.status, c.introduced_at, c.due, c.stability, c.reps, c.lapses)
+            for c in (await session.scalars(select(Card).where(Card.id.in_(opened_ids)))).all()
+        }
+
+    tomorrow = NOW + timedelta(days=1)
+    async with session_factory() as session:
+        await introduce_due_forms(session, 1, tomorrow, daily_new_forms=99, boundary_hour=4)
+        await session.commit()
+
+    async with session_factory() as session:
+        after = {
+            c.id: (c.status, c.introduced_at, c.due, c.stability, c.reps, c.lapses)
+            for c in (await session.scalars(select(Card).where(Card.id.in_(opened_ids)))).all()
+        }
+
+    assert after == before
+
+
 # --- 8-9: the session caps still hold -----------------------------------------
 
 
 async def test_daily_new_limit_still_caps_what_a_session_admits(session_factory):
     await seed_three_nouns(session_factory)
     for note_id in ("n0", "n1", "n2"):
-        await master_recognition(session_factory, note_id)
+        await learn_word(session_factory, note_id)
     async with session_factory() as session:
         # Open far more forms than a day's session should ever show.
         await introduce_due_forms(session, 1, NOW, daily_new_forms=99, boundary_hour=4)
@@ -374,8 +547,8 @@ async def test_daily_new_limit_still_caps_what_a_session_admits(session_factory)
         )
         cards = [await session.get(Card, card_id) for card_id in queue]
 
-    # The limit caps never-reviewed cards only; the three mastered
-    # recognition cards are reviews and are never held back by it.
+    # The limit caps never-reviewed cards only; the three recognition cards
+    # the learner has already answered are reviews, never held back by it.
     assert len([c for c in cards if c.reps == 0]) == 10
     assert len(queue) == 13
 
@@ -383,13 +556,13 @@ async def test_daily_new_limit_still_caps_what_a_session_admits(session_factory)
 async def test_session_max_cards_still_caps_the_queue(session_factory):
     await seed_three_nouns(session_factory)
     for note_id in ("n0", "n1", "n2"):
-        await master_recognition(session_factory, note_id)
+        await learn_word(session_factory, note_id)
     async with session_factory() as session:
         await introduce_due_forms(session, 1, NOW, daily_new_forms=99, boundary_hour=4)
         await session.commit()
-    await master_introduced_forms(session_factory)
+    await learn_introduced_forms(session_factory)
     async with session_factory() as session:
-        # Core is retained now, so the extended layer opens too - more than
+        # Core is known now, so the extended layer opens too - more than
         # enough due cards to run into the session cap.
         await introduce_due_forms(session, 1, NOW, daily_new_forms=99, boundary_hour=4)
         await session.commit()
@@ -406,7 +579,7 @@ async def test_session_max_cards_still_caps_the_queue(session_factory):
 
 async def test_rerunning_sync_creates_no_duplicates_and_keeps_introductions(session_factory):
     await seed_three_nouns(session_factory)
-    await master_recognition(session_factory, "n0")
+    await learn_word(session_factory, "n0")
     async with session_factory() as session:
         opened = await introduce_due_forms(session, 1, NOW, daily_new_forms=2, boundary_hour=4)
         opened_ids = [c.id for c in opened]
@@ -423,9 +596,10 @@ async def test_rerunning_sync_creates_no_duplicates_and_keeps_introductions(sess
         ]
 
     inflection = [c for c in cards if c.type == CardType.inflection]
-    # Not a duplicate: n0's recognition card matured, which is exactly the
-    # condition that opens its production card. No inflection card is
-    # created twice, and nothing already introduced falls back.
+    # Not a duplicate: n0's recognition card crossed the production
+    # threshold, which is exactly the condition that opens its production
+    # card. No inflection card is created twice, and nothing already
+    # introduced falls back.
     assert [c.type for c in created_again] == [CardType.production]
     assert len(inflection) == 36
     assert len({(c.note_id, c.form) for c in inflection}) == 36
@@ -433,30 +607,12 @@ async def test_rerunning_sync_creates_no_duplicates_and_keeps_introductions(sess
 
 
 def test_eligible_forms_is_pure_and_needs_no_session():
-    # The policy itself is a function of the note's cards - testable without
-    # a database, which is what keeps it easy to re-tune.
-    recognition = Card(
-        id="r",
-        note_id="n",
-        user_id=1,
-        type=CardType.recognition,
-        due=NOW,
-        stability=9.0,
-        status=CardStatus.introduced,
-    )
-    forms = [
-        Card(
-            id=name,
-            note_id="n",
-            user_id=1,
-            type=CardType.inflection,
-            form=name,
-            due=NOW,
-            status=CardStatus.not_introduced,
-        )
-        for name in ("essiivi", "genetiivi", "inessiivi")
-    ]
+    # The policy itself is a function of the note's cards plus their answer
+    # history - testable without a database, which is what keeps it easy to
+    # re-tune.
+    recognition = _recognition_card("r", stability=9.0)
+    forms = _form_cards("essiivi", "genetiivi", "inessiivi")
 
-    eligible = eligible_forms([recognition, *forms])
+    eligible = eligible_forms([recognition, *forms], {"r": SUCCESSFUL_ANSWERS_TO_UNLOCK})
 
     assert [c.form for c in eligible] == ["genetiivi"]  # core before the rest

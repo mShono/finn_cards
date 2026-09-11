@@ -16,12 +16,11 @@ come from FSRS alone, exactly as before - see srs/scheduler.py.
 
 Policy, all of it data-driven from kielikaveri.grammar:
 1. A form only opens once the word itself is known - the note's recognition
-   card must have matured (the same threshold that opens `production`).
-2. Forms open by curriculum level: every core form of a note must be
-   mastered before an extended one opens, and every extended one before a
-   `later` one. "Mastered" is FSRS stability over MASTERY_STABILITY_DAYS,
-   so the ladder is driven by what the learner actually retains rather than
-   by how long ago the word was added.
+   card must have been answered correctly SUCCESSFUL_ANSWERS_TO_UNLOCK times.
+2. Forms open by curriculum level: every core form of a note must be known
+   before an extended one opens, and every extended one before a `later`
+   one. Same "answered right twice" bar, so the ladder is driven by what the
+   learner actually got right rather than by how long ago the word was added.
 3. Ties break by FORM_ORDER, which keeps a grammatical group (mihin? /
    missä? / mistä?) consecutive instead of scattered across weeks.
 """
@@ -29,26 +28,31 @@ Policy, all of it data-driven from kielikaveri.grammar:
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from datetime import datetime
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from kielikaveri.db.models import Card, CardStatus, CardType, Note
+from kielikaveri.db.models import Card, CardStatus, CardType, Note, Review
 from kielikaveri.grammar import FORM_ORDER, FORM_TASKS, LEVEL_ORDER
 from kielikaveri.srs.queue import study_day_bounds
+from kielikaveri.srs.scheduler import Rating
 
 logger = logging.getLogger(__name__)
 
-# Stability (days) at which a card counts as "known well enough to build on".
-# Same number as graduation's production threshold, and the same idea: the
-# next thing opens when the previous one has stopped being fragile.
-MASTERY_STABILITY_DAYS = 3.0
+# Correct answers a card needs before the curriculum will build on it.
+# Deliberately a count of answers and not an FSRS interval: what a word has
+# earned in days depends on which ratings it happened to get and on FSRS's
+# own parameters, while "I have recalled this twice" is the same short
+# acquaintance for every word. Two, not one, because the first correct
+# answer to a brand new word is mostly the echo of having just read it.
+SUCCESSFUL_ANSWERS_TO_UNLOCK = 2
 
 
-def _is_mastered(card: Card) -> bool:
-    return card.status == CardStatus.introduced and (card.stability or 0.0) >= (
-        MASTERY_STABILITY_DAYS
+def _is_known(card: Card, successes: Mapping[str, int]) -> bool:
+    return card.status == CardStatus.introduced and (
+        successes.get(card.id, 0) >= SUCCESSFUL_ANSWERS_TO_UNLOCK
     )
 
 
@@ -56,14 +60,16 @@ def _level_index(form: str) -> int:
     return LEVEL_ORDER.index(FORM_TASKS[form].level)
 
 
-def eligible_forms(cards: list[Card]) -> list[Card]:
+def eligible_forms(cards: list[Card], successes: Mapping[str, int]) -> list[Card]:
     """The not_introduced inflection cards of one note that may open now.
 
-    Empty while the word itself is still shaky, or while any lower level of
-    this note has an unmastered form left.
+    `successes` counts correct answers per card id - see
+    successful_answer_counts(). Empty while the word itself is still new, or
+    while any lower level of this note has a form the learner hasn't
+    answered right yet.
     """
     recognition = next((c for c in cards if c.type == CardType.recognition), None)
-    if recognition is None or not _is_mastered(recognition):
+    if recognition is None or not _is_known(recognition, successes):
         return []
 
     inflection = [c for c in cards if c.type == CardType.inflection and c.form in FORM_TASKS]
@@ -72,10 +78,10 @@ def eligible_forms(cards: list[Card]) -> list[Card]:
         return []
 
     # The lowest level that still has anything to open is the only one that
-    # may: everything below it must be mastered first.
+    # may: everything below it must be known first.
     open_level = min(_level_index(c.form) for c in candidates)
     unfinished_below = [
-        c for c in inflection if _level_index(c.form) < open_level and not _is_mastered(c)
+        c for c in inflection if _level_index(c.form) < open_level and not _is_known(c, successes)
     ]
     if unfinished_below:
         return []
@@ -84,6 +90,23 @@ def eligible_forms(cards: list[Card]) -> list[Card]:
         (c for c in candidates if _level_index(c.form) == open_level),
         key=lambda c: FORM_ORDER[c.form],
     )
+
+
+async def successful_answer_counts(session: AsyncSession, user_id: int) -> dict[str, int]:
+    """How many times each of the user's cards has been answered correctly.
+
+    Read straight off the review log, so the curriculum needs no column of
+    its own and every review already recorded counts. `Again` is the one
+    rating that isn't a correct answer, so a lapse adds nothing to the
+    count - it doesn't subtract either: the bar is "has been recalled
+    twice", not "has never been forgotten".
+    """
+    rows = await session.execute(
+        select(Review.card_id, func.count())
+        .where(Review.user_id == user_id, Review.rating > Rating.Again.value)
+        .group_by(Review.card_id)
+    )
+    return {card_id: count for card_id, count in rows.all()}
 
 
 async def count_introduced_today(
@@ -122,6 +145,8 @@ async def introduce_due_forms(
     if budget <= 0:
         return []
 
+    successes = await successful_answer_counts(session, user_id)
+
     stmt = select(Note).where(Note.user_id == user_id)
     if deck_id is not None:
         stmt = stmt.where(Note.deck_id == deck_id)
@@ -132,7 +157,7 @@ async def introduce_due_forms(
         if len(introduced) >= budget:
             break
         cards = list((await session.scalars(select(Card).where(Card.note_id == note.id))).all())
-        for card in eligible_forms(cards):
+        for card in eligible_forms(cards, successes):
             if len(introduced) >= budget:
                 break
             card.status = CardStatus.introduced
