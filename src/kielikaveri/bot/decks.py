@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime
+from math import ceil
 
 from aiogram import F, Router
 from aiogram.filters import Command
@@ -32,14 +33,45 @@ router = Router(name="decks")
 
 NEW_DECK_PROMPT = "Как назвать новую колоду?"
 
-# A deck screen with more cards than this only shows the first page - keeps
-# the message under Telegram's length limit and the keyboard under its
-# button-count limit (one row per card).
-MAX_NOTES_SHOWN = 40
+# One row per card, so a deck screen is paged - keeps the keyboard under
+# Telegram's button-count limit and the message under its length limit.
+NOTES_PER_PAGE = 40
+MAX_BUTTON_TRANSLATION = 40
 
 
 class DeckStates(StatesGroup):
     naming = State()
+
+
+def _parse_open(data: str) -> tuple[str, int]:
+    # "decks:open:<deck_id>" or "decks:open:<deck_id>:<page>"
+    parts = data.split(":")
+    page = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
+    return parts[2], page
+
+
+def _pager_row(deck_id: str, page: int, pages: int) -> list[list[InlineKeyboardButton]]:
+    if pages < 2:
+        return []
+    row = []
+    if page > 0:
+        row.append(
+            InlineKeyboardButton(text="⬅️ назад", callback_data=f"decks:open:{deck_id}:{page - 1}")
+        )
+    if page < pages - 1:
+        row.append(
+            InlineKeyboardButton(text="вперёд ➡️", callback_data=f"decks:open:{deck_id}:{page + 1}")
+        )
+    return [row]
+
+
+def _note_button_text(index: int, note: Note) -> str:
+    # Lemma plus translation, so an edit starts from what you read
+    translation = " ".join((note.translation_ru or "").split())
+    if len(translation) > MAX_BUTTON_TRANSLATION:
+        translation = translation[: MAX_BUTTON_TRANSLATION - 1].rstrip() + "…"
+    label = f"✍️ {index}. {note.lemma}"
+    return f"{label} - {translation}" if translation else label
 
 
 def _decks_keyboard(decks: list[Deck], current_id: str) -> InlineKeyboardMarkup:
@@ -106,10 +138,10 @@ async def decks_back(
 async def decks_open(
     callback: CallbackQuery, session_factory: async_sessionmaker[AsyncSession]
 ) -> None:
-    deck_id = callback.data.split(":", 2)[2]
+    deck_id, page = _parse_open(callback.data)
     user_id = callback.from_user.id
     now = datetime.now(UTC)
-    logger.debug("event=decks.open deck_id=%s", deck_id)
+    logger.debug("event=decks.open deck_id=%s page=%s", deck_id, page)
 
     async with session_factory() as session:
         deck = await session.get(Deck, deck_id)
@@ -118,18 +150,26 @@ async def decks_open(
             await callback.answer("Не нашла колоду.", show_alert=True)
             return
 
+        total = (
+            await session.scalar(
+                select(func.count()).select_from(Note).where(Note.deck_id == deck_id)
+            )
+            or 0
+        )
+        pages = max(1, ceil(total / NOTES_PER_PAGE))
+        page = min(page, pages - 1)
         notes = list(
             (
                 await session.scalars(
+                    # Newest first: a freshly added word is the one you most
+                    # often come back to fix.
                     select(Note)
                     .where(Note.deck_id == deck_id)
-                    .order_by(Note.created_at)
-                    .limit(MAX_NOTES_SHOWN)
+                    .order_by(Note.created_at.desc())
+                    .offset(page * NOTES_PER_PAGE)
+                    .limit(NOTES_PER_PAGE)
                 )
             ).all()
-        )
-        total = await session.scalar(
-            select(func.count()).select_from(Note).where(Note.deck_id == deck_id)
         )
         counters = await card_counters(session, user_id, now, deck_id=deck_id)
 
@@ -139,17 +179,20 @@ async def decks_open(
     ]
     if not notes:
         lines.append("\nКарточек пока нет.")
-    else:
-        for i, note in enumerate(notes, start=1):
-            pos_suffix = f" ({note.pos})" if note.pos else ""
-            lines.append(f"{i}. {note.lemma}{pos_suffix} - {note.translation_ru}")
-        if total > len(notes):
-            lines.append(f"\n… показаны первые {len(notes)} из {total}.")
+    elif pages > 1:
+        lines.append(f"страница {page + 1} из {pages}")
 
+    # The words themselves live on the buttons, not in the message text
     rows = [
-        [InlineKeyboardButton(text=f"✍️ {i}. {note.lemma}", callback_data=f"noteedit:{note.id}")]
+        [
+            InlineKeyboardButton(
+                text=_note_button_text(page * NOTES_PER_PAGE + i, note),
+                callback_data=f"noteedit:{note.id}",
+            )
+        ]
         for i, note in enumerate(notes, start=1)
     ]
+    rows.extend(_pager_row(deck_id, page, pages))
     rows.append([InlineKeyboardButton(text="⬅️ Колоды", callback_data="decks:list")])
 
     await callback.message.answer(
