@@ -9,10 +9,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from kielikaveri.db.models import Card, CardStatus, Note, Review
+from kielikaveri.db.models import Card, CardStatus, CardType, Note, Review
+from kielikaveri.grammar import FORM_ORDER
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,46 @@ def study_day_bounds(now: datetime, boundary_hour: int) -> tuple[datetime, datet
     return start.astimezone(UTC), end.astimezone(UTC)
 
 
+# A card's place inside its own note: the word itself before any of its
+# forms, and the forms in FORM_TASKS order. This is the order
+# srs/curriculum.py opens forms in (grammar.FORM_ORDER, notes outer and
+# forms inner) - the queue repeats it rather than inventing one, so a
+# group like mihin?/missa?/mista? reaches the learner back to back.
+_CARD_TYPE_ORDER: dict[CardType, int] = {
+    CardType.recognition: 0,
+    CardType.production: 1,
+    CardType.inflection: 2,
+    CardType.usage: 3,
+}
+
+
+def _syllabus_order() -> tuple:
+    """SQL ORDER BY terms placing a card in its note's syllabus.
+
+    Without them the only ordering term is `due`, and a whole batch of
+    forms opened on one study day carries the *same* due second (see
+    curriculum.introduce_due_forms, plus UTCDateTime's epoch-second
+    storage). Ties in ORDER BY are not ordered at all: SQLite happened to
+    return them in insert order, which is the key order of the note's
+    `principal_forms` JSON - so a note whose forms arrived reversed handed
+    the learner monikon_genetiivi before genetiivi. Deliberately not
+    Card.id: it is a uuid4, deterministic but meaningless.
+    """
+    return (
+        case(_CARD_TYPE_ORDER, value=Card.type, else_=len(_CARD_TYPE_ORDER)),
+        case(FORM_ORDER, value=Card.form, else_=len(FORM_ORDER)),
+        Card.id,  # last resort, so the order is total and never plan-dependent
+    )
+
+
+def _due_order() -> tuple:
+    """The full ordering contract for a session's candidates: oldest due
+    first, then note by note in the order they were added, then each note's
+    syllabus.
+    """
+    return (Card.due, Note.created_at, Note.id, *_syllabus_order())
+
+
 async def due_cards(
     session: AsyncSession,
     user_id: int,
@@ -39,14 +80,18 @@ async def due_cards(
     deck_id: str | None = None,
     reviewed_only: bool = False,
 ) -> list[Card]:
-    stmt = select(Card).where(
-        Card.user_id == user_id, Card.due <= now, Card.status == CardStatus.introduced
+    # Note is joined unconditionally, not just to filter by deck: the
+    # ordering below needs its columns, and a card always has a note.
+    stmt = (
+        select(Card)
+        .join(Note, Card.note_id == Note.id)
+        .where(Card.user_id == user_id, Card.due <= now, Card.status == CardStatus.introduced)
     )
     if reviewed_only:
         stmt = stmt.where(Card.reps > 0)
     if deck_id is not None:
-        stmt = stmt.join(Note, Card.note_id == Note.id).where(Note.deck_id == deck_id)
-    result = await session.scalars(stmt.order_by(Card.due).limit(limit))
+        stmt = stmt.where(Note.deck_id == deck_id)
+    result = await session.scalars(stmt.order_by(*_due_order()).limit(limit))
     return list(result.all())
 
 
@@ -142,7 +187,13 @@ async def build_session_queue(
     boundary_hour: int,
     deck_id: str | None = None,
 ) -> list[str]:
-    """Card ids for one /learn session, oldest-due first.
+    """Card ids for one /learn session, in the order the learner meets them.
+
+    The order is the contract, not an accident of the query plan: oldest due
+    first, then - among cards sharing a due second, which every batch the
+    curriculum opens on one day does - note by note in the order they were
+    added, and inside a note the word before its forms and the forms in
+    FORM_TASKS order. See _due_order().
 
     Only `introduced` cards are candidates: a form the curriculum has not
     opened yet has no due date worth honouring, and a suspended one is

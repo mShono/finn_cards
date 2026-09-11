@@ -616,3 +616,93 @@ def test_eligible_forms_is_pure_and_needs_no_session():
     eligible = eligible_forms([recognition, *forms], {"r": SUCCESSFUL_ANSWERS_TO_UNLOCK})
 
     assert [c.form for c in eligible] == ["genetiivi"]  # core before the rest
+
+
+async def test_the_learner_meets_forms_in_the_order_the_curriculum_opened_them(session_factory):
+    # The end-to-end order question: the curriculum picks forms in
+    # FORM_TASKS order, but the learner only ever sees build_session_queue's
+    # output. Here principal_forms is stored in the exact reverse of
+    # FORM_TASKS, which is what graduation._ensure_inflection_cards iterates
+    # when it creates the cards - so insert order, and with it any query
+    # that leans on it, runs the syllabus backwards.
+    reversed_forms = list(reversed(QUIZZABLE_NOUN_FORMS))
+    async with session_factory() as session:
+        session.add(User(id=1))
+        note = make_noun("n0", "kauppa")
+        note.meta = {
+            "forms_verified": True,
+            "principal_forms": {"nominatiivi": "kauppa"}
+            | {name: f"kauppa-{name}" for name in reversed_forms},
+        }
+        session.add(note)
+        await session.flush()
+        await sync_user_card_types(session, 1, NOW)
+        await session.commit()
+
+    await learn_word(session_factory, "n0")
+
+    async with session_factory() as session:
+        opened = [c.form for c in await introduce_due_forms(session, 1, NOW, 4, boundary_hour=4)]
+        await session.commit()
+        queue = await build_session_queue(
+            session, 1, NOW, session_max_cards=50, daily_new_limit=50, boundary_hour=4
+        )
+        forms_asked = []
+        for card_id in queue:
+            card = await session.get(Card, card_id)
+            if card.type is CardType.inflection:
+                forms_asked.append(card.form)
+
+    # Guards the guard: if the curriculum itself ever stopped opening forms
+    # in FORM_TASKS order, the assertion below would still pass while
+    # testing nothing.
+    assert opened == ["genetiivi", "partitiivi", "illatiivi", "monikon_genetiivi"]
+    assert forms_asked == opened
+
+
+async def test_forms_of_the_older_word_are_asked_before_forms_of_the_newer_one(session_factory):
+    # Order between words, not inside one: two notes open forms on the same
+    # day and so share a due second. The one added first is the one the
+    # learner has lived with longer, and introduce_due_forms walks notes in
+    # that order - the queue has to keep each word's forms together and in
+    # that same sequence, instead of interleaving them by whatever the
+    # database returns.
+    async with session_factory() as session:
+        session.add(User(id=1))
+        # Inserted newest-first on purpose, so insert order contradicts age.
+        session.add(make_noun("n-new", "talo", created_at=NOW))
+        session.add(make_noun("n-old", "kauppa", created_at=NOW - timedelta(days=30)))
+        await session.flush()
+        await sync_user_card_types(session, 1, NOW)
+        await session.commit()
+
+    await learn_word(session_factory, "n-old")
+    await learn_word(session_factory, "n-new")
+
+    async with session_factory() as session:
+        # Seven forms: the older word's core level is five, so the budget
+        # spills onto the newer word and the queue has to show both the
+        # grouping and the order between the two words.
+        await introduce_due_forms(session, 1, NOW, daily_new_forms=7, boundary_hour=4)
+        await session.commit()
+        queue = await build_session_queue(
+            session, 1, NOW, session_max_cards=50, daily_new_limit=50, boundary_hour=4
+        )
+        asked = []
+        for card_id in queue:
+            card = await session.get(Card, card_id)
+            if card.type is CardType.inflection:
+                note = await session.get(Note, card.note_id)
+                asked.append((note.lemma, card.form))
+
+    # kauppa's whole core level, unbroken and in FORM_TASKS order, and only
+    # then talo - not the two words interleaved.
+    assert asked == [
+        ("kauppa", "genetiivi"),
+        ("kauppa", "partitiivi"),
+        ("kauppa", "illatiivi"),
+        ("kauppa", "monikon_genetiivi"),
+        ("kauppa", "monikon_partitiivi"),
+        ("talo", "genetiivi"),
+        ("talo", "partitiivi"),
+    ]
