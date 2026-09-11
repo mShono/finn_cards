@@ -345,6 +345,92 @@ async def test_hard_still_drives_fsrs_even_though_it_unlocks_nothing(session_fac
     assert introduced == []  # yet no grammar opened
 
 
+async def test_tightening_the_unlock_rule_does_not_close_a_form_already_open(session_factory):
+    """A curriculum policy change decides what opens next - never what closes.
+
+    `not_introduced -> introduced` is a one-way door: the only assignment of
+    `not_introduced` is at card creation (graduation._ensure_inflection_cards)
+    and the only transition is curriculum.introduce_due_forms. This pins that,
+    because the door being one-way is what makes a policy change safe to ship:
+    forms opened under an older rule keep their FSRS history instead of being
+    silently reset by the new one.
+
+    The scenario is the real one from 11.09.2026: before that day Hard counted
+    toward the unlock threshold, so a word answered only "Трудно" could open
+    its genitive. Under today's rule (UNLOCKING_RATINGS) the very same word
+    would not open anything at all - and the already-open genitive must not
+    care.
+    """
+    await seed_three_nouns(session_factory)
+    recognition = (await cards_of(session_factory, "n0", type=CardType.recognition))[0]
+    # Only Hard: enough under the old rule, not enough under today's.
+    await answer(session_factory, recognition.id, [Rating.Hard, Rating.Hard])
+
+    opened_long_ago = NOW - timedelta(days=40)
+    genetiivi = (await cards_of(session_factory, "n0", form="genetiivi"))[0]
+    async with session_factory() as session:
+        card = await session.get(Card, genetiivi.id)
+        card.status = CardStatus.introduced
+        card.introduced_at = opened_long_ago
+        await session.commit()
+    # Real reviews through the real scheduler, so the card carries the FSRS
+    # state of a form that has been in rotation for weeks - including a lapse.
+    await answer(session_factory, genetiivi.id, [Rating.Good, Rating.Good, Rating.Again])
+
+    def snapshot(card: Card) -> dict:
+        return {
+            "id": card.id,
+            "status": card.status,
+            "introduced_at": card.introduced_at,
+            "due": card.due,
+            "state": card.state,
+            "stability": card.stability,
+            "difficulty": card.difficulty,
+            "reps": card.reps,
+            "lapses": card.lapses,
+            "step": card.step,
+        }
+
+    async with session_factory() as session:
+        before = snapshot(await session.get(Card, genetiivi.id))
+
+    # Guards the guard: an all-default card would make every assertion below
+    # pass without proving anything. This one has a real history, and neither
+    # its introduced_at nor its due is NOW - so a re-open would show up.
+    assert before["reps"] == 3
+    assert before["lapses"] == 1
+    assert before["stability"] is not None
+    assert before["introduced_at"] == opened_long_ago
+    assert before["due"] != NOW
+
+    async with session_factory() as session:
+        # The /learn path in full (bot/learn.py's _proceed_past_deck_choice):
+        # cards are synced first, then the curriculum runs.
+        await sync_user_card_types(session, 1, NOW)
+        introduced = await introduce_due_forms(session, 1, NOW, daily_new_forms=4, boundary_hour=4)
+        await session.commit()
+
+    async with session_factory() as session:
+        after = snapshot(await session.get(Card, genetiivi.id))
+        inflection = (
+            await session.scalars(
+                select(Card).where(Card.note_id == "n0", Card.type == CardType.inflection)
+            )
+        ).all()
+        partitiivi = next(c for c in inflection if c.form == "partitiivi")
+
+    assert after == before  # id, status, introduced_at, due and FSRS state all intact
+    assert after["status"] == CardStatus.introduced
+    # Not rebuilt behind the same lemma either: one card per form, same ids.
+    assert len(inflection) == len(QUIZZABLE_NOUN_FORMS)
+    assert genetiivi.id in {c.id for c in inflection}
+
+    # The other half of the contract: eligibility still governs what is new.
+    # The word no longer clears today's bar, so the next core form stays shut.
+    assert introduced == []
+    assert partitiivi.status == CardStatus.not_introduced
+
+
 async def test_a_forgotten_answer_does_not_count_toward_the_threshold(session_factory):
     await seed_three_nouns(session_factory)
     recognition = (await cards_of(session_factory, "n0", type=CardType.recognition))[0]
