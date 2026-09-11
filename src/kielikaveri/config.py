@@ -42,7 +42,13 @@ class Settings(BaseSettings):
     # /learn session shape.
     session_max_cards: int = 20
     session_max_minutes: int = 10
+    # Defensive cap: never-reviewed cards of any type admitted per study day.
     daily_new_limit: int = 10
+    # How many *grammar forms* the curriculum may open per study day. Kept
+    # separate from daily_new_limit on purpose - a new word and a new case
+    # are different units of work, and one noun has a dozen forms waiting
+    # (see srs/curriculum.py).
+    daily_new_forms: int = 4
 
     # Above this many overdue cards, /learn offers to postpone the backlog
     # instead of dumping it all into one session.

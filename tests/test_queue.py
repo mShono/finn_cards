@@ -219,3 +219,144 @@ async def test_defer_overdue_tail_postpones_everything_past_keep_n(session_facto
 
     assert postponed == 3
     assert remaining_overdue == 2
+
+
+async def test_debt_ignores_cards_that_have_never_been_reviewed(session_factory):
+    # A note now opens an inflection card per form, all due immediately. If
+    # those counted as debt, the backlog prompt would fire on day one over
+    # cards the user has simply not reached yet.
+    now = datetime(2026, 8, 24, 10, 0, tzinfo=UTC)
+    async with session_factory() as session:
+        session.add(User(id=1))
+        session.add(make_note("note-1", 1))
+        await session.flush()
+        session.add(make_card("seen", "note-1", 1, due=now - timedelta(days=3), reps=4))
+        for i in range(12):
+            session.add(make_card(f"new-{i}", "note-1", 1, due=now, reps=0))
+        await session.commit()
+
+        everything_due = await overdue_count(session, 1, now)
+        debt = await overdue_count(session, 1, now, reviewed_only=True)
+
+    assert everything_due == 13  # the deck screen still counts them all
+    assert debt == 1
+
+
+async def test_defer_overdue_tail_leaves_never_reviewed_cards_alone(session_factory):
+    now = datetime(2026, 8, 24, 10, 0, tzinfo=UTC)
+    async with session_factory() as session:
+        session.add(User(id=1))
+        session.add(make_note("note-1", 1))
+        await session.flush()
+        for i in range(3):
+            session.add(
+                make_card(f"seen-{i}", "note-1", 1, due=now - timedelta(days=3 - i), reps=2)
+            )
+        session.add(make_card("fresh", "note-1", 1, due=now, reps=0))
+        await session.commit()
+
+        postponed = await defer_overdue_tail(session, 1, now, keep_n=1, postpone_days=7)
+        await session.commit()
+
+        fresh = await session.get(Card, "fresh")
+
+    assert postponed == 2
+    assert fresh.due == now
+
+
+# --- ordering contract ------------------------------------------------------
+
+
+def make_inflection_card(
+    card_id: str, note_id: str, user_id: int, due: datetime, form: str, reps: int = 1
+) -> Card:
+    return Card(
+        id=card_id,
+        note_id=note_id,
+        user_id=user_id,
+        type=CardType.inflection,
+        form=form,
+        due=due,
+        reps=reps,
+    )
+
+
+async def test_cards_sharing_a_due_second_come_out_in_syllabus_order_not_insert_order(
+    session_factory,
+):
+    # Every form the curriculum opens on one study day gets `due = now`, and
+    # UTCDateTime stores whole epoch seconds - so a batch of forms shares one
+    # due value exactly. `ORDER BY due` alone leaves those rows unordered,
+    # and what SQLite actually returned was insert order, i.e. the key order
+    # of the note's principal_forms JSON. Everything below is arranged to
+    # contradict the syllabus: the note inserted first is the *younger* one,
+    # and inside a note both the insert order and the (uuid4-shaped) card ids
+    # run backwards against FORM_TASKS and against "word before its forms".
+    now = datetime(2026, 8, 24, 10, 0, tzinfo=UTC)
+    due = now - timedelta(hours=1)
+    async with session_factory() as session:
+        session.add(User(id=1))
+
+        younger = make_note("note-younger", 1)
+        younger.created_at = now
+        session.add(younger)
+        older = make_note("note-older", 1)
+        older.created_at = now - timedelta(days=1)
+        session.add(older)
+        await session.flush()
+
+        # Inserted younger-note-first, and inside each note the forms run
+        # backwards through FORM_TASKS (illatiivi sits after partitiivi,
+        # which sits after genetiivi). Ids sort the wrong way too.
+        session.add(make_inflection_card("a-y-illat", "note-younger", 1, due, "illatiivi"))
+        session.add(make_inflection_card("b-y-genet", "note-younger", 1, due, "genetiivi"))
+        session.add(make_inflection_card("c-o-illat", "note-older", 1, due, "illatiivi"))
+        session.add(make_inflection_card("d-o-parti", "note-older", 1, due, "partitiivi"))
+        session.add(make_inflection_card("e-o-genet", "note-older", 1, due, "genetiivi"))
+        # The word's own card, inserted last and with the largest id, still
+        # belongs in front of that same note's forms.
+        session.add(make_card("z-o-recog", "note-older", 1, due=due, reps=1))
+        await session.commit()
+
+        queue = await build_session_queue(
+            session, 1, now, session_max_cards=50, daily_new_limit=50, boundary_hour=4
+        )
+
+    assert queue == [
+        "z-o-recog",  # older note first, and its word before its forms
+        "e-o-genet",
+        "d-o-parti",
+        "c-o-illat",
+        "b-y-genet",  # then the younger note, again in FORM_TASKS order
+        "a-y-illat",
+    ]
+
+
+async def test_the_fetch_window_cuts_a_tied_batch_at_a_fixed_point(session_factory):
+    # The tie-break has to live in SQL, not in a Python sort afterwards:
+    # `LIMIT` is applied by the database, so with an ambiguous ORDER BY it is
+    # undefined *which* of the tied rows are fetched at all - a later sort
+    # could only reorder whichever ones happened to arrive. Here 6 cards
+    # share one due second and the window holds 5, so exactly one must be
+    # left out, and it must be the last one in syllabus order.
+    now = datetime(2026, 8, 24, 10, 0, tzinfo=UTC)
+    due = now - timedelta(hours=1)
+    forms = ["genetiivi", "partitiivi", "illatiivi", "inessiivi", "elatiivi", "adessiivi"]
+    async with session_factory() as session:
+        session.add(User(id=1))
+        session.add(make_note("note-1", 1))
+        await session.flush()
+        # Inserted last-form-first, so insert order is the reverse of the
+        # order the learner should meet them in.
+        for i, form in enumerate(reversed(forms)):
+            session.add(make_inflection_card(f"card-{i}", "note-1", 1, due, form))
+        await session.commit()
+
+        # session_max_cards * 5 is the fetch window, so 1 -> 5 candidates.
+        queue = await build_session_queue(
+            session, 1, now, session_max_cards=1, daily_new_limit=50, boundary_hour=4
+        )
+        fetched = await due_cards(session, 1, now, limit=5)
+
+    assert [card.form for card in fetched] == forms[:5]  # adessiivi is the one dropped
+    assert queue == [fetched[0].id]

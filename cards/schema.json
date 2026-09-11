@@ -90,7 +90,7 @@
             "gradation": { "type": ["string", "null"] },
             "principal_forms": {
               "type": "object",
-              "description": "Verb keys: preesens_1s, preesens_3s, imperfekti_3s, nut_partisiippi, passiivi. Noun/adjective keys: nominatiivi, genetiivi, partitiivi, illatiivi, monikon_genetiivi, monikon_partitiivi. All values must come from generate_forms() - never hand-written.",
+              "description": "Verb keys: preesens_1s, preesens_3s, imperfekti_3s, konditionaali_1s, imperatiivi_2s, nut_partisiippi, passiivi. Noun/adjective keys: nominatiivi, genetiivi, partitiivi, illatiivi, inessiivi, elatiivi, adessiivi, ablatiivi, allatiivi, essiivi, translatiivi, monikon_genetiivi, monikon_partitiivi. All values must come from generate_forms() - never hand-written.",
               "additionalProperties": { "type": "string" }
             },
             "forms_source": { "$ref": "#/$defs/formsSource" },

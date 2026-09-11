@@ -116,6 +116,108 @@ async def test_inflection_opens_only_when_forms_are_filled_and_verified(session_
     assert CardType.inflection in {c.type for c in created}
 
 
+async def test_each_principal_form_gets_its_own_card(session_factory):
+    # One card per note would let FSRS schedule the translative by how the
+    # illative was rated - the forms are separate items, so they need
+    # separate schedules.
+    forms = {"genetiivi": "kaupan", "illatiivi": "kauppaan", "partitiivi": "kauppaa"}
+    async with session_factory() as session:
+        session.add(User(id=1))
+        note = make_note("note-1", 1, forms_verified=True, principal_forms=forms)
+        session.add(note)
+        await session.flush()
+
+        created = await ensure_card_types(session, note, NOW)
+        await session.commit()
+
+    assert {c.form for c in created if c.type == CardType.inflection} == set(forms)
+
+
+async def test_forms_with_no_task_defined_get_no_card(session_factory):
+    # nominatiivi equals the lemma shown on the front, so it is generated
+    # and stored but never turned into a card.
+    async with session_factory() as session:
+        session.add(User(id=1))
+        note = make_note(
+            "note-1",
+            1,
+            forms_verified=True,
+            principal_forms={"nominatiivi": "kauppa", "illatiivi": "kauppaan"},
+        )
+        session.add(note)
+        await session.flush()
+
+        created = await ensure_card_types(session, note, NOW)
+        await session.commit()
+
+    assert {c.form for c in created if c.type == CardType.inflection} == {"illatiivi"}
+
+
+async def test_inflection_cards_are_not_duplicated_on_repeated_calls(session_factory):
+    forms = {"genetiivi": "kaupan", "illatiivi": "kauppaan"}
+    async with session_factory() as session:
+        session.add(User(id=1))
+        note = make_note("note-1", 1, forms_verified=True, principal_forms=forms)
+        session.add(note)
+        await session.flush()
+
+        await ensure_card_types(session, note, NOW)
+        await session.flush()
+        second_run = await ensure_card_types(session, note, NOW)
+        await session.commit()
+
+    assert second_run == []
+    async with session_factory() as session:
+        cards = (
+            await session.scalars(
+                select(Card).where(Card.note_id == "note-1", Card.type == CardType.inflection)
+            )
+        ).all()
+    assert sorted(c.form for c in cards) == ["genetiivi", "illatiivi"]
+
+
+async def test_a_formless_inflection_card_is_adopted_instead_of_replaced(session_factory):
+    # Cards written before forms were per-card carry real review history -
+    # they get a form, they don't get thrown away and re-created.
+    async with session_factory() as session:
+        session.add(User(id=1))
+        note = make_note(
+            "note-1",
+            1,
+            forms_verified=True,
+            principal_forms={"genetiivi": "kaupan", "illatiivi": "kauppaan"},
+        )
+        session.add(note)
+        session.add(
+            Card(
+                id="old-1",
+                note_id="note-1",
+                user_id=1,
+                type=CardType.inflection,
+                form=None,
+                due=NOW,
+                reps=7,
+                stability=12.0,
+            )
+        )
+        await session.flush()
+
+        await ensure_card_types(session, note, NOW)
+        await session.commit()
+
+    async with session_factory() as session:
+        cards = (
+            await session.scalars(
+                select(Card).where(Card.note_id == "note-1", Card.type == CardType.inflection)
+            )
+        ).all()
+        old = await session.get(Card, "old-1")
+
+    assert len(cards) == 2
+    assert old.form == "genetiivi"
+    assert old.reps == 7 and old.stability == 12.0
+
+
 async def test_inflection_stays_closed_without_principal_forms_even_if_verified(session_factory):
     async with session_factory() as session:
         session.add(User(id=1))

@@ -9,7 +9,6 @@ this must keep working when OpenAI is unreachable (see plan 3.10).
 from __future__ import annotations
 
 import logging
-import random
 from datetime import UTC, datetime
 
 from aiogram import F, Router
@@ -29,6 +28,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from kielikaveri.config import Settings
 from kielikaveri.db.decks import list_decks
 from kielikaveri.db.models import Card, CardType, Deck, Note, Review
+from kielikaveri.grammar import FORM_TASKS
+from kielikaveri.srs.curriculum import introduce_due_forms
 from kielikaveri.srs.graduation import ensure_card_types, sync_user_card_types
 from kielikaveri.srs.queue import build_session_queue, defer_overdue_tail, overdue_count
 from kielikaveri.srs.scheduler import RATING_LABELS, Rating, SrsState
@@ -56,9 +57,13 @@ def render_card(card: Card, note: Note) -> tuple[str, str]:
         return f"🇷🇺 {note.translation_ru}", f"{note.lemma}\n\n{note.example_fi}"
     if card.type == CardType.inflection:
         forms: dict = note.meta.get("principal_forms") or {}
-        if forms:
-            form_name, form_value = random.choice(list(forms.items()))
-            return f"{note.lemma} → {form_name}?", form_value
+        # The card names its own form (one card per form), so the question
+        # is stable across reviews and its FSRS interval means something.
+        # A form with no FORM_TASKS entry is never asked - the front must
+        # not carry a bare key like "nut_partisiippi".
+        task = FORM_TASKS.get(card.form)
+        if task is not None and card.form in forms:
+            return f"{note.lemma} → {task.cue}", f"{forms[card.form]}\n\n✅ {task.label}"
         return note.lemma, note.lemma
     return note.lemma, note.translation_ru
 
@@ -203,8 +208,18 @@ async def _proceed_past_deck_choice(
 ) -> None:
     async with session_factory() as session:
         await sync_user_card_types(session, user_id, now)
+        # Cards first, then the curriculum decides which of the new forms
+        # the learner actually meets today - see srs/curriculum.py.
+        await introduce_due_forms(
+            session,
+            user_id,
+            now,
+            daily_new_forms=settings.daily_new_forms,
+            boundary_hour=settings.day_boundary_hour,
+            deck_id=deck_id,
+        )
         await session.commit()
-        overdue = await overdue_count(session, user_id, now, deck_id=deck_id)
+        overdue = await overdue_count(session, user_id, now, deck_id=deck_id, reviewed_only=True)
 
     if overdue > settings.debt_threshold:
         logger.info(
