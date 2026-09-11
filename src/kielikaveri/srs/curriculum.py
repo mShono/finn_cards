@@ -16,11 +16,13 @@ come from FSRS alone, exactly as before - see srs/scheduler.py.
 
 Policy, all of it data-driven from kielikaveri.grammar:
 1. A form only opens once the word itself is known - the note's recognition
-   card must have been answered correctly SUCCESSFUL_ANSWERS_TO_UNLOCK times.
+   card must have been rated Good or Easy SUCCESSFUL_ANSWERS_TO_UNLOCK times.
+   Hard and Again do not count toward the threshold (see UNLOCKING_RATINGS).
 2. Forms open by curriculum level: every core form of a note must be known
    before an extended one opens, and every extended one before a `later`
-   one. Same "answered right twice" bar, so the ladder is driven by what the
-   learner actually got right rather than by how long ago the word was added.
+   one. Same "rated Good or Easy twice" bar, so the ladder is driven by what
+   the learner actually recalled rather than by how long ago the word was
+   added.
 3. Ties break by FORM_ORDER, which keeps a grammatical group (mihin? /
    missä? / mistä?) consecutive instead of scattered across weeks.
 """
@@ -41,12 +43,20 @@ from kielikaveri.srs.scheduler import Rating
 
 logger = logging.getLogger(__name__)
 
-# Correct answers a card needs before the curriculum will build on it.
-# Deliberately a count of answers and not an FSRS interval: what a word has
-# earned in days depends on which ratings it happened to get and on FSRS's
-# own parameters, while "I have recalled this twice" is the same short
-# acquaintance for every word. Two, not one, because the first correct
-# answer to a brand new word is mostly the echo of having just read it.
+# The ratings that count toward opening grammar. Hard is deliberately not
+# one of them: it means the answer was dragged up with effort, and a word
+# that keeps coming back as "Трудно" is not a foundation to build twelve
+# inflections on. Hard still moves the card's FSRS schedule exactly as
+# before - this set governs one question only, whether the answer counts
+# toward the unlock threshold below.
+UNLOCKING_RATINGS = (Rating.Good, Rating.Easy)
+
+# Answers rated Good or Easy a card needs before the curriculum will build
+# on it. Deliberately a count of answers and not an FSRS interval: what a
+# word has earned in days depends on which ratings it happened to get and on
+# FSRS's own parameters, while "I have recalled this twice" is the same short
+# acquaintance for every word. Two, not one, because the first good answer to
+# a brand new word is mostly the echo of having just read it.
 SUCCESSFUL_ANSWERS_TO_UNLOCK = 2
 
 
@@ -63,10 +73,10 @@ def _level_index(form: str) -> int:
 def eligible_forms(cards: list[Card], successes: Mapping[str, int]) -> list[Card]:
     """The not_introduced inflection cards of one note that may open now.
 
-    `successes` counts correct answers per card id - see
+    `successes` counts Good/Easy answers per card id - see
     successful_answer_counts(). Empty while the word itself is still new, or
-    while any lower level of this note has a form the learner hasn't
-    answered right yet.
+    while any lower level of this note has a form the learner hasn't yet
+    rated Good or Easy twice.
     """
     recognition = next((c for c in cards if c.type == CardType.recognition), None)
     if recognition is None or not _is_known(recognition, successes):
@@ -93,17 +103,19 @@ def eligible_forms(cards: list[Card], successes: Mapping[str, int]) -> list[Card
 
 
 async def successful_answer_counts(session: AsyncSession, user_id: int) -> dict[str, int]:
-    """How many times each of the user's cards has been answered correctly.
+    """How many times each of the user's cards has been rated Good or Easy.
 
     Read straight off the review log, so the curriculum needs no column of
-    its own and every review already recorded counts. `Again` is the one
-    rating that isn't a correct answer, so a lapse adds nothing to the
-    count - it doesn't subtract either: the bar is "has been recalled
-    twice", not "has never been forgotten".
+    its own and every review already recorded counts. Only UNLOCKING_RATINGS
+    add to the count; Hard and Again add nothing. Neither subtracts either:
+    the bar is "has been recalled twice", not "has never been forgotten".
     """
     rows = await session.execute(
         select(Review.card_id, func.count())
-        .where(Review.user_id == user_id, Review.rating > Rating.Again.value)
+        .where(
+            Review.user_id == user_id,
+            Review.rating.in_([rating.value for rating in UNLOCKING_RATINGS]),
+        )
         .group_by(Review.card_id)
     )
     return {card_id: count for card_id, count in rows.all()}
