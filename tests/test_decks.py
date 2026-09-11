@@ -6,8 +6,16 @@ import pytest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import InlineKeyboardButton
 
-from kielikaveri.bot.decks import DeckStates, decks_activate, decks_list, decks_new_save, decks_open
+from kielikaveri.bot.decks import (
+    NOTES_PER_PAGE,
+    DeckStates,
+    decks_activate,
+    decks_list,
+    decks_new_save,
+    decks_open,
+)
 from kielikaveri.db.decks import (
     active_deck,
     create_deck,
@@ -238,7 +246,7 @@ async def test_decks_keyboard_offers_open_and_activate_for_every_deck(session_fa
     assert len(activate_rows) == 1
 
 
-async def test_decks_open_lists_notes_with_an_edit_button_each(session_factory):
+async def test_decks_open_puts_each_note_on_an_edit_button_with_its_translation(session_factory):
     async with session_factory() as session:
         deck = await create_deck(session, 1, "Общая")
         await session.flush()
@@ -262,14 +270,91 @@ async def test_decks_open_lists_notes_with_an_edit_button_each(session_factory):
     await decks_open(callback, session_factory)
 
     text = callback.message.answer.call_args.args[0]
-    assert "hakea" in text
-    assert "искать" in text
+    assert "слов: 1" in text
+    assert "hakea" not in text
     keyboard = callback.message.answer.call_args.kwargs["reply_markup"]
     edit_buttons = [
         b for row in keyboard.inline_keyboard for b in row if b.callback_data == "noteedit:n1"
     ]
     assert len(edit_buttons) == 1
+    assert edit_buttons[0].text == "✍️ 1. hakea - искать"
+    assert "verbi" not in edit_buttons[0].text
     callback.answer.assert_awaited_once()
+
+
+async def _fill_deck(session_factory, deck_id: str, count: int) -> None:
+    async with session_factory() as session:
+        for n in range(count):
+            session.add(
+                Note(
+                    id=f"n{n}",
+                    user_id=1,
+                    lemma=f"sana{n}",
+                    translation_ru=f"слово {n}",
+                    example_fi="x",
+                    example_ru="y",
+                    kind=NoteKind.word,
+                    deck_id=deck_id,
+                    created_at=NOW + timedelta(minutes=n),
+                    meta={},
+                )
+            )
+        await session.commit()
+
+
+def _note_buttons(callback):
+    keyboard = callback.message.answer.call_args.kwargs["reply_markup"]
+    return [
+        b
+        for row in keyboard.inline_keyboard
+        for b in row
+        if (b.callback_data or "").startswith("noteedit:")
+    ]
+
+
+async def test_decks_open_pages_a_deck_larger_than_one_screen_newest_first(session_factory):
+    # Regression: a deck over NOTES_PER_PAGE used to cut off the extra notes
+    # with no way to reach them - and it cut the newest ones, the very words
+    # you come back to fix.
+    async with session_factory() as session:
+        deck = await create_deck(session, 1, "Большая")
+        await session.commit()
+    await _fill_deck(session_factory, deck.id, NOTES_PER_PAGE + 3)
+
+    first = make_callback(f"decks:open:{deck.id}")
+    await decks_open(first, session_factory)
+
+    buttons = _note_buttons(first)
+    assert len(buttons) == NOTES_PER_PAGE
+    assert buttons[0].text.startswith(f"✍️ 1. sana{NOTES_PER_PAGE + 2}")
+    assert "страница 1 из 2" in first.message.answer.call_args.args[0]
+    assert first.message.answer.call_args.kwargs["reply_markup"].inline_keyboard[-2] == [
+        InlineKeyboardButton(text="вперёд ➡️", callback_data=f"decks:open:{deck.id}:1")
+    ]
+
+    second = make_callback(f"decks:open:{deck.id}:1")
+    await decks_open(second, session_factory)
+
+    tail = _note_buttons(second)
+    assert [b.callback_data for b in tail] == ["noteedit:n2", "noteedit:n1", "noteedit:n0"]
+    assert tail[0].text.startswith(f"✍️ {NOTES_PER_PAGE + 1}. sana2")
+    assert "страница 2 из 2" in second.message.answer.call_args.args[0]
+    assert second.message.answer.call_args.kwargs["reply_markup"].inline_keyboard[-2] == [
+        InlineKeyboardButton(text="⬅️ назад", callback_data=f"decks:open:{deck.id}:0")
+    ]
+
+
+async def test_decks_open_clamps_a_page_past_the_end(session_factory):
+    async with session_factory() as session:
+        deck = await create_deck(session, 1, "Малая")
+        await session.commit()
+    await _fill_deck(session_factory, deck.id, 2)
+
+    callback = make_callback(f"decks:open:{deck.id}:7")
+    await decks_open(callback, session_factory)
+
+    assert len(_note_buttons(callback)) == 2
+    assert "страница" not in callback.message.answer.call_args.args[0]
 
 
 async def test_decks_open_rejects_a_deck_belonging_to_another_user(session_factory):
