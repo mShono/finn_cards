@@ -38,6 +38,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from kielikaveri.db.models import Card, CardStatus, CardType, Note, Review
 from kielikaveri.grammar import FORM_ORDER, FORM_TASKS, LEVEL_ORDER
+from kielikaveri.srs.graduation import cards_by_note
 from kielikaveri.srs.queue import study_day_bounds
 from kielikaveri.srs.scheduler import Rating
 
@@ -163,13 +164,19 @@ async def introduce_due_forms(
     if deck_id is not None:
         stmt = stmt.where(Note.deck_id == deck_id)
     notes = (await session.scalars(stmt.order_by(Note.created_at, Note.id))).all()
+    # One query for every note's cards instead of one per note. The loop below
+    # walks *all* the notes whenever little is eligible - the ordinary state of
+    # a /learn - so the per-note SELECT cost a statement per note even on days
+    # it opened nothing (measured: 500 notes -> 503 statements). Safe to read
+    # them all up front: the three queries above have already autoflushed
+    # whatever sync_user_card_types created in this same uncommitted session.
+    cards_of = await cards_by_note(session, user_id, deck_id)
 
     introduced: list[Card] = []
     for note in notes:
         if len(introduced) >= budget:
             break
-        cards = list((await session.scalars(select(Card).where(Card.note_id == note.id))).all())
-        for card in eligible_forms(cards, successes):
+        for card in eligible_forms(cards_of.get(note.id, []), successes):
             if len(introduced) >= budget:
                 break
             card.status = CardStatus.introduced
