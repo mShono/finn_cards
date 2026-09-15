@@ -89,6 +89,47 @@ def make_message() -> SimpleNamespace:
     return SimpleNamespace(from_user=SimpleNamespace(id=1), answer=AsyncMock())
 
 
+async def _drain_session(
+    state, session_factory, settings, message, max_taps: int = 50
+) -> list[str]:
+    """Run one /learn session through the real handlers and return the card
+    ids it actually showed.
+
+    Deliberately no hand-built FSM data: the queue comes from the real
+    build_session_queue and every card is advanced by the real learn_rate,
+    so the card cap under test is the one production applies.
+    """
+    await learn_start(message, state, session_factory, settings)
+    shown: list[str] = []
+    for _ in range(max_taps):
+        markup = message.answer.call_args.kwargs.get("reply_markup")
+        if markup is None:
+            break  # the session-end message carries no keyboard
+        card_id = markup.inline_keyboard[0][0].callback_data.split(":", 2)[2]
+        shown.append(card_id)
+        reveal = make_callback(f"learn:reveal:{card_id}")
+        reveal.message = message
+        await learn_reveal(reveal, session_factory)
+        rate = make_callback(f"learn:rate:{card_id}:3")
+        rate.message = message
+        await learn_rate(rate, state, session_factory)
+    return shown
+
+
+async def _seed_due_cards(session_factory, count: int, now: datetime) -> None:
+    """`count` already-reviewed cards, each overdue by a different amount so
+    the queue order is deterministic."""
+    async with session_factory() as session:
+        session.add(User(id=1))
+        session.add(make_note())
+        await session.flush()
+        for i in range(count):
+            session.add(
+                make_card(f"card-{i}", "note-1", 1, due=now - timedelta(days=count - i), reps=1)
+            )
+        await session.commit()
+
+
 async def _seed_reviewed_card(session_factory, card_id: str) -> None:
     """A card already rated once, mirroring the state right after learn_rate
     processed it and moved the queue past it."""
@@ -241,7 +282,6 @@ async def test_concurrent_double_tap_on_the_current_head_card_records_only_one_r
         queue=["card-A"],
         reviewed_count=0,
         session_started_at=datetime.now(UTC).isoformat(),
-        session_max_cards=20,
         session_max_minutes=10,
     )
     callback_1 = make_callback("learn:rate:card-A:3")
@@ -276,7 +316,6 @@ async def test_rating_the_card_at_queue_head_records_exactly_one_review(session_
         # timestamp here is a trap for whoever next touches this test (see
         # the debt_choice tests below, which hit exactly this).
         session_started_at=datetime.now(UTC).isoformat(),
-        session_max_cards=20,
         session_max_minutes=10,
     )
     callback = make_callback("learn:rate:card-A:3")
@@ -295,7 +334,7 @@ async def test_rating_the_card_at_queue_head_records_exactly_one_review(session_
     callback.message.answer.assert_awaited_once()
 
 
-# --- _show_next_card: rendering and the two session-end conditions --------
+# --- _show_next_card and the two session-end conditions ------------------
 
 
 async def test_show_next_card_displays_the_head_of_a_nonempty_queue(session_factory):
@@ -312,7 +351,6 @@ async def test_show_next_card_displays_the_head_of_a_nonempty_queue(session_fact
         queue=["card-A", "card-B"],
         reviewed_count=0,
         session_started_at=datetime.now(UTC).isoformat(),
-        session_max_cards=20,
         session_max_minutes=10,
     )
     answer_to = SimpleNamespace(answer=AsyncMock())
@@ -328,31 +366,41 @@ async def test_show_next_card_displays_the_head_of_a_nonempty_queue(session_fact
     assert (await state.get_data())["queue"] == ["card-A", "card-B"]
 
 
-async def test_session_ends_once_the_card_limit_is_reached_even_with_cards_left(session_factory):
-    async with session_factory() as session:
-        session.add(User(id=1))
-        session.add(make_note())
-        await session.flush()
-        session.add(make_card("card-A", "note-1", 1, due=NOW))
-        session.add(make_card("card-B", "note-1", 1, due=NOW))
-        await session.commit()
-
+async def test_a_session_never_serves_more_than_session_max_cards(session_factory):
+    # Five cards are due but the cap is two. The limit lives in
+    # build_session_queue alone, so the proof has to be the real flow: start a
+    # session, rate whatever it offers, and count what actually got reviewed.
+    now = datetime.now(UTC)
+    await _seed_due_cards(session_factory, 5, now)
     state = make_state()
-    await state.update_data(
-        queue=["card-A", "card-B"],
-        reviewed_count=2,  # already at the cap
-        session_started_at=datetime.now(UTC).isoformat(),
-        session_max_cards=2,
-        session_max_minutes=10,
+    message = make_message()
+
+    shown = await _drain_session(
+        state, session_factory, make_settings(session_max_cards=2, daily_new_limit=10), message
     )
-    answer_to = SimpleNamespace(answer=AsyncMock())
 
-    await _show_next_card(answer_to, state, session_factory)
+    assert len(shown) == 2  # not 5 - the queue was capped before the first card
+    async with session_factory() as session:
+        reviews = (await session.scalars(select(Review))).all()
+    assert len(reviews) == 2
 
-    text = answer_to.answer.call_args.args[0]
-    assert "Сессия окончена" in text
-    assert "осталось 2" in text  # both cards are still due, session just capped
-    assert await state.get_data() == {}
+    text = message.answer.call_args.args[0]
+    assert "Сессия окончена: 2 карточек пройдено" in text
+    assert await state.get_data() == {}  # session closed, nothing left in the FSM
+
+
+async def test_the_next_session_picks_up_the_cards_the_cap_left_behind(session_factory):
+    # The cap defers cards, it doesn't drop them: the three the first session
+    # couldn't reach are still due and lead the next one.
+    now = datetime.now(UTC)
+    await _seed_due_cards(session_factory, 5, now)
+    settings = make_settings(session_max_cards=2, daily_new_limit=10)
+
+    first = await _drain_session(make_state(), session_factory, settings, make_message())
+    second = await _drain_session(make_state(), session_factory, settings, make_message())
+
+    assert len(second) == 2
+    assert not set(first) & set(second)  # the cap moved the window, didn't repeat it
 
 
 async def test_session_ends_once_the_time_limit_is_reached(session_factory):
@@ -369,7 +417,6 @@ async def test_session_ends_once_the_time_limit_is_reached(session_factory):
         queue=["card-A"],
         reviewed_count=0,
         session_started_at=started_11_minutes_ago,
-        session_max_cards=20,
         session_max_minutes=10,
     )
     answer_to = SimpleNamespace(answer=AsyncMock())
@@ -699,32 +746,36 @@ async def test_learn_start_with_no_due_cards_logs_session_empty(session_factory,
 
 
 async def test_show_next_card_logs_session_end_with_reason_and_counts(session_factory, caplog):
-    async with session_factory() as session:
-        session.add(User(id=1))
-        session.add(make_note())
-        await session.flush()
-        session.add(make_card("card-A", "note-1", 1, due=NOW))
-        session.add(make_card("card-B", "note-1", 1, due=NOW))
-        await session.commit()
-
+    # A session that runs out of time mid-queue - the only way session_end
+    # reports a non-zero `remaining`, now that the card cap is the queue's job
+    # and a capped queue simply ends empty.
+    now = datetime.now(UTC)
+    await _seed_due_cards(session_factory, 2, now)
     state = make_state()
+    message = make_message()
+    settings = make_settings(session_max_cards=2, session_max_minutes=10, daily_new_limit=10)
+
+    await learn_start(message, state, session_factory, settings)
+    first_card = message.answer.call_args.kwargs["reply_markup"].inline_keyboard[0][0]
+    card_id = first_card.callback_data.split(":", 2)[2]
+    rate = make_callback(f"learn:rate:{card_id}:3")
+    rate.message = message
+
+    # The learner walked away for 11 minutes between the first card and the
+    # second - only the clock is moved, the queue and the count stay as the
+    # real flow left them.
     await state.update_data(
-        queue=["card-A", "card-B"],
-        reviewed_count=2,
-        session_started_at=datetime.now(UTC).isoformat(),
-        session_max_cards=2,
-        session_max_minutes=10,
+        session_started_at=(datetime.now(UTC) - timedelta(minutes=11)).isoformat()
     )
-    answer_to = SimpleNamespace(answer=AsyncMock())
 
     with caplog.at_level(logging.INFO, logger="kielikaveri.bot.learn"):
-        await _show_next_card(answer_to, state, session_factory)
+        await learn_rate(rate, state, session_factory)
 
     events = [log_fields(r.message) for r in caplog.records]
     end = next(f for f in events if f.get("event") == "learn.session_end")
-    assert end["reason"] == "max_cards"
-    assert end["reviewed"] == "2"
-    assert end["remaining"] == "2"
+    assert end["reason"] == "max_minutes"
+    assert end["reviewed"] == "1"
+    assert end["remaining"] == "1"  # the second card was never shown
 
 
 async def test_learn_reveal_logs_reveal_event(session_factory, caplog):
@@ -758,7 +809,6 @@ async def test_learn_rate_logs_db_save_with_rating(session_factory, caplog):
         queue=["card-A"],
         reviewed_count=0,
         session_started_at=datetime.now(UTC).isoformat(),
-        session_max_cards=20,
         session_max_minutes=10,
     )
     callback = make_callback("learn:rate:card-A:3")

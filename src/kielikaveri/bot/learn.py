@@ -2,7 +2,8 @@
 
 Flow: show front -> "Показать ответ" reveals back + rating buttons -> rating
 applies the review via srs.scheduler and advances to the next card, until the
-session hits its card/time limit or the queue runs dry. No LLM, no network -
+session hits its time limit or the queue - already capped at session_max_cards
+by build_session_queue - runs dry. No LLM, no network -
 this must keep working when OpenAI is unreachable (see plan 3.10).
 """
 
@@ -143,7 +144,6 @@ async def _start_session(
         queue=queue,
         session_started_at=now.isoformat(),
         reviewed_count=0,
-        session_max_cards=settings.session_max_cards,
         session_max_minutes=settings.session_max_minutes,
     )
     await _show_next_card(answer_to, state, session_factory)
@@ -158,19 +158,13 @@ async def _show_next_card(
     reviewed_count: int = data["reviewed_count"]
     elapsed_minutes = (datetime.now(UTC) - started_at).total_seconds() / 60
 
-    if (
-        not queue
-        or reviewed_count >= data["session_max_cards"]
-        or elapsed_minutes >= data["session_max_minutes"]
-    ):
+    # No card-count check here on purpose: build_session_queue already caps the
+    # queue at session_max_cards and learn_rate pops exactly one card per
+    # review, so reviewed_count can never reach the cap while cards remain -
+    # the queue is the single place that limit is applied.
+    if not queue or elapsed_minutes >= data["session_max_minutes"]:
         remaining = len(queue)
-        reason = (
-            "queue_empty"
-            if not queue
-            else "max_cards"
-            if reviewed_count >= data["session_max_cards"]
-            else "max_minutes"
-        )
+        reason = "queue_empty" if not queue else "max_minutes"
         logger.info(
             "event=learn.session_end reason=%s reviewed=%d remaining=%d",
             reason,
