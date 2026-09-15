@@ -32,8 +32,7 @@ from kielikaveri.grammar import FORM_TASKS
 from kielikaveri.srs.curriculum import introduce_due_forms
 from kielikaveri.srs.graduation import ensure_card_types, sync_user_card_types
 from kielikaveri.srs.queue import build_session_queue, defer_overdue_tail, overdue_count
-from kielikaveri.srs.scheduler import RATING_LABELS, Rating, SrsState
-from kielikaveri.srs.scheduler import review as apply_review
+from kielikaveri.srs.scheduler import RATING_LABELS, Rating, apply_review
 from kielikaveri.tts import synthesize_speech
 
 logger = logging.getLogger(__name__)
@@ -372,23 +371,8 @@ async def learn_rate(
 
     async with session_factory() as session:
         card = await session.get(Card, card_id)
-        current = SrsState(
-            state=card.state,
-            due=card.due,
-            stability=card.stability,
-            difficulty=card.difficulty,
-            reps=card.reps,
-            lapses=card.lapses,
-            step=card.step,
-        )
-        updated = apply_review(current, rating, now)
-        card.state = updated.state
-        card.due = updated.due
-        card.stability = updated.stability
-        card.difficulty = updated.difficulty
-        card.reps = updated.reps
-        card.lapses = updated.lapses
-        card.step = updated.step
+        # Moves every SRS column on the card; the `reviews` row below is ours.
+        apply_review(card, rating, now)
 
         session.add(
             Review(card_id=card.id, user_id=card.user_id, rating=rating.value, reviewed_at=now)

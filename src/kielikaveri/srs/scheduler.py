@@ -11,7 +11,7 @@ from datetime import datetime
 
 import fsrs
 
-from kielikaveri.db.models import CardState
+from kielikaveri.db.models import Card, CardState
 
 Rating = fsrs.Rating
 
@@ -78,3 +78,37 @@ def review(current: SrsState, rating: Rating, now: datetime) -> SrsState:
         lapses=lapses,
         step=updated.step,
     )
+
+
+def apply_review(card: Card, rating: Rating, now: datetime) -> None:
+    """Apply one review to `card`'s SRS columns, in place.
+
+    The Card <-> SrsState mapping lives here, not at the call sites, because
+    there were two hand-written copies of it (the bot's rating handler and the
+    tests' `answer` helper) and every column has to appear in both halves:
+    dropping `step` on the write-back alone silently restarts a card's
+    learning phase on the next review.
+
+    Still no DB access - this only assigns attributes on an ORM instance.
+    Writing the `reviews` row and committing stay with the caller.
+    """
+    updated = review(
+        SrsState(
+            state=card.state,
+            due=card.due,
+            stability=card.stability,
+            difficulty=card.difficulty,
+            reps=card.reps,
+            lapses=card.lapses,
+            step=card.step,
+        ),
+        rating,
+        now,
+    )
+    card.state = updated.state
+    card.due = updated.due
+    card.stability = updated.stability
+    card.difficulty = updated.difficulty
+    card.reps = updated.reps
+    card.lapses = updated.lapses
+    card.step = updated.step
