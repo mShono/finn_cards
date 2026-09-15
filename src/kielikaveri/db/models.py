@@ -268,6 +268,12 @@ class Card(Base):
 
     note: Mapped[Note] = relationship(back_populates="cards")
 
+    # SQLite indexes no foreign key on its own, so every "this note's cards"
+    # lookup was a full scan of `cards`. /learn asks for exactly that on the
+    # hot path - once per user in graduation.cards_by_note (joined to notes)
+    # and once per rating in learn_rate's ensure_card_types.
+    __table_args__ = (Index("ix_cards_note_id", "note_id"),)
+
 
 class IngestCache(Base):
     """Cached /add candidate-generation result, keyed by the input text's hash.

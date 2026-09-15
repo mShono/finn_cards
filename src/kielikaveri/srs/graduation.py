@@ -25,13 +25,50 @@ from kielikaveri.grammar import FORM_TASKS
 PRODUCTION_STABILITY_THRESHOLD_DAYS = 3.0
 
 
-async def ensure_card_types(session: AsyncSession, note: Note, now: datetime) -> list[Card]:
+async def cards_by_note(
+    session: AsyncSession, user_id: int, deck_id: str | None = None
+) -> dict[str, list[Card]]:
+    """Every card belonging to the user's notes, grouped by note id, in one query.
+
+    Exactly the rows the per-note `WHERE cards.note_id = ?` lookups used to
+    return, fetched once: walking N notes cost N SELECTs (measured on this
+    schema: 500 notes -> 501 statements for a single /learn). Joined to
+    `notes` by the very predicate that selects those notes, so the grouping
+    covers precisely them and nothing else.
+
+    Deliberately no ORDER BY. Cards inside one note come back in the same
+    (rowid) order the per-note SELECT gave them, and _ensure_inflection_cards
+    pairs form-less orphan cards with form names in that order - sorting by
+    Card.id here would reshuffle it, and a uuid4 order means nothing anyway.
+    """
+    stmt = select(Card).join(Note, Card.note_id == Note.id).where(Note.user_id == user_id)
+    if deck_id is not None:
+        stmt = stmt.where(Note.deck_id == deck_id)
+    grouped: dict[str, list[Card]] = {}
+    for card in await session.scalars(stmt):
+        grouped.setdefault(card.note_id, []).append(card)
+    return grouped
+
+
+async def ensure_card_types(
+    session: AsyncSession,
+    note: Note,
+    now: datetime,
+    existing: Sequence[Card] | None = None,
+) -> list[Card]:
     """Create any review-card types `note` has become eligible for.
 
     Safe to call repeatedly (e.g. after every review, or lazily before
     building a /learn queue) - each type is created at most once per note.
+
+    `existing` is this note's cards, for a caller that already holds them -
+    see sync_user_card_types, which fetches every note's in one query rather
+    than one SELECT per note. Left out, the function reads them itself and
+    behaves exactly as it always did; an empty sequence means "this note has
+    no cards", not "go and look".
     """
-    existing = (await session.scalars(select(Card).where(Card.note_id == note.id))).all()
+    if existing is None:
+        existing = (await session.scalars(select(Card).where(Card.note_id == note.id))).all()
     by_type = {card.type: card for card in existing}
     created: list[Card] = []
 
@@ -115,9 +152,16 @@ def _ensure_inflection_cards(
 
 
 async def sync_user_card_types(session: AsyncSession, user_id: int, now: datetime) -> list[Card]:
-    """Run ensure_card_types for every note the user owns. Does not commit."""
+    """Run ensure_card_types for every note the user owns. Does not commit.
+
+    Two queries regardless of how many notes there are: the notes, then all
+    of their cards at once (see cards_by_note). Each note is still handed
+    only its own cards, so ensure_card_types decides exactly what it decided
+    before - the loop just no longer pays a SELECT per iteration.
+    """
     notes = (await session.scalars(select(Note).where(Note.user_id == user_id))).all()
+    by_note = await cards_by_note(session, user_id)
     created: list[Card] = []
     for note in notes:
-        created.extend(await ensure_card_types(session, note, now))
+        created.extend(await ensure_card_types(session, note, now, by_note.get(note.id, ())))
     return created
