@@ -8,6 +8,7 @@ from finn_cards.morphology import NOMINAL_FORMS
 from kielikaveri.db.engine import create_all, make_engine, make_session_factory
 from kielikaveri.db.models import (
     Card,
+    CardState,
     CardStatus,
     CardType,
     Note,
@@ -23,8 +24,7 @@ from kielikaveri.srs.curriculum import (
 )
 from kielikaveri.srs.graduation import sync_user_card_types
 from kielikaveri.srs.queue import build_session_queue, card_counters, overdue_count
-from kielikaveri.srs.scheduler import Rating, SrsState
-from kielikaveri.srs.scheduler import review as apply_review
+from kielikaveri.srs.scheduler import Rating, apply_review
 
 NOW = datetime(2026, 9, 10, 9, 0, tzinfo=UTC)
 # When the tests' simulated learner first met a card. Far enough back that
@@ -88,26 +88,7 @@ async def answer(
             # seeing it would hand FSRS a near-perfect recall and a wildly
             # long interval, which is not what a learner's history looks like.
             when = at if i == 0 else card.due
-            updated = apply_review(
-                SrsState(
-                    state=card.state,
-                    due=card.due,
-                    stability=card.stability,
-                    difficulty=card.difficulty,
-                    reps=card.reps,
-                    lapses=card.lapses,
-                    step=card.step,
-                ),
-                rating,
-                when,
-            )
-            card.state = updated.state
-            card.due = updated.due
-            card.stability = updated.stability
-            card.difficulty = updated.difficulty
-            card.reps = updated.reps
-            card.lapses = updated.lapses
-            card.step = updated.step
+            apply_review(card, rating, when)
             session.add(
                 Review(
                     card_id=card.id,
@@ -176,6 +157,53 @@ def _form_cards(*names: str) -> list[Card]:
         )
         for name in names
     ]
+
+
+# --- 0: the SRS write-back shared with bot/learn.py ---------------------------
+
+SRS_COLUMNS = ("state", "due", "stability", "difficulty", "reps", "lapses", "step")
+
+
+async def test_answering_persists_every_srs_column_including_step(session_factory):
+    """`answer` above and bot/learn.py's rating handler write a review through
+    the same srs.scheduler.apply_review, so this pins down what that writes.
+    A column dropped from the write-back would still leave most of these
+    tests green - `step` especially: losing it reads back as None and FSRS
+    restarts the card's learning phase."""
+    await seed_three_nouns(session_factory)
+    pristine = (await cards_of(session_factory, "n0", type=CardType.recognition))[0]
+    assert {name: getattr(pristine, name) for name in SRS_COLUMNS} == {
+        "state": CardState.learning,
+        "due": NOW,
+        "stability": None,
+        "difficulty": None,
+        "reps": 0,
+        "lapses": 0,
+        "step": None,
+    }
+
+    await answer(session_factory, pristine.id, [Rating.Good])
+
+    card = (await cards_of(session_factory, "n0", type=CardType.recognition))[0]
+    assert card.state == CardState.learning  # one Good is not yet a graduation
+    assert card.due > FIRST_SEEN
+    assert card.stability is not None and card.stability > 0
+    assert card.difficulty is not None
+    assert card.reps == 1
+    assert card.lapses == 0  # never was in review state, so nothing was forgotten
+    assert card.step == 1  # moved on one learning step, and it survived the DB
+
+    async with session_factory() as session:
+        reviews = (await session.scalars(select(Review).where(Review.card_id == card.id))).all()
+    assert [(r.rating, r.reviewed_at) for r in reviews] == [(Rating.Good.value, FIRST_SEEN)]
+
+    # Proof the stored `step` is the one FSRS reads back: answering the card
+    # when it next comes up graduates it rather than replaying step 0.
+    await answer(session_factory, card.id, [Rating.Good], at=card.due)
+
+    graduated = (await cards_of(session_factory, "n0", type=CardType.recognition))[0]
+    assert graduated.state == CardState.review
+    assert graduated.reps == 2
 
 
 # --- 1-2: the cards exist, the learner is not buried in them ------------------
@@ -599,20 +627,7 @@ async def test_reviewing_one_form_moves_only_that_forms_schedule(session_factory
                 )
             ).all()
         }
-        state = apply_review(
-            SrsState(
-                state=illative.state,
-                due=illative.due,
-                stability=illative.stability,
-                difficulty=illative.difficulty,
-                reps=illative.reps,
-                lapses=illative.lapses,
-                step=illative.step,
-            ),
-            Rating.Easy,
-            NOW,
-        )
-        illative.due, illative.stability, illative.reps = state.due, state.stability, state.reps
+        apply_review(illative, Rating.Easy, NOW)
         await session.commit()
 
     async with session_factory() as session:
