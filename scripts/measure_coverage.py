@@ -12,7 +12,7 @@ Usage: python scripts/measure_coverage.py
 
 from __future__ import annotations
 
-from finn_cards.morphology import detect_pos, forms_for_pos, generate_forms
+from finn_cards.morphology import forms_for_pos, generate_forms, pos_set_for_lemma
 
 VERBS = [
     "hakea",
@@ -63,9 +63,14 @@ def main() -> None:
     problems = []
 
     for lemma, pos in WORDS:
-        detected = detect_pos(lemma)
-        if pos not in detected:
-            pos_mismatches.append((lemma, pos, detected))
+        # The curated list above pairs a *lemma* with its part of speech,
+        # so the question is what the FST allows for that lemma - not what
+        # the bare string can analyze as. detect_pos("tuli") includes "verbi"
+        # from the unrelated lemma "tulla", which would report a mismatch
+        # that isn't one.
+        allowed = pos_set_for_lemma(lemma)
+        if pos not in allowed:
+            pos_mismatches.append((lemma, pos, sorted(allowed)))
 
         result = generate_forms(lemma, pos)
         n_forms = len(forms_for_pos(pos))
@@ -92,9 +97,9 @@ def main() -> None:
     print(f"  missing (FST empty):      {missing_forms}")
 
     if pos_mismatches:
-        print("\npos mismatches (detect_pos() disagreed with the curated list):")
-        for lemma, expected, detected in pos_mismatches:
-            print(f"  {lemma}: expected {expected}, detect_pos()={detected}")
+        print("\npos mismatches (the FST disagreed with the curated list):")
+        for lemma, expected, allowed in pos_mismatches:
+            print(f"  {lemma}: expected {expected}, pos_set_for_lemma()={allowed}")
 
     if problems:
         print("\nwords needing attention (ambiguous or missing forms):")

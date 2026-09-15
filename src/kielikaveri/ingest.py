@@ -2,7 +2,8 @@
 candidates (plan 3.11, "Текст", revised - a chat instead of a fixed
 one-by-one confirmation list).
 
-Two separate LLM calls, both structured (strict: true):
+Up to three separate LLM calls, all structured (strict: true) - the third
+only fires for a genuinely ambiguous lemma:
 
 1. check_and_suggest() - reads one chat message (pasted text, or a
    translation attempt) and returns a conversational Russian reply plus
@@ -15,6 +16,12 @@ Two separate LLM calls, both structured (strict: true):
    call picks the literary one - constrained by an enum built from exactly
    those FST candidates, so the schema itself makes it impossible for the
    model to return anything the FST didn't already generate.
+3. choose_pos() - the same pattern one level up, for the part of speech
+   itself. The FST says which parts of speech a lemma can have
+   (morphology.pos_set_for_lemma); when the LLM's answer isn't one of them
+   and there is more than one to choose from ("hakea" is both a verb and a
+   noun), only the sentence can decide, so the LLM picks again from an enum
+   of exactly the FST's set. See resolve_note_pos().
 """
 
 from __future__ import annotations
@@ -32,7 +39,13 @@ from openai import AsyncOpenAI
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from finn_cards.morphology import FormsResult, forms_for_pos, generate_forms, lemmatize
+from finn_cards.morphology import (
+    FormsResult,
+    forms_for_pos,
+    generate_forms,
+    lemmatize,
+    pos_set_for_lemma,
+)
 from finn_cards.strict_schema import convert_to_strict
 from kielikaveri.db.models import IngestCache, Note
 from kielikaveri.import_cards import SCHEMA_PATH
@@ -51,6 +64,7 @@ EXCLUDED_FIELDS = frozenset({"id", "principal_forms", "forms_source", "forms_ver
 
 CHAT_SCHEMA_NAME = "kielikaveri_chat_reply"
 FORM_CHOICE_SCHEMA_NAME = "kielikaveri_form_choice"
+POS_CHOICE_SCHEMA_NAME = "kielikaveri_pos_choice"
 
 
 @dataclass
@@ -65,6 +79,10 @@ class ResolvedForms:
     principal_forms: dict[str, str]
     forms_source: str
     forms_verified: bool
+    # The part of speech the forms were actually generated for - the LLM's
+    # own answer when the FST confirmed it, the FST's when it corrected it
+    # (see resolve_note_pos). Callers persist this, not the LLM's `pos`.
+    pos: str | None = None
 
 
 def _load_note_schema() -> dict:
@@ -334,6 +352,154 @@ async def resolve_ambiguous_forms(
     return chosen, usage
 
 
+async def choose_pos(
+    client: AsyncOpenAI,
+    breaker: CallBreaker,
+    model: str,
+    lemma: str,
+    allowed: list[str],
+    context: str | None,
+    now: datetime,
+) -> tuple[str, TokenUsage]:
+    """Have the LLM pick one part of speech out of the FST's own set - never invent one.
+
+    Same shape as resolve_ambiguous_forms(): the enum is built from exactly
+    what the FST allows, so the schema itself makes an answer outside that
+    set impossible. The difference is what is being decided - which reading
+    of the lemma the sentence actually uses, which is a question about
+    meaning that the FST has never seen the material for.
+    """
+    breaker.check(now)
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["pos"],
+        "properties": {"pos": {"type": "string", "enum": allowed}},
+    }
+    _log_llm_request("choose_pos", model, lemma=lemma)
+    start = time.monotonic()
+    response = await client.responses.create(
+        model=model,
+        instructions=(
+            f"Лемма '{lemma}' по данным морфологического анализатора может быть "
+            "несколькими частями речи - это разные слова, у которых совпало "
+            "написание. Выбери ту часть речи, в которой слово употреблено в "
+            "присланном предложении. Если предложения нет, выбери самое "
+            "обычное для этой леммы значение. Схема ответа разрешает только "
+            "значения из присланного списка."
+        ),
+        input=json.dumps(
+            {"lemma": lemma, "allowed_pos": allowed, "example_fi": context or ""},
+            ensure_ascii=False,
+        ),
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": POS_CHOICE_SCHEMA_NAME,
+                "schema": schema,
+                "strict": True,
+            }
+        },
+    )
+    duration_ms = int((time.monotonic() - start) * 1000)
+    usage = _usage_from(response)
+    _log_llm_response("choose_pos", model, duration_ms, usage, lemma=lemma)
+    return json.loads(response.output_text)["pos"], usage
+
+
+async def resolve_note_pos(
+    client: AsyncOpenAI,
+    breaker: CallBreaker,
+    model: str,
+    lemma: str,
+    pos: str | None,
+    context: str | None,
+    now: datetime,
+) -> tuple[str | None, TokenUsage | None]:
+    """Reconcile the LLM's part of speech with the one(s) the FST allows for `lemma`.
+
+    The invariant: the FST bounds the set of possible parts of speech, the
+    LLM picks inside it. The FST is never allowed to *choose* - its readings
+    all carry weight 0.0, so preferring one over another would be reading a
+    ranking into an arbitrary order (plain `pos_set_for_lemma(lemma)` returns
+    a set for exactly this reason).
+
+    Four cases:
+
+    * the FST knows nothing about `lemma` - keep the LLM's answer, nothing
+      can confirm or refute it (unknown words must behave as before);
+    * the LLM's answer is in the set - keep it;
+    * the answer is outside the set and the set holds exactly one part of
+      speech - take it. This is not guessing: there is nothing to choose
+      between. "tuli" is the live case - the LLM sees "hän tuli kotiin" and
+      answers "verbi", which belongs to the lemma "tulla", while the lemma
+      "tuli" is only ever a noun;
+    * the answer is outside the set and the set holds several - "hakea" is
+      both a real verb and a real noun, and only the sentence says which -
+      so ask the LLM again, constrained to the FST's set (choose_pos()).
+    """
+    if pos is None:
+        return None, None
+
+    allowed = pos_set_for_lemma(lemma)
+    if not allowed:
+        logger.debug("event=resolve_note_pos.unknown_lemma lemma=%s pos=%s", lemma, pos)
+        return pos, None
+    if pos in allowed:
+        return pos, None
+
+    if len(allowed) == 1:
+        corrected = next(iter(allowed))
+        logger.info(
+            "event=resolve_note_pos.corrected lemma=%s llm_pos=%s pos=%s",
+            lemma,
+            pos,
+            corrected,
+        )
+        return corrected, None
+
+    logger.debug(
+        "event=resolve_note_pos.ambiguous lemma=%s llm_pos=%s allowed=%s",
+        lemma,
+        pos,
+        ",".join(sorted(allowed)),
+    )
+    chosen, usage = await choose_pos(client, breaker, model, lemma, sorted(allowed), context, now)
+    if chosen not in allowed:
+        # The strict enum should make this unreachable; if it ever happens,
+        # fall back to the LLM's original answer rather than to an arbitrary
+        # member of the set - generate_forms() then simply finds no forms and
+        # the note degrades to forms_verified=False, which is honest.
+        logger.warning(
+            "event=resolve_note_pos.invalid_choice lemma=%s pos=%s chosen=%s",
+            lemma,
+            pos,
+            chosen,
+        )
+        return pos, usage
+    logger.info(
+        "event=resolve_note_pos.chosen lemma=%s llm_pos=%s pos=%s allowed=%s",
+        lemma,
+        pos,
+        chosen,
+        ",".join(sorted(allowed)),
+    )
+    return chosen, usage
+
+
+def _add_usage(first: TokenUsage | None, second: TokenUsage | None) -> TokenUsage | None:
+    """One note can now cost two tie-break calls (pos, then forms) - report both."""
+    if first is None:
+        return second
+    if second is None:
+        return first
+    return TokenUsage(
+        input_tokens=first.input_tokens + second.input_tokens,
+        output_tokens=first.output_tokens + second.output_tokens,
+        total_tokens=first.total_tokens + second.total_tokens,
+    )
+
+
 async def resolve_note_forms(
     client: AsyncOpenAI,
     breaker: CallBreaker,
@@ -341,8 +507,17 @@ async def resolve_note_forms(
     lemma: str,
     pos: str | None,
     now: datetime,
+    context: str | None = None,
 ) -> tuple[ResolvedForms, TokenUsage | None]:
     """FST first (finn_cards.morphology); LLM only breaks ties among real FST forms.
+
+    `pos` arrives from the LLM and is checked against the FST before it is
+    used - resolve_note_pos() does that, and this is the single production
+    path into generate_forms(), so no caller can bypass the check. The part
+    of speech the forms were really generated for comes back on
+    ResolvedForms.pos; persist that one. `context` is the note's Finnish
+    example sentence, needed only for a lemma the FST allows in several
+    parts of speech.
 
     generate_forms()/forms_for_pos() only have a principal-forms table for
     verbi/substantiivi/adjektiivi and raise ValueError on anything else -
@@ -353,6 +528,7 @@ async def resolve_note_forms(
     is nullable there regardless of kind. Treat both as "FST has nothing"
     rather than letting the ValueError crash the /add confirmation handler.
     """
+    pos, usage = await resolve_note_pos(client, breaker, model, lemma, pos, context, now)
     try:
         result: FormsResult = generate_forms(lemma, pos)
     except ValueError:
@@ -364,12 +540,11 @@ async def resolve_note_forms(
             lemma,
             pos,
         )
-        return ResolvedForms({}, "llm", False), None
+        return ResolvedForms({}, "llm", False, pos), usage
     covered = result.principal_forms.keys() | result.ambiguous.keys()
     missing = set(forms_for_pos(pos)) - covered
 
     forms = dict(result.principal_forms)
-    usage: TokenUsage | None = None
     if result.ambiguous:
         # Routine, not a degradation: the FST did resolve every form, it just
         # returned several equally-weighted candidates for some of them - the
@@ -380,10 +555,11 @@ async def resolve_note_forms(
             pos,
             list(result.ambiguous),
         )
-        chosen, usage = await resolve_ambiguous_forms(
+        chosen, forms_usage = await resolve_ambiguous_forms(
             client, breaker, model, lemma, pos, result.ambiguous, now
         )
         forms.update(chosen)
+        usage = _add_usage(usage, forms_usage)
 
     if missing:
         forms_source, forms_verified = "llm", False
@@ -405,7 +581,7 @@ async def resolve_note_forms(
         forms_source,
         forms_verified,
     )
-    return ResolvedForms(forms, forms_source, forms_verified), usage
+    return ResolvedForms(forms, forms_source, forms_verified, pos), usage
 
 
 def canonical_key(lemma: str, pos: str | None) -> tuple[str, str | None]:
@@ -414,9 +590,13 @@ def canonical_key(lemma: str, pos: str | None) -> tuple[str, str | None]:
     `cards/instructions.md`: the LLM sometimes returns an inflected form as
     "lemma" (e.g. töitä instead of työ) - lemmatize() resolves that. `pos` is
     part of the key so homonyms with different parts of speech stay distinct
-    (kuusi "spruce" vs kuusi "six" - both nouns, but see detect_pos() for the
-    general case). kind="pattern" has no real lemma to resolve - pos is None
-    there, so the raw construction string is the key as-is.
+    (kuusi the noun "spruce" vs kuusi the numeral "six" - pos_set_for_lemma()
+    is what says which of the two a note means). kind="pattern" has no real
+    lemma to resolve - pos is None there, so the raw construction string is
+    the key as-is.
+
+    Only the lemma is settled here. The part of speech is passed through
+    untouched and reconciled with the FST later, in resolve_note_pos().
     """
     if pos is None:
         return lemma, None
