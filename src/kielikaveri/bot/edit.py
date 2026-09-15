@@ -201,7 +201,13 @@ async def _apply_lemma_edit(
         client = make_client(settings.openai_api_key, settings.openai_timeout_seconds)
         try:
             resolved, _usage = await resolve_note_forms(
-                client, breaker, settings.openai_text_model, new_lemma, note.pos, datetime.now(UTC)
+                client,
+                breaker,
+                settings.openai_text_model,
+                new_lemma,
+                note.pos,
+                datetime.now(UTC),
+                context=note.example_fi,
             )
         except CircuitOpenError:
             logger.warning("event=edit.lemma_forms_skipped reason=breaker_open lemma=%s", new_lemma)
@@ -227,6 +233,11 @@ async def _apply_lemma_edit(
             new_meta["forms_source"] = resolved.forms_source
             new_meta["forms_verified"] = resolved.forms_verified
             note.meta = new_meta
+            # The new lemma can belong to a different part of speech than the
+            # old one did (ingest.resolve_note_pos) - the forms above were
+            # generated for resolved.pos, so the note has to agree with them.
+            if resolved.pos is not None:
+                note.pos = resolved.pos
         try:
             await session.commit()
         except IntegrityError as error:

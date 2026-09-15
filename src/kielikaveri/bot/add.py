@@ -536,6 +536,7 @@ async def _save_candidates_and_report(
                     candidate["lemma"],
                     candidate.get("pos"),
                     now,
+                    context=candidate.get("example_fi"),
                 )
             except CircuitOpenError:
                 failed.append((candidate["lemma"], "предохранитель сработал"))
@@ -546,6 +547,28 @@ async def _save_candidates_and_report(
                 )
                 failed.append((candidate["lemma"], "OpenAI недоступен"))
                 continue
+
+        # The FST may have corrected the part of speech the LLM guessed (see
+        # ingest.resolve_note_pos: "tuli" is a noun, never the verb "tulla").
+        # Save the corrected one - and re-run the dedup check with it, because
+        # the key computed above still carried the LLM's answer.
+        if (
+            resolved is not None
+            and resolved.pos is not None
+            and resolved.pos != candidate.get("pos")
+        ):
+            candidate = {**candidate, "pos": resolved.pos}
+            key = (candidate["lemma"], resolved.pos)
+            if key in existing or key in seen:
+                logger.info(
+                    "event=add.duplicate_after_pos_fix deck=%s lemma=%s pos=%s",
+                    deck_id,
+                    key[0],
+                    key[1],
+                )
+                duplicate_lemmas.append(key[0])
+                continue
+            seen.add(key)
 
         full_note = build_full_note(candidate, resolved)
         try:

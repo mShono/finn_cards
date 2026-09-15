@@ -23,6 +23,7 @@ from kielikaveri.ingest import (
     hash_text,
     resolve_ambiguous_forms,
     resolve_note_forms,
+    resolve_note_pos,
     store_cached_chat,
 )
 from kielikaveri.llm.breaker import CallBreaker, CircuitOpenError
@@ -259,6 +260,256 @@ async def test_resolve_note_forms_handles_a_pos_with_no_forms_table():
         client, breaker, "gpt-5.6-terra", "kuitenkin", "adverbi", NOW
     )
 
+    assert resolved.forms_source == "llm"
+    assert resolved.forms_verified is False
+    assert resolved.principal_forms == {}
+    assert usage is None
+    client.responses.create.assert_not_called()
+
+
+# --- resolve_note_pos -------------------------------------------------------------
+#
+# Integration-level on the morphology side on purpose: the FST is the real
+# one, only the OpenAI client is faked. The whole bug class these cover is
+# the LLM naming a part of speech that belongs to a *different* lemma which
+# merely spells the same, so a mocked pos_set_for_lemma() would test nothing.
+
+
+async def test_resolve_note_pos_keeps_a_pos_the_fst_confirms():
+    client = MagicMock()
+    client.responses.create = AsyncMock()
+
+    pos, usage = await resolve_note_pos(
+        client, make_breaker(), "gpt-5.6-terra", "kissa", "substantiivi", "Kissa nukkuu.", NOW
+    )
+
+    assert pos == "substantiivi"
+    assert usage is None
+    client.responses.create.assert_not_called()
+
+
+async def test_resolve_note_pos_corrects_when_the_lemma_allows_exactly_one():
+    # The live bug: "hän tuli kotiin" makes the LLM answer verbi, which is
+    # right about the sentence and wrong about the lemma - "tuli" the lemma
+    # is only ever the noun "fire". One allowed pos means there is nothing
+    # to choose between, so no second LLM call.
+    client = MagicMock()
+    client.responses.create = AsyncMock()
+
+    pos, usage = await resolve_note_pos(
+        client, make_breaker(), "gpt-5.6-terra", "tuli", "verbi", "Hän tuli kotiin.", NOW
+    )
+
+    assert pos == "substantiivi"
+    assert usage is None
+    client.responses.create.assert_not_called()
+
+
+async def test_resolve_note_pos_keeps_the_llm_pos_for_a_lemma_the_fst_does_not_know():
+    # Unknown words must behave exactly as before: the FST can neither
+    # confirm nor refute, so nothing is corrected and nothing is asked.
+    client = MagicMock()
+    client.responses.create = AsyncMock()
+
+    pos, usage = await resolve_note_pos(
+        client, make_breaker(), "gpt-5.6-terra", "xyzquu", "substantiivi", "Xyzquu on täällä.", NOW
+    )
+
+    assert pos == "substantiivi"
+    assert usage is None
+    client.responses.create.assert_not_called()
+
+
+async def test_resolve_note_pos_never_picks_the_first_of_several_allowed():
+    # "hakea" really is both a verb and a noun under one lemma. The FST has
+    # no ranking to offer (both readings weigh 0.0), so the code must ask
+    # rather than take whichever came out of the analyzer first.
+    client = MagicMock()
+    client.responses.create = AsyncMock(return_value=fake_response({"pos": "verbi"}))
+
+    pos, usage = await resolve_note_pos(
+        client, make_breaker(), "gpt-5.6-terra", "hakea", "adjektiivi", "Haen töitä.", NOW
+    )
+
+    client.responses.create.assert_called_once()
+    assert pos == "verbi"
+    assert usage is not None
+
+
+async def test_resolve_note_pos_asks_the_llm_with_an_enum_built_from_the_fst():
+    client = MagicMock()
+    client.responses.create = AsyncMock(return_value=fake_response({"pos": "substantiivi"}))
+
+    pos, _usage = await resolve_note_pos(
+        client, make_breaker(), "gpt-5.6-terra", "hakea", "adjektiivi", "Hakea oli pitkä.", NOW
+    )
+
+    kwargs = client.responses.create.call_args.kwargs
+    schema = kwargs["text"]["format"]["schema"]
+    # sorted() of the FST set, so the enum can't smuggle in an order that
+    # means something - and "adjektiivi", the LLM's own first answer, is not
+    # among the options precisely because the FST ruled it out.
+    assert schema["properties"]["pos"]["enum"] == ["substantiivi", "verbi"]
+    assert kwargs["text"]["format"]["strict"] is True
+    assert "Hakea oli pitkä." in kwargs["input"]
+    assert pos == "substantiivi"
+
+
+async def test_resolve_note_pos_rejects_a_choice_outside_the_fst_set():
+    # The strict enum should make this impossible; if it ever happens we keep
+    # the LLM's original answer rather than inventing a pick of our own.
+    client = MagicMock()
+    client.responses.create = AsyncMock(return_value=fake_response({"pos": "adverbi"}))
+
+    pos, _usage = await resolve_note_pos(
+        client, make_breaker(), "gpt-5.6-terra", "hakea", "adjektiivi", "Haen töitä.", NOW
+    )
+
+    assert pos == "adjektiivi"
+
+
+async def test_resolve_note_pos_leaves_a_missing_pos_alone():
+    # kind="pattern" and the strict-schema nullable pos (see
+    # resolve_note_forms' docstring) both arrive as None - nothing to check.
+    client = MagicMock()
+    client.responses.create = AsyncMock()
+
+    pos, usage = await resolve_note_pos(
+        client, make_breaker(), "gpt-5.6-terra", "hakea", None, None, NOW
+    )
+
+    assert pos is None
+    assert usage is None
+    client.responses.create.assert_not_called()
+
+
+async def test_resolve_note_pos_does_not_borrow_voida_readings_for_voi():
+    # "voi" as a lemma is the noun/particle/interjection; the five verb
+    # readings all belong to "voida". So verbi is not an option here, and
+    # because three options remain the choice goes back to the LLM.
+    client = MagicMock()
+    client.responses.create = AsyncMock(return_value=fake_response({"pos": "substantiivi"}))
+
+    pos, _usage = await resolve_note_pos(
+        client, make_breaker(), "gpt-5.6-terra", "voi", "verbi", "Ostin voita.", NOW
+    )
+
+    enum = client.responses.create.call_args.kwargs["text"]["format"]["schema"]["properties"][
+        "pos"
+    ]["enum"]
+    assert "verbi" not in enum
+    assert enum == ["interjektio", "partikkeli", "substantiivi"]
+    assert pos == "substantiivi"
+
+
+async def test_resolve_note_pos_does_not_use_another_lemmas_reading_for_kuusi():
+    # "kuu+N+Sg+Nom+PxSg2" ("your moon") spells "kuusi" too. It must not
+    # widen the lemma "kuusi"'s own set, which is noun + numeral.
+    client = MagicMock()
+    client.responses.create = AsyncMock(return_value=fake_response({"pos": "numeraali"}))
+
+    pos, _usage = await resolve_note_pos(
+        client, make_breaker(), "gpt-5.6-terra", "kuusi", "verbi", "Minulla on kuusi kirjaa.", NOW
+    )
+
+    enum = client.responses.create.call_args.kwargs["text"]["format"]["schema"]["properties"][
+        "pos"
+    ]["enum"]
+    assert enum == ["numeraali", "substantiivi"]
+    assert pos == "numeraali"
+
+
+async def test_resolve_note_pos_does_not_fall_back_to_a_pick_when_the_breaker_is_open():
+    # The important half of "never take the first pos": when the tie-break
+    # call cannot happen at all, the answer is an honest failure, not a
+    # quietly chosen member of the set. /add reports the word as failed.
+    client = MagicMock()
+    client.responses.create = AsyncMock()
+    breaker = CallBreaker(max_calls=0, window=timedelta(minutes=10))
+
+    with pytest.raises(CircuitOpenError):
+        await resolve_note_pos(
+            client, breaker, "gpt-5.6-terra", "hakea", "adjektiivi", "Haen töitä.", NOW
+        )
+
+    client.responses.create.assert_not_called()
+
+
+# --- resolve_note_forms: pos correction ------------------------------------------
+
+
+async def test_resolve_note_forms_recovers_the_grammar_forms_for_tuli():
+    # Regression for the production bug. Before: the LLM answered verbi for
+    # "hän tuli kotiin", generate_forms("tuli", "verbi") returned nothing at
+    # all, and the note was saved with empty principal_forms and
+    # forms_verified=False - so srs.graduation never issued a grammar card
+    # for it. After: the pos is corrected to the lemma's only real one and
+    # the full nominal paradigm comes back, FST-verified.
+    client = MagicMock()
+    client.responses.create = AsyncMock()
+
+    resolved, usage = await resolve_note_forms(
+        client,
+        make_breaker(),
+        "gpt-5.6-terra",
+        "tuli",
+        "verbi",
+        NOW,
+        context="Hän tuli kotiin.",
+    )
+
+    assert resolved.pos == "substantiivi"
+    assert resolved.forms_source == "fst"
+    assert resolved.forms_verified is True
+    assert resolved.principal_forms["partitiivi"] == "tulta"
+    assert resolved.principal_forms["genetiivi"] == "tulen"
+    assert usage is None
+    client.responses.create.assert_not_called()
+
+
+async def test_resolve_note_forms_reports_the_pos_it_actually_used():
+    client = MagicMock()
+    client.responses.create = AsyncMock()
+
+    resolved, _usage = await resolve_note_forms(
+        client, make_breaker(), "gpt-5.6-terra", "hakea", "verbi", NOW, context="Haen töitä."
+    )
+
+    assert resolved.pos == "verbi"
+    assert resolved.principal_forms["preesens_1s"] == "haen"
+
+
+async def test_resolve_note_forms_asks_before_switching_a_genuinely_ambiguous_lemma():
+    # "hakea" is the multi-pos case: the code must not silently take the
+    # verb just because it is the bigger forms table or the first reading.
+    client = MagicMock()
+    client.responses.create = AsyncMock(return_value=fake_response({"pos": "verbi"}))
+
+    resolved, usage = await resolve_note_forms(
+        client, make_breaker(), "gpt-5.6-terra", "hakea", "adverbi", NOW, context="Haen töitä."
+    )
+
+    assert client.responses.create.await_count == 1
+    assert (
+        client.responses.create.call_args.kwargs["text"]["format"]["name"]
+        == "kielikaveri_pos_choice"
+    )
+    assert resolved.pos == "verbi"
+    assert resolved.forms_verified is True
+    assert usage is not None  # the pos tie-break is billed like any other call
+
+
+async def test_resolve_note_forms_unknown_lemma_keeps_its_old_behaviour():
+    # An unknown word still degrades the same way it did before the pos
+    # check existed: no correction, no crash, forms_verified=False.
+    client = MagicMock()
+    client.responses.create = AsyncMock()
+
+    resolved, usage = await resolve_note_forms(
+        client, make_breaker(), "gpt-5.6-terra", "xyzquu", "substantiivi", NOW
+    )
+
+    assert resolved.pos == "substantiivi"
     assert resolved.forms_source == "llm"
     assert resolved.forms_verified is False
     assert resolved.principal_forms == {}

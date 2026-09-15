@@ -8,6 +8,7 @@ from finn_cards.morphology import (
     detect_pos,
     generate_forms,
     lemmatize,
+    pos_set_for_lemma,
     validate_form,
 )
 
@@ -64,6 +65,66 @@ def test_detect_pos_compound_not_polluted_by_modifier_class():
     # returned ["substantiivi", "adjektiivi"] - the lexicalized
     # non-compound reading ("sinivalkoinen+A+Sg+Nom") must win.
     assert detect_pos("sinivalkoinen") == ["adjektiivi"]
+
+
+# --- pos_set_for_lemma --------------------------------------------------------
+#
+# The point of every test here: detect_pos() answers "what can this string
+# be", pos_set_for_lemma() answers "what can this lemma be". The two differ
+# exactly when a string also happens to be some other lemma's inflected form,
+# which is where generate_forms() used to be handed a part of speech that
+# produced nothing.
+
+
+def test_pos_set_for_lemma_ignores_another_lemmas_reading():
+    # "tuli" analyzes as tulla+V+Act+Ind+Prt+Sg3 ("he came") *and* as
+    # tuli+N+Sg+Nom ("fire"). The verb reading belongs to the lemma "tulla",
+    # so it must not end up in the lemma "tuli"'s own set.
+    assert "verbi" in detect_pos("tuli")
+    assert pos_set_for_lemma("tuli") == {"substantiivi"}
+
+
+def test_pos_set_for_lemma_drops_voida_readings_from_voi():
+    # Five of "voi"'s eight readings are forms of the verb "voida"; the rest
+    # are the lemma "voi" itself (butter / particle / interjection).
+    assert "verbi" in detect_pos("voi")
+    assert pos_set_for_lemma("voi") == {"substantiivi", "partikkeli", "interjektio"}
+
+
+def test_pos_set_for_lemma_drops_a_different_lemmas_possessive_reading():
+    # "kuusi" analyzes as kuu+N+...+PxSg2 ("your moon") beside its own two
+    # readings. Only the latter say anything about the lemma "kuusi", and
+    # both of them are real - a set, not a pick.
+    assert pos_set_for_lemma("kuusi") == {"substantiivi", "numeraali"}
+
+
+def test_pos_set_for_lemma_keeps_both_when_one_lemma_really_has_two():
+    # "hakea" is both the verb "to fetch" and a noun. Nothing in the FST
+    # ranks them (both readings carry weight 0.0), so both stay and the
+    # choice belongs to whoever has the sentence.
+    assert pos_set_for_lemma("hakea") == {"verbi", "substantiivi"}
+
+
+def test_pos_set_for_lemma_unambiguous_word():
+    assert pos_set_for_lemma("kissa") == {"substantiivi"}
+    assert pos_set_for_lemma("lyhyt") == {"adjektiivi"}
+
+
+def test_pos_set_for_lemma_unknown_word_is_empty():
+    assert pos_set_for_lemma("xyzquu") == set()
+
+
+def test_pos_set_for_lemma_not_polluted_by_compound_modifier_class():
+    # Same trap detect_pos() guards against: "sinivalkoinen" has a Cmp#
+    # reading whose first component "sini" is a noun, but the lexicalized
+    # whole-word reading says adjective and wins.
+    assert pos_set_for_lemma("sinivalkoinen") == {"adjektiivi"}
+
+
+def test_pos_set_for_lemma_compound_with_no_whole_word_entry_uses_the_head():
+    # "keittiöpöytä" has only the Cmp# split - the compound's class is its
+    # head's ("pöytä"), not its modifier's.
+    assert pos_set_for_lemma("keittiöpöytä") == {"substantiivi"}
 
 
 def test_generate_forms_unambiguous_verb():

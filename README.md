@@ -21,8 +21,9 @@ See `cards/instructions.md` for the exact algorithm and its rationale.
 - `cards/examples/` - three reference notes (verb, noun with consonant
   gradation, verb with non-trivial government/rektio).
 - `src/finn_cards/` - phase 0: `morphology.py` (generate_forms,
-  validate_form, lemmatize, detect_pos), `strict_schema.py` (converts
-  `cards/schema.json` into an OpenAI `strict: true` schema).
+  validate_form, lemmatize, detect_pos, pos_set_for_lemma),
+  `strict_schema.py` (converts `cards/schema.json` into an OpenAI
+  `strict: true` schema).
 - `src/kielikaveri/` - phase 1+: the bot.
   - `config.py` - settings loaded from `.env` (see `.env.example`).
   - `db/models.py` - SQLAlchemy models (`users`, `notes`, `cards`,

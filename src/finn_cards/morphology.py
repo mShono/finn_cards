@@ -184,7 +184,7 @@ def lemmatize(word: str) -> list[str]:
     with _FST_LOCK:
         readings = uralicApi.analyze(word, LANG)
     for reading, _weight in readings:
-        lemma = "".join(segment.split("+", 1)[0] for segment in reading.split("Cmp#"))
+        lemma = _reading_lemma(reading)
         if lemma not in lemmas:
             lemmas.append(lemma)
     return lemmas
@@ -213,15 +213,66 @@ def detect_pos(word: str) -> list[str]:
     )
 
 
+def pos_set_for_lemma(lemma: str) -> set[str]:
+    """Parts of speech the FST allows for *this lemma*, not for this string.
+
+    detect_pos() answers "what can this string be", which necessarily mixes
+    in readings belonging to other lemmas: "tuli" analyzes both as
+    "tulla+V+Act+Ind+Prt+Sg3" (the past tense of "tulla") and as
+    "tuli+N+Sg+Nom" ("fire"), so its POS list contains "verbi" even though
+    the lemma "tuli" is only ever a noun - and generate_forms("tuli",
+    "verbi") then silently produces nothing. Keeping only the readings whose
+    own lemma is `lemma` is what separates the two questions.
+
+    Returns a set on purpose. Every reading here carries FST weight 0.0, so
+    their order is not a ranking and must never be used to pick one: a lemma
+    with several genuinely different parts of speech ("hakea" is both the
+    verb "to fetch" and a noun) is a question about the sentence, which the
+    FST has never seen. The caller decides; this function only bounds the
+    choice.
+    """
+    with _FST_LOCK:
+        readings = uralicApi.analyze(lemma, LANG)
+
+    own = [reading for reading, _weight in readings if _reading_lemma(reading) == lemma]
+
+    # Same priority as detect_pos(): a lexicalized whole-word reading states
+    # the real class, Cmp# readings only stand in for compounds that have no
+    # whole-word entry at all ("keittiöpöytä"). There the class is the head's,
+    # i.e. the last component - "keittiö+N+Sg+Nom+Cmp#pöytä+N+Sg+Nom" is a
+    # noun because of "pöytä", not because of "keittiö".
+    whole_word = {
+        pos for pos in (_reading_pos(r) for r in own if "Cmp#" not in r) if pos is not None
+    }
+    if whole_word:
+        return whole_word
+    return {
+        pos
+        for pos in (_reading_pos(r.split("Cmp#")[-1]) for r in own if "Cmp#" in r)
+        if pos is not None
+    }
+
+
+def _reading_lemma(reading: str) -> str:
+    """The dictionary form one FST reading belongs to - see lemmatize()."""
+    return "".join(segment.split("+", 1)[0] for segment in reading.split("Cmp#"))
+
+
+def _reading_pos(reading: str) -> str | None:
+    """First tag of one reading that names a part of speech, in our vocabulary."""
+    for part in reading.split("+")[1:]:
+        pos = FST_TAG_TO_POS.get(part)
+        if pos:
+            return pos
+    return None
+
+
 def _pos_from_readings(readings) -> list[str]:
     found: list[str] = []
     for reading in readings:
-        for part in reading.split("+")[1:]:
-            pos = FST_TAG_TO_POS.get(part)
-            if pos:
-                if pos not in found:
-                    found.append(pos)
-                break
+        pos = _reading_pos(reading)
+        if pos and pos not in found:
+            found.append(pos)
     return found
 
 

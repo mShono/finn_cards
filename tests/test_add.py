@@ -660,7 +660,7 @@ async def test_add_new_deck_save_reprompts_on_an_empty_name(session_factory):
 async def test_chat_reports_a_failed_candidate_without_blocking_the_others(
     session_factory, monkeypatch
 ):
-    async def fake_resolve(client, breaker, model, lemma, pos, now):
+    async def fake_resolve(client, breaker, model, lemma, pos, now, context=None):
         if lemma == "hakea":
             raise CircuitOpenError("stopped")
         return ResolvedForms({}, "fst", True), None
@@ -942,3 +942,86 @@ async def test_add_save_logs_event_with_saved_and_duplicate_counts(
     assert saves[0]["duplicates"] == "0"
     assert saves[0]["failed"] == "0"
     assert int(saves[0]["duration_ms"]) >= 0
+
+
+# --- pos correction end to end -----------------------------------------------------
+
+
+async def test_chat_saves_tuli_as_a_noun_with_real_grammar_forms(session_factory, monkeypatch):
+    """Regression, end to end with the real FST: only the OpenAI call is faked.
+
+    The LLM reads "hän tuli kotiin" and answers lemma="tuli", pos="verbi" -
+    right about the sentence, wrong about the lemma, because that verb form
+    belongs to "tulla". generate_forms("tuli", "verbi") used to return
+    nothing at all, so the note landed with empty principal_forms and
+    forms_verified=False and srs.graduation never gave it a grammar card.
+    """
+    candidate = {
+        "lemma": "tuli",
+        "pos": "verbi",
+        "translation_ru": "огонь",
+        "example_fi": "Hän tuli kotiin.",
+        "example_ru": "Он пришёл домой.",
+        "kind": "word",
+        "meta": {"cefr": "A2"},
+    }
+    patch_check_and_suggest(monkeypatch, "Добавляю.", [candidate])
+    state = make_state()
+
+    await chat_message(
+        make_message("добавь tuli"), state, session_factory, make_settings(), make_breaker()
+    )
+
+    data = await state.get_data()
+    async with session_factory() as session:
+        deck_id = (await active_deck(session, 1)).id
+    callback = make_callback(f"adddeck:{data['batch_id']}:{deck_id}")
+    await add_deck_choice(callback, state, session_factory, make_settings(), make_breaker())
+
+    async with session_factory() as session:
+        note = (await session.scalars(select(Note))).one()
+
+    assert note.lemma == "tuli"
+    assert note.pos == "substantiivi"  # not the LLM's "verbi"
+    assert note.meta["forms_verified"] is True
+    assert note.meta["forms_source"] == "fst"
+    assert note.meta["principal_forms"]["partitiivi"] == "tulta"
+
+
+async def test_chat_dedups_against_the_corrected_pos(session_factory, monkeypatch):
+    """The dedup key is computed from the LLM's pos, before the FST sees it.
+
+    Two turns that both say pos="verbi" for "tuli" both get corrected to
+    "substantiivi", so the second one is a duplicate of the first even
+    though neither key matched what was already stored.
+    """
+    candidate = {
+        "lemma": "tuli",
+        "pos": "verbi",
+        "translation_ru": "огонь",
+        "example_fi": "Hän tuli kotiin.",
+        "example_ru": "Он пришёл домой.",
+        "kind": "word",
+        "meta": {},
+    }
+
+    async def add_once() -> SimpleNamespace:
+        state = make_state()
+        await chat_message(
+            make_message("добавь tuli"), state, session_factory, make_settings(), make_breaker()
+        )
+        data = await state.get_data()
+        async with session_factory() as session:
+            deck_id = (await active_deck(session, 1)).id
+        callback = make_callback(f"adddeck:{data['batch_id']}:{deck_id}")
+        await add_deck_choice(callback, state, session_factory, make_settings(), make_breaker())
+        return callback
+
+    patch_check_and_suggest(monkeypatch, "Добавляю.", [candidate])
+    await add_once()
+    second = await add_once()
+
+    async with session_factory() as session:
+        notes = (await session.scalars(select(Note))).all()
+    assert len(notes) == 1
+    assert "не дублирую" in second.message.answer.call_args.args[0]
