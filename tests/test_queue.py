@@ -26,10 +26,12 @@ async def session_factory(tmp_path):
 
 
 def make_note(note_id: str, user_id: int) -> Note:
+    # Lemma derived from note_id: notes are unique per (user, deck, lemma, pos),
+    # and every call here means a genuinely different word.
     return Note(
         id=note_id,
         user_id=user_id,
-        lemma="hakea",
+        lemma=f"hakea-{note_id}",
         translation_ru="искать",
         example_fi="Haen töitä.",
         example_ru="Я ищу работу.",
