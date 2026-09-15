@@ -228,6 +228,32 @@ async def test_note_edit_apply_lemma_rejects_a_clash_with_an_existing_note(sessi
     assert "уже есть" in message.answer.call_args.args[0]
 
 
+async def test_note_edit_apply_lemma_handles_a_clash_that_appears_during_the_llm_call(
+    session_factory, monkeypatch
+):
+    # The race uq_notes_user_deck_lemma_pos exists for, reproduced in the real
+    # window: the clash lookup above runs before resolve_note_forms, so anything
+    # that takes "mennä" while that call is in flight only surfaces at commit.
+    await _add_note(session_factory)
+
+    async def steal_the_lemma(*args, **kwargs):
+        await _add_note(session_factory, id="n2", lemma="mennä", translation_ru="идти")
+        return ResolvedForms({"preesens_1s": "menen"}, "fst", True), None
+
+    monkeypatch.setattr("kielikaveri.bot.edit.resolve_note_forms", steal_the_lemma)
+    state = make_state()
+    await state.set_state(EditStates.awaiting_value)
+    await state.update_data(note_id="n1", field="lemma")
+    message = make_message("mennä")
+
+    await note_edit_apply(message, state, session_factory, make_settings(), make_breaker())
+
+    async with session_factory() as session:
+        note = await session.get(Note, "n1")
+    assert note.lemma == "hakea"  # kept its old lemma, nothing half-written
+    assert "уже есть" in message.answer.call_args.args[0]
+
+
 async def test_note_edit_apply_lemma_saves_even_when_the_breaker_has_tripped(
     session_factory, monkeypatch
 ):

@@ -472,6 +472,49 @@ async def test_add_deck_choice_allows_a_word_already_in_a_different_deck(
     assert "не дублирую" not in report
 
 
+async def test_add_deck_choice_handles_a_duplicate_that_appears_after_the_lookup(
+    session_factory, monkeypatch
+):
+    # The race the unique index exists for: two concurrent /add turns both pass
+    # existing_note_keys() and both insert. Simulated without threads by making
+    # the lookup miss a note that is already there - the INSERT then hits
+    # uq_notes_user_deck_lemma_pos exactly as the losing turn would.
+    patch_resolve_note_forms(monkeypatch)
+    monkeypatch.setattr("kielikaveri.bot.add.existing_note_keys", AsyncMock(return_value=set()))
+    async with session_factory() as session:
+        deck = await create_deck(session, 1, "Общая")
+        session.add(
+            Note(
+                id="n1",
+                user_id=1,
+                lemma="hakea",
+                pos="verbi",
+                translation_ru="искать",
+                example_fi="x",
+                example_ru="y",
+                kind="word",
+                deck_id=deck.id,
+                meta={},
+            )
+        )
+        await session.commit()
+        source = await _make_source(session)
+
+    state = make_state()
+    await state.set_state(AddStates.choosing_deck)
+    await state.update_data(batch_id="batch-1", candidates=[WORD_CANDIDATE], source_id=source)
+    callback = make_callback(f"adddeck:batch-1:{deck.id}")
+
+    await add_deck_choice(callback, state, session_factory, make_settings(), make_breaker())
+
+    async with session_factory() as session:
+        notes = (await session.scalars(select(Note))).all()
+    assert [n.id for n in notes] == ["n1"]  # the winner stays, nothing added
+    report = callback.message.answer.call_args.args[0]
+    assert "Уже есть в «Общая», не дублирую: hakea." in report
+    assert await state.get_state() is None
+
+
 async def test_add_deck_choice_reports_duplicates_even_when_some_candidates_are_new(
     session_factory, monkeypatch
 ):

@@ -43,7 +43,15 @@ from kielikaveri.bot.decks import NEW_DECK_PROMPT
 from kielikaveri.bot.text import split_message
 from kielikaveri.config import Settings
 from kielikaveri.db.decks import active_deck, create_deck, list_decks, set_active_deck
-from kielikaveri.db.models import Card, Deck, Note, Review, Source, SourceType
+from kielikaveri.db.models import (
+    Card,
+    Deck,
+    Note,
+    Review,
+    Source,
+    SourceType,
+    is_note_duplicate_error,
+)
 from kielikaveri.import_cards import load_validator
 from kielikaveri.ingest import (
     build_chat_input,
@@ -563,7 +571,24 @@ async def _save_candidates_and_report(
                     meta=full_note["meta"],
                 )
             )
-            await session.commit()
+            try:
+                await session.commit()
+            except IntegrityError as error:
+                # Lost the race: another /add turn for the same word in the
+                # same deck committed between our dedup lookup above and this
+                # insert. The other turn's note is just as good, so this is
+                # the same outcome as the lookup having caught it - report it
+                # as a duplicate, never as a crash.
+                if not is_note_duplicate_error(error):
+                    raise
+                await session.rollback()
+                logger.info(
+                    "event=add.duplicate_race deck=%s lemma=%s",
+                    deck_id,
+                    full_note["lemma"],
+                )
+                duplicate_lemmas.append(full_note["lemma"])
+                continue
         saved.append((full_note["lemma"], full_note["translation_ru"]))
 
     duration_ms = int((time.monotonic() - start) * 1000)

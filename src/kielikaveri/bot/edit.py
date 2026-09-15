@@ -21,10 +21,11 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from kielikaveri.config import Settings
-from kielikaveri.db.models import Note, NoteKind
+from kielikaveri.db.models import Note, NoteKind, is_note_duplicate_error
 from kielikaveri.ingest import canonical_key, resolve_note_forms
 from kielikaveri.llm.breaker import CallBreaker, CircuitOpenError
 from kielikaveri.llm.client import make_client
@@ -212,8 +213,13 @@ async def _apply_lemma_edit(
             logger.exception("event=llm.error op=resolve_note_forms lemma=%s", new_lemma)
             await message.answer("Слово сохраню, но формы не пересчитала - OpenAI недоступен.")
 
+    # Read off before the session below: a rollback there expires every object
+    # it holds, and `note.id` would then lazy-load mid-exception handler -
+    # which, on an async session, is a MissingGreenlet crash, not a query.
+    note_id = note.id
+
     async with session_factory() as session:
-        note = await session.get(Note, note.id)
+        note = await session.get(Note, note_id)
         note.lemma = new_lemma
         if resolved is not None:
             new_meta = dict(note.meta)
@@ -221,11 +227,24 @@ async def _apply_lemma_edit(
             new_meta["forms_source"] = resolved.forms_source
             new_meta["forms_verified"] = resolved.forms_verified
             note.meta = new_meta
-        await session.commit()
+        try:
+            await session.commit()
+        except IntegrityError as error:
+            # The clash lookup above said this lemma was free, but a
+            # concurrent /add or /edit took it in the meantime. Same answer as
+            # the lookup's, just later - and the note keeps its old lemma.
+            if not is_note_duplicate_error(error):
+                raise
+            await session.rollback()
+            logger.info("event=edit.lemma_clash_race note_id=%s new_lemma=%s", note_id, new_lemma)
+            await message.answer(
+                f"«{new_lemma}» уже есть в базе отдельной карточкой - сначала удали одну из них."
+            )
+            return
 
     logger.info(
         "event=edit.save note_id=%s field=lemma old=%r new=%r forms_source=%s",
-        note.id,
+        note_id,
         old_lemma,
         new_lemma,
         resolved.forms_source if resolved is not None else "unchanged",

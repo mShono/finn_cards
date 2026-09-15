@@ -15,6 +15,7 @@ import json
 from pathlib import Path
 
 import jsonschema
+from sqlalchemy import select
 
 from kielikaveri.config import load_settings
 from kielikaveri.db.engine import make_engine, make_session_factory
@@ -52,6 +53,28 @@ async def import_notes(session_factory, user_id: int, cards_dir: Path) -> list[s
             existing = await session.get(Note, payload["id"])
             if existing is not None:
                 continue
+
+            # Notes are unique per (user, deck, lemma, pos) and everything
+            # imported here lands deckless, so a second file for a word this
+            # user already has deckless would only surface as an IntegrityError
+            # on the single commit below - aborting the whole import with a
+            # traceback. Say which file instead, and change nothing.
+            clash = await session.scalar(
+                select(Note.id).where(
+                    Note.user_id == user_id,
+                    Note.lemma == payload["lemma"],
+                    Note.pos.is_(None)
+                    if payload.get("pos") is None
+                    else Note.pos == payload["pos"],
+                    Note.deck_id.is_(None),
+                )
+            )
+            if clash is not None:
+                raise ValueError(
+                    f"{note_file}: user {user_id} already has a deckless note "
+                    f"{payload['lemma']!r} ({payload.get('pos') or 'no pos'}), id={clash}. "
+                    "Nothing was imported - remove or re-point one of the two."
+                )
 
             session.add(
                 Note(

@@ -103,6 +103,32 @@ def test_canonical_key_pattern_kind_uses_the_raw_construction():
     assert canonical_key("hakea + partitiivi", None) == ("hakea + partitiivi", None)
 
 
+def test_canonical_key_resolves_a_capitalised_word_to_its_dictionary_form():
+    # Case is handled here and nowhere else - whatever this returns is what
+    # reaches the (user, deck, lemma, pos) unique index. Not by casefold():
+    # the FST's own lemma is the canonical form, see the next test.
+    assert canonical_key("Hakea", "verbi") == ("hakea", "verbi")
+    assert canonical_key("Töitä", "substantiivi") == ("työ", "substantiivi")
+
+
+def test_canonical_key_keeps_a_proper_noun_capitalised():
+    # Why casefold() is not the normalisation to add on top: it would turn
+    # Helsinki into helsinki.
+    assert canonical_key("Helsingissä", "substantiivi") == ("Helsinki", "substantiivi")
+
+
+def test_canonical_key_is_not_case_insensitive_for_an_ambiguous_lemma():
+    # Pins a known pre-existing gap, not a contract worth keeping: when the FST
+    # offers several lemmas, `if lemma in lemmas` can only match a lowercase
+    # input, so a capitalised one falls through to lemmas[0] - a *different*
+    # word. This is the mechanism behind the duplicate `seurojentalo` pair
+    # found in production 11.09.2026. The unique index deliberately does not
+    # paper over it: it compares what canonical_key() produced, so fixing the
+    # case asymmetry means fixing it here, in the one canonicalisation.
+    assert canonical_key("seurojentalo", "substantiivi") == ("seurojentalo", "substantiivi")
+    assert canonical_key("Seurojentalo", "substantiivi") == ("seuratalo", "substantiivi")
+
+
 # --- strict schema wrapper -------------------------------------------------------
 
 

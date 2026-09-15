@@ -12,7 +12,18 @@ import enum
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import JSON, Boolean, Enum, ForeignKey, Integer, String, TypeDecorator
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    Enum,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    TypeDecorator,
+    text,
+)
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -140,6 +151,25 @@ class Source(Base):
     context_fi: Mapped[str | None] = mapped_column(String, nullable=True)
 
 
+NOTE_UNIQUE_INDEX = "uq_notes_user_deck_lemma_pos"
+
+
+def is_note_duplicate_error(error: IntegrityError) -> bool:
+    """True only for a NOTE_UNIQUE_INDEX violation, not for any IntegrityError.
+
+    A bare `except IntegrityError` would also swallow a broken FK or a NOT
+    NULL miss - real bugs that must keep surfacing. SQLite names the offending
+    index in the message for an expression index ("UNIQUE constraint failed:
+    index 'uq_notes_user_deck_lemma_pos'"), which is what identifies this one.
+
+    Matched against `error.orig` - the driver's own message - not str(error),
+    which appends the statement and its bound parameters. A lemma comes from
+    the LLM, and a parameter echo would let one containing this index name turn
+    an unrelated IntegrityError into a silent "already added".
+    """
+    return NOTE_UNIQUE_INDEX in str(error.orig)
+
+
 class Note(Base):
     __tablename__ = "notes"
 
@@ -161,6 +191,36 @@ class Note(Base):
 
     cards: Mapped[list[Card]] = relationship(back_populates="note")
     deck: Mapped[Deck | None] = relationship(back_populates="notes")
+
+    # One note per (user, deck, lemma, pos) - the DB's own copy of the dedup
+    # contract /add enforces in Python (ingest.existing_note_keys), so two
+    # concurrent /add turns that both pass the pre-insert lookup can't both
+    # land. Deck-scoped on purpose: the same word in a different deck is
+    # allowed (requested 03.09.2026, see existing_note_keys).
+    #
+    # COALESCE, not a plain UNIQUE(...), because SQLite treats NULLs as
+    # distinct in a unique index: `pos` is legitimately NULL for every
+    # kind="pattern" note (cards/schema.json requires pos only when
+    # kind="word") and `deck_id` is NULL for rows predating decks and for
+    # import_cards.py's CLI imports - a plain constraint would let exactly
+    # those duplicate freely.
+    #
+    # Case is already canonical by the time a lemma reaches here:
+    # ingest.canonical_key() runs it through the FST, which folds
+    # capitalization for known words ("Hakea" -> "hakea") while keeping
+    # proper nouns ("Helsingissä" -> "Helsinki"). A lower()-based index
+    # would be both a second normalization and a wrong one - SQLite's
+    # lower() only folds ASCII, so 'Äiti' would never match 'äiti'.
+    __table_args__ = (
+        Index(
+            NOTE_UNIQUE_INDEX,
+            "user_id",
+            "lemma",
+            text("coalesce(deck_id, '')"),
+            text("coalesce(pos, '')"),
+            unique=True,
+        ),
+    )
 
 
 class Card(Base):
