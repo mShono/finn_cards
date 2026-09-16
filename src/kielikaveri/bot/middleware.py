@@ -15,8 +15,7 @@ logger = logging.getLogger(__name__)
 
 DECLINE_TEXT = "Этот бот приватный и отвечает только своему владельцу."
 
-# Matches add.py's SOURCE_QUOTE_CHARS - just a readable log preview, not a
-# content limit.
+# Just a readable log preview, not a content limit.
 _PREVIEW_CHARS = 200
 
 

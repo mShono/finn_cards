@@ -373,11 +373,10 @@ async def test_add_deck_choice_saves_into_the_picked_deck_and_reports_the_new_co
         deck_b = await create_deck(session, 1, "Из книги")
         await set_active_deck(session, 1, deck_a.id)
         await session.commit()
-        source = await _make_source(session)
 
     state = make_state()
     await state.set_state(AddStates.choosing_deck)
-    await state.update_data(batch_id="batch-1", candidates=[WORD_CANDIDATE], source_id=source)
+    await state.update_data(batch_id="batch-1", candidates=[WORD_CANDIDATE])
     callback = make_callback(f"adddeck:batch-1:{deck_b.id}")
 
     await add_deck_choice(callback, state, session_factory, make_settings(), make_breaker())
@@ -413,11 +412,10 @@ async def test_add_deck_choice_drops_a_duplicate_already_in_the_target_deck(
             )
         )
         await session.commit()
-        source = await _make_source(session)
 
     state = make_state()
     await state.set_state(AddStates.choosing_deck)
-    await state.update_data(batch_id="batch-1", candidates=[WORD_CANDIDATE], source_id=source)
+    await state.update_data(batch_id="batch-1", candidates=[WORD_CANDIDATE])
     callback = make_callback(f"adddeck:batch-1:{deck.id}")
 
     await add_deck_choice(callback, state, session_factory, make_settings(), make_breaker())
@@ -455,11 +453,10 @@ async def test_add_deck_choice_allows_a_word_already_in_a_different_deck(
         )
         deck_b = await create_deck(session, 1, "talkoot")
         await session.commit()
-        source = await _make_source(session)
 
     state = make_state()
     await state.set_state(AddStates.choosing_deck)
-    await state.update_data(batch_id="batch-1", candidates=[WORD_CANDIDATE], source_id=source)
+    await state.update_data(batch_id="batch-1", candidates=[WORD_CANDIDATE])
     callback = make_callback(f"adddeck:batch-1:{deck_b.id}")
 
     await add_deck_choice(callback, state, session_factory, make_settings(), make_breaker())
@@ -498,11 +495,10 @@ async def test_add_deck_choice_handles_a_duplicate_that_appears_after_the_lookup
             )
         )
         await session.commit()
-        source = await _make_source(session)
 
     state = make_state()
     await state.set_state(AddStates.choosing_deck)
-    await state.update_data(batch_id="batch-1", candidates=[WORD_CANDIDATE], source_id=source)
+    await state.update_data(batch_id="batch-1", candidates=[WORD_CANDIDATE])
     callback = make_callback(f"adddeck:batch-1:{deck.id}")
 
     await add_deck_choice(callback, state, session_factory, make_settings(), make_breaker())
@@ -541,13 +537,10 @@ async def test_add_deck_choice_reports_duplicates_even_when_some_candidates_are_
             )
         )
         await session.commit()
-        source = await _make_source(session)
 
     state = make_state()
     await state.set_state(AddStates.choosing_deck)
-    await state.update_data(
-        batch_id="batch-1", candidates=[WORD_CANDIDATE, PATTERN_CANDIDATE], source_id=source
-    )
+    await state.update_data(batch_id="batch-1", candidates=[WORD_CANDIDATE, PATTERN_CANDIDATE])
     callback = make_callback(f"adddeck:batch-1:{deck.id}")
 
     await add_deck_choice(callback, state, session_factory, make_settings(), make_breaker())
@@ -560,7 +553,7 @@ async def test_add_deck_choice_reports_duplicates_even_when_some_candidates_are_
 async def test_add_deck_choice_rejects_a_stale_batch(session_factory):
     state = make_state()
     await state.set_state(AddStates.choosing_deck)
-    await state.update_data(batch_id="batch-1", candidates=[WORD_CANDIDATE], source_id="src")
+    await state.update_data(batch_id="batch-1", candidates=[WORD_CANDIDATE])
     callback = make_callback("adddeck:old-batch:deck-x")
 
     await add_deck_choice(callback, state, session_factory, make_settings(), make_breaker())
@@ -585,13 +578,13 @@ async def test_add_deck_choice_stray_callback_is_rejected_outside_the_state():
 async def test_add_new_deck_prompt_asks_for_a_name():
     state = make_state()
     await state.set_state(AddStates.choosing_deck)
-    await state.update_data(batch_id="batch-1", candidates=[WORD_CANDIDATE], source_id="src")
+    await state.update_data(batch_id="batch-1", candidates=[WORD_CANDIDATE])
     callback = make_callback("addnewdeck:batch-1")
 
     await add_new_deck_prompt(callback, state)
 
     assert await state.get_state() == AddStates.naming_new_deck.state
-    # batch_id/candidates/source_id survive the state change untouched.
+    # batch_id/candidates survive the state change untouched.
     data = await state.get_data()
     assert data["candidates"] == [WORD_CANDIDATE]
     callback.message.answer.assert_awaited_once_with(NEW_DECK_PROMPT)
@@ -601,7 +594,7 @@ async def test_add_new_deck_prompt_asks_for_a_name():
 async def test_add_new_deck_prompt_rejects_a_stale_batch():
     state = make_state()
     await state.set_state(AddStates.choosing_deck)
-    await state.update_data(batch_id="batch-1", candidates=[WORD_CANDIDATE], source_id="src")
+    await state.update_data(batch_id="batch-1", candidates=[WORD_CANDIDATE])
     callback = make_callback("addnewdeck:old-batch")
 
     await add_new_deck_prompt(callback, state)
@@ -624,12 +617,10 @@ async def test_add_new_deck_prompt_stray_callback_is_rejected_outside_the_state(
 
 async def test_add_new_deck_save_creates_the_deck_and_saves_into_it(session_factory, monkeypatch):
     patch_resolve_note_forms(monkeypatch)
-    async with session_factory() as session:
-        source = await _make_source(session)
 
     state = make_state()
     await state.set_state(AddStates.naming_new_deck)
-    await state.update_data(batch_id="batch-1", candidates=[WORD_CANDIDATE], source_id=source)
+    await state.update_data(batch_id="batch-1", candidates=[WORD_CANDIDATE])
     message = make_message("Из книги")
 
     await add_new_deck_save(message, state, session_factory, make_settings(), make_breaker())
@@ -648,7 +639,7 @@ async def test_add_new_deck_save_creates_the_deck_and_saves_into_it(session_fact
 async def test_add_new_deck_save_reprompts_on_an_empty_name(session_factory):
     state = make_state()
     await state.set_state(AddStates.naming_new_deck)
-    await state.update_data(batch_id="batch-1", candidates=[WORD_CANDIDATE], source_id="src")
+    await state.update_data(batch_id="batch-1", candidates=[WORD_CANDIDATE])
     message = make_message("   ")
 
     await add_new_deck_save(message, state, session_factory, make_settings(), make_breaker())
@@ -711,15 +702,6 @@ async def test_chat_reports_an_honest_error_instead_of_dying_silently(session_fa
 
 
 # --- /delete ---------------------------------------------------------------------
-
-
-async def _make_source(session) -> str:
-    from kielikaveri.db.models import Source
-
-    source = Source(type="other", ref="test", context_fi="x")
-    session.add(source)
-    await session.commit()
-    return source.id
 
 
 async def _add_note(session_factory, *, lemma="naapuri", pos="substantiivi", deck_name="Общая"):
@@ -922,11 +904,10 @@ async def test_add_save_logs_event_with_saved_and_duplicate_counts(
         deck = await create_deck(session, 1, "Общая")
         await set_active_deck(session, 1, deck.id)
         await session.commit()
-        source = await _make_source(session)
 
     state = make_state()
     await state.set_state(AddStates.choosing_deck)
-    await state.update_data(batch_id="batch-1", candidates=[WORD_CANDIDATE], source_id=source)
+    await state.update_data(batch_id="batch-1", candidates=[WORD_CANDIDATE])
     callback = make_callback(f"adddeck:batch-1:{deck.id}")
 
     with caplog.at_level(logging.INFO, logger="kielikaveri.bot.add"):

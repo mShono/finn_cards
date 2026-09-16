@@ -34,8 +34,6 @@ from kielikaveri.db.models import (
     Card,
     CardType,
     Note,
-    Source,
-    SourceType,
     User,
 )
 from kielikaveri.ingest import ResolvedForms
@@ -82,16 +80,12 @@ async def make_db(tmp_path):
         await engine.dispose()
 
 
-async def seed(session_factory, *deck_names: str) -> tuple[list[str], str]:
+async def seed(session_factory, *deck_names: str) -> list[str]:
     async with session_factory() as session:
         session.add(User(id=USER_ID))
         deck_ids = [(await create_deck(session, USER_ID, name)).id for name in deck_names]
-        source = Source(
-            type=SourceType.other, ref="Telegram чат", context_fi=CANDIDATE["example_fi"]
-        )
-        session.add(source)
         await session.commit()
-    return deck_ids, source.id
+    return deck_ids
 
 
 def make_settings() -> Settings:
@@ -127,7 +121,7 @@ def _barrier_in_the_race_window(monkeypatch, parties: int) -> None:
     monkeypatch.setattr("kielikaveri.bot.add.resolve_note_forms", resolve_at_the_barrier)
 
 
-async def tap_deck_button(session_factory, deck_id: str, source_id: str, chat_id: int):
+async def tap_deck_button(session_factory, deck_id: str, chat_id: int):
     """One /add turn, resumed at the point the learner picks a deck.
 
     Each turn gets its own FSM key (aiogram keys state by chat), which is what
@@ -141,7 +135,7 @@ async def tap_deck_button(session_factory, deck_id: str, source_id: str, chat_id
         storage=MemoryStorage(), key=StorageKey(bot_id=0, chat_id=chat_id, user_id=USER_ID)
     )
     await state.set_state(AddStates.choosing_deck)
-    await state.update_data(batch_id=batch_id, candidates=[CANDIDATE], source_id=source_id)
+    await state.update_data(batch_id=batch_id, candidates=[CANDIDATE])
     callback = SimpleNamespace(
         data=f"adddeck:{batch_id}:{deck_id}",
         from_user=SimpleNamespace(id=USER_ID),
@@ -163,12 +157,12 @@ async def notes_in(session_factory) -> list[Note]:
 
 async def test_two_concurrent_adds_of_the_same_word_leave_exactly_one_note(make_db, monkeypatch):
     session_factory = await make_db("same_deck")
-    (deck_id,), source_id = await seed(session_factory, "Общая")
+    (deck_id,) = await seed(session_factory, "Общая")
     _barrier_in_the_race_window(monkeypatch, parties=2)
 
     first, second = await asyncio.gather(
-        tap_deck_button(session_factory, deck_id, source_id, chat_id=1),
-        tap_deck_button(session_factory, deck_id, source_id, chat_id=2),
+        tap_deck_button(session_factory, deck_id, chat_id=1),
+        tap_deck_button(session_factory, deck_id, chat_id=2),
     )
 
     notes = await notes_in(session_factory)
@@ -193,12 +187,12 @@ async def test_the_surviving_note_opens_exactly_one_set_of_cards(make_db, monkey
     # (srs/graduation). So "no two sets of cards" is only really answered by
     # running that same opening path over whatever the race left behind.
     session_factory = await make_db("cards")
-    (deck_id,), source_id = await seed(session_factory, "Общая")
+    (deck_id,) = await seed(session_factory, "Общая")
     _barrier_in_the_race_window(monkeypatch, parties=2)
 
     await asyncio.gather(
-        tap_deck_button(session_factory, deck_id, source_id, chat_id=1),
-        tap_deck_button(session_factory, deck_id, source_id, chat_id=2),
+        tap_deck_button(session_factory, deck_id, chat_id=1),
+        tap_deck_button(session_factory, deck_id, chat_id=2),
     )
 
     async with session_factory() as session:
@@ -224,12 +218,12 @@ async def test_two_concurrent_adds_of_the_same_word_into_different_decks_both_la
     # The guard above must stay deck-scoped: a word already learned in one
     # deck is still addable to another (per-deck dedup, requested 03.09.2026).
     session_factory = await make_db("two_decks")
-    (deck_a, deck_b), source_id = await seed(session_factory, "Общая", "talkoot")
+    (deck_a, deck_b) = await seed(session_factory, "Общая", "talkoot")
     _barrier_in_the_race_window(monkeypatch, parties=2)
 
     first, second = await asyncio.gather(
-        tap_deck_button(session_factory, deck_a, source_id, chat_id=1),
-        tap_deck_button(session_factory, deck_b, source_id, chat_id=2),
+        tap_deck_button(session_factory, deck_a, chat_id=1),
+        tap_deck_button(session_factory, deck_b, chat_id=2),
     )
 
     notes = await notes_in(session_factory)
@@ -249,12 +243,12 @@ async def test_without_the_unique_index_the_same_race_writes_two_notes(make_db, 
     leaves two notes for one word. Nothing in src/ changes to get here.
     """
     session_factory = await make_db("no_index", unique_index=False)
-    (deck_id,), source_id = await seed(session_factory, "Общая")
+    (deck_id,) = await seed(session_factory, "Общая")
     _barrier_in_the_race_window(monkeypatch, parties=2)
 
     first, second = await asyncio.gather(
-        tap_deck_button(session_factory, deck_id, source_id, chat_id=1),
-        tap_deck_button(session_factory, deck_id, source_id, chat_id=2),
+        tap_deck_button(session_factory, deck_id, chat_id=1),
+        tap_deck_button(session_factory, deck_id, chat_id=2),
     )
 
     notes = await notes_in(session_factory)

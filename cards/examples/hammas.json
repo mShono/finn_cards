@@ -23,7 +23,6 @@
     "puhekieli": null,
     "confusable_with": [],
     "topics": ["terveys", "keho"],
-    "origin": "text",
-    "source": { "type": "article", "ref": "Yle Uutiset selkosuomeksi", "context_fi": "Lapsen ensimmäinen hammas puhkeaa yleensä kuuden kuukauden iässä." }
+    "origin": "text"
   }
 }

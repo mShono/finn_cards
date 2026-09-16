@@ -655,7 +655,7 @@ def _drop_nulls(value):
 
     Strict-mode structured outputs can only express "optional" as a
     ["type", "null"] union (see strict_schema.py) - every optional field the
-    LLM skipped (pos on a pattern candidate, rektio, source, ...)
+    LLM skipped (pos on a pattern candidate, rektio, puhekieli, ...)
     comes back explicitly `null` rather than omitted. cards/schema.json
     itself doesn't allow null on most of those fields, only omission, so the
     two need reconciling before the result can validate against it.
