@@ -78,6 +78,7 @@ async def due_cards(
     limit: int | None,
     deck_id: str | None = None,
     reviewed_only: bool = False,
+    new_only: bool = False,
 ) -> list[Card]:
     # Note is joined unconditionally, not just to filter by deck: the
     # ordering below needs its columns, and a card always has a note.
@@ -88,6 +89,8 @@ async def due_cards(
     )
     if reviewed_only:
         stmt = stmt.where(Card.reps > 0)
+    if new_only:
+        stmt = stmt.where(Card.reps == 0)
     if deck_id is not None:
         stmt = stmt.where(Note.deck_id == deck_id)
     result = await session.scalars(stmt.order_by(*_due_order()).limit(limit))
@@ -201,7 +204,9 @@ async def build_session_queue(
     Caps total size at `session_max_cards`, and caps how many never-reviewed
     (reps == 0) cards it admits at whatever's left of `daily_new_limit` for
     today's study window - review cards are never held back by this limit.
-    That limit is the defensive one, counted over cards of every type;
+    Reviews are not *preferred* over new cards either: both only compete
+    for places through _due_order(), so a new card due earlier still comes
+    first. That limit is the defensive one, counted over cards of every type;
     `daily_new_forms` separately governs how fast new grammar opens.
     `deck_id` narrows candidates to one deck; the daily new-card budget stays
     global across decks on purpose - it's a "don't overload the learner today"
@@ -210,29 +215,39 @@ async def build_session_queue(
     new_today = await count_new_cards_today(session, user_id, now, boundary_hour)
     new_budget = max(0, daily_new_limit - new_today)
 
-    # Fetch generously past session_max_cards - some candidates may be
-    # skipped for being "new" past the daily budget, so a tight limit here
-    # could starve the queue with review cards still due.
-    candidates = await due_cards(
-        session, user_id, now, limit=session_max_cards * 5, deck_id=deck_id
+    # Reviews and new cards are fetched separately, each in a window of its
+    # own. One shared window let a backlog of new cards past the daily budget
+    # fill every slot, so due reviews were never fetched at all. Neither
+    # fetch needs more rows than it could ever put into the queue.
+    reviews = await due_cards(
+        session, user_id, now, limit=session_max_cards, deck_id=deck_id, reviewed_only=True
     )
+    new_limit = min(new_budget, session_max_cards)
+    new_cards: list[Card] = []
+    if new_limit > 0:
+        new_cards = await due_cards(
+            session, user_id, now, limit=new_limit, deck_id=deck_id, new_only=True
+        )
 
+    # Merge with the very same _due_order() in SQL rather than re-sorting in
+    # Python, so the order keeps a single definition.
+    candidate_ids = [card.id for card in (*reviews, *new_cards)]
     queue: list[str] = []
-    new_used = 0
-    for card in candidates:
-        if card.reps == 0:
-            if new_used >= new_budget:
-                continue
-            new_used += 1
-        queue.append(card.id)
-        if len(queue) >= session_max_cards:
-            break
+    if candidate_ids:
+        result = await session.scalars(
+            select(Card.id)
+            .join(Note, Card.note_id == Note.id)
+            .where(Card.id.in_(candidate_ids))
+            .order_by(*_due_order())
+            .limit(session_max_cards)
+        )
+        queue = list(result.all())
 
     logger.debug(
-        "event=learn.queue_built candidates=%d queue=%d new_used=%d new_budget=%d",
-        len(candidates),
+        "event=learn.queue_built reviews=%d new=%d queue=%d new_budget=%d",
+        len(reviews),
+        len(new_cards),
         len(queue),
-        new_used,
         new_budget,
     )
     return queue
