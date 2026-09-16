@@ -65,15 +65,6 @@ class NoteKind(str, enum.Enum):
     pattern = "pattern"
 
 
-class SourceType(str, enum.Enum):
-    video = "video"
-    audio = "audio"
-    article = "article"
-    conversation = "conversation"
-    book = "book"
-    other = "other"
-
-
 class CardType(str, enum.Enum):
     recognition = "recognition"
     production = "production"
@@ -141,15 +132,6 @@ class Deck(Base):
     notes: Mapped[list[Note]] = relationship(back_populates="deck")
 
 
-class Source(Base):
-    __tablename__ = "sources"
-
-    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
-    type: Mapped[SourceType] = mapped_column(Enum(SourceType, native_enum=False))
-    ref: Mapped[str] = mapped_column(String)
-    context_fi: Mapped[str | None] = mapped_column(String, nullable=True)
-
-
 NOTE_UNIQUE_INDEX = "uq_notes_user_deck_lemma_pos"
 
 
@@ -180,7 +162,6 @@ class Note(Base):
     example_fi: Mapped[str] = mapped_column(String)
     example_ru: Mapped[str] = mapped_column(String)
     kind: Mapped[NoteKind] = mapped_column(Enum(NoteKind, native_enum=False))
-    source_id: Mapped[str | None] = mapped_column(ForeignKey("sources.id"), nullable=True)
     # Nullable at the DB level only for old rows predating decks (backfilled
     # to a "Общая" deck by the migration that added this column) - app code
     # always resolves one via db.decks.active_deck() before insert.

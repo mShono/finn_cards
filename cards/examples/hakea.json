@@ -23,7 +23,6 @@
     "puhekieli": "mä haen",
     "confusable_with": ["hakata"],
     "topics": ["työnhaku"],
-    "origin": "error",
-    "source": { "type": "conversation", "ref": "разговор о поиске работы", "context_fi": "Hän haki työpaikkaa." }
+    "origin": "error"
   }
 }

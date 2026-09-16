@@ -48,8 +48,6 @@ from kielikaveri.db.models import (
     Deck,
     Note,
     Review,
-    Source,
-    SourceType,
     is_note_duplicate_error,
 )
 from kielikaveri.import_cards import load_validator
@@ -71,10 +69,6 @@ logger = logging.getLogger(__name__)
 
 router = Router(name="add")
 
-# How much of the source text to keep as a quote (plan 3.9: "ссылка и цитата,
-# не весь текст целиком" - a chat message can be an entire pasted article).
-SOURCE_QUOTE_CHARS = 200
-
 ADD_BUTTON_TEXT = "💬 Добавить"
 ADD_PROMPT = "Просто напиши мне текст на финском или свой перевод - отвечу в чате."
 
@@ -82,7 +76,7 @@ ADD_PROMPT = "Просто напиши мне текст на финском и
 class AddStates(StatesGroup):
     # Data: pending_text - the Finnish text the clarifying question was about.
     awaiting_instruction = State()
-    # Data: batch_id, candidates, source_id - waiting for a deck pick before saving.
+    # Data: batch_id, candidates - waiting for a deck pick before saving.
     choosing_deck = State()
     # Data: same as choosing_deck, carried over - waiting for the new deck's name.
     naming_new_deck = State()
@@ -326,20 +320,12 @@ async def _handle_chat_turn(
         # not here - whether a word is "already there" depends on which deck
         # you're adding to (plan: per-deck dedup, requested 03.09.2026, was
         # global-per-user before). Nothing to filter on yet at this point.
-        quote_text = context_text or text
         async with session_factory() as session:
-            source = Source(
-                type=SourceType.other,
-                ref=f"Telegram чат, {now.date().isoformat()}",
-                context_fi=quote_text[:SOURCE_QUOTE_CHARS],
-            )
-            session.add(source)
             # active_deck() first - guarantees at least one deck (creating the
             # default "Общая" for a brand new user) before the picker below is
             # built, so it's never shown empty.
             await active_deck(session, user_id)
             await session.commit()
-            source_id = source.id
             decks = await list_decks(session, user_id)
 
         # Short, not a full uuid4 (36 chars) - callback_data below packs this
@@ -357,7 +343,7 @@ async def _handle_chat_turn(
             len(decks),
         )
         await state.set_state(AddStates.choosing_deck)
-        await state.update_data(batch_id=batch_id, candidates=candidates, source_id=source_id)
+        await state.update_data(batch_id=batch_id, candidates=candidates)
         await message.answer(
             "В какую колоду добавить?", reply_markup=_deck_choice_keyboard(decks, batch_id)
         )
@@ -401,7 +387,6 @@ async def add_deck_choice(
         return
 
     candidates: list[dict] = data.get("candidates", [])
-    source_id = data.get("source_id")
     user_id = callback.from_user.id
     await state.clear()
     await callback.answer()
@@ -413,7 +398,6 @@ async def add_deck_choice(
         breaker,
         user_id,
         deck_id,
-        source_id,
         candidates,
     )
 
@@ -435,7 +419,7 @@ async def add_new_deck_prompt(callback: CallbackQuery, state: FSMContext) -> Non
         )
         return
 
-    # batch_id/candidates/source_id stay in state data - set_state() alone
+    # batch_id/candidates stay in state data - set_state() alone
     # doesn't touch them, only the name reply below needs to read them back.
     await state.set_state(AddStates.naming_new_deck)
     await callback.message.answer(NEW_DECK_PROMPT)
@@ -462,7 +446,6 @@ async def add_new_deck_save(
 
     data = await state.get_data()
     candidates: list[dict] = data.get("candidates", [])
-    source_id = data.get("source_id")
     user_id = message.from_user.id
 
     async with session_factory() as session:
@@ -474,7 +457,7 @@ async def add_new_deck_save(
     await state.clear()
     await message.answer(f"Колода «{deck.name}» создана и стала активной.")
     await _save_candidates_and_report(
-        message, session_factory, settings, breaker, user_id, deck_id, source_id, candidates
+        message, session_factory, settings, breaker, user_id, deck_id, candidates
     )
 
 
@@ -485,7 +468,6 @@ async def _save_candidates_and_report(
     breaker: CallBreaker,
     user_id: int,
     deck_id: str,
-    source_id: str,
     candidates: list[dict],
 ) -> None:
     now = datetime.now(UTC)
@@ -589,7 +571,6 @@ async def _save_candidates_and_report(
                     example_fi=full_note["example_fi"],
                     example_ru=full_note["example_ru"],
                     kind=full_note["kind"],
-                    source_id=source_id,
                     deck_id=deck_id,
                     meta=full_note["meta"],
                 )

@@ -25,19 +25,6 @@
       "enum": ["fst", "fst+llm", "llm"],
       "description": "fst = every principal form resolved to exactly one FST candidate. fst+llm = at least one form had several FST candidates and an LLM (or a human, in phase 0) must pick one. llm = FST produced nothing for at least one form."
     },
-    "source": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["type", "ref"],
-      "properties": {
-        "type": {
-          "type": "string",
-          "enum": ["video", "audio", "article", "conversation", "book", "other"]
-        },
-        "ref": { "type": "string" },
-        "context_fi": { "type": "string" }
-      }
-    },
     "note": {
       "type": "object",
       "additionalProperties": false,
@@ -100,8 +87,7 @@
               "type": "array",
               "items": { "type": "string" }
             },
-            "origin": { "type": "string", "enum": ["error", "text"] },
-            "source": { "$ref": "#/$defs/source" }
+            "origin": { "type": "string", "enum": ["error", "text"] }
           }
         }
       },

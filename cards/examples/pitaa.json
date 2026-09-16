@@ -23,7 +23,6 @@
     "puhekieli": "mä pidän suomen kielestä",
     "confusable_with": [],
     "topics": ["mielipide", "kieli"],
-    "origin": "error",
-    "source": { "type": "conversation", "ref": "разговор о финском языке", "context_fi": "Minä pitää suomen kielestä." }
+    "origin": "error"
   }
 }

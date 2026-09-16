@@ -27,7 +27,7 @@ See `cards/instructions.md` for the exact algorithm and its rationale.
 - `src/kielikaveri/` - phase 1+: the bot.
   - `config.py` - settings loaded from `.env` (see `.env.example`).
   - `db/models.py` - SQLAlchemy models (`users`, `notes`, `cards`,
-    `reviews`, `sources`), mirroring `cards/schema.json`.
+    `reviews`), mirroring `cards/schema.json`.
   - `db/engine.py` - async engine/session helpers.
   - `bot/main.py` - entrypoint: long polling, whitelist middleware,
     `/start` `/help`.
