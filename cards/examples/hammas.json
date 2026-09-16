@@ -20,13 +20,8 @@
     "forms_source": "fst+llm",
     "forms_verified": false,
     "rektio": null,
-    "cognates": [
-      { "lemma": "hammaslääkäri", "pos": "substantiivi", "translation_ru": "стоматолог" },
-      { "lemma": "hampaisto", "pos": "substantiivi", "translation_ru": "зубной ряд" }
-    ],
     "puhekieli": null,
     "confusable_with": [],
-    "cefr": "A2",
     "topics": ["terveys", "keho"],
     "origin": "text",
     "source": { "type": "article", "ref": "Yle Uutiset selkosuomeksi", "context_fi": "Lapsen ensimmäinen hammas puhkeaa yleensä kuuden kuukauden iässä." }

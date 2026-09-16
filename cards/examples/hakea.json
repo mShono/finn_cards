@@ -20,14 +20,8 @@
     "forms_source": "fst",
     "forms_verified": true,
     "rektio": "hakea + partitiivi",
-    "cognates": [
-      { "lemma": "haku", "pos": "substantiivi", "translation_ru": "поиск, набор" },
-      { "lemma": "hakemus", "pos": "substantiivi", "translation_ru": "заявление" },
-      { "lemma": "hakija", "pos": "substantiivi", "translation_ru": "заявитель" }
-    ],
     "puhekieli": "mä haen",
     "confusable_with": ["hakata"],
-    "cefr": "B1",
     "topics": ["työnhaku"],
     "origin": "error",
     "source": { "type": "conversation", "ref": "разговор о поиске работы", "context_fi": "Hän haki työpaikkaa." }

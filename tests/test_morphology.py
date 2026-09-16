@@ -9,20 +9,7 @@ from finn_cards.morphology import (
     generate_forms,
     lemmatize,
     pos_set_for_lemma,
-    validate_form,
 )
-
-
-def test_validate_form_accepts_real_word():
-    assert validate_form("kättä") is True
-
-
-def test_validate_form_rejects_made_up_word():
-    assert validate_form("xyzquu") is False
-
-
-def test_validate_form_rejects_made_up_verb_form():
-    assert validate_form("hakelisi") is False
 
 
 def test_lemmatize_returns_dictionary_form():
@@ -191,7 +178,6 @@ def test_concurrent_calls_do_not_crash():
         try:
             assert detect_pos(lemma)
             assert lemmatize(lemma)
-            assert validate_form(lemma)
             generate_forms(lemma, pos)
         except Exception as exc:  # noqa: BLE001
             errors.append(exc)

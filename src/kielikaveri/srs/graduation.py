@@ -3,8 +3,7 @@
 recognition opens immediately, production once recognition's interval
 (stability) crosses a threshold, inflection once the note's principal_forms
 are FST-verified - and there it is one card per form, not one per note, so
-each form carries its own FSRS schedule. usage is opened by hand (not
-implemented here) - it isn't tied to any automatic condition.
+each form carries its own FSRS schedule.
 
 Opening a dozen inflection cards at once does not flood a session:
 build_session_queue admits at most `daily_new_limit` never-reviewed cards
