@@ -1,4 +1,5 @@
 import asyncio
+import functools
 import logging
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -6,10 +7,17 @@ from unittest.mock import AsyncMock
 
 import openai
 import pytest
+from aiogram import Bot, Dispatcher
+from aiogram.client.session.base import BaseSession
 from aiogram.filters import CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.methods import SendMessage
+from aiogram.types import CallbackQuery as TgCallbackQuery
+from aiogram.types import Chat, Update
+from aiogram.types import Message as TgMessage
+from aiogram.types import User as TgUser
 from conftest import log_fields
 from sqlalchemy import select
 
@@ -26,7 +34,12 @@ from kielikaveri.bot.add import (
     delete_command,
     delete_confirm,
 )
+from kielikaveri.bot.add import router as add_router
 from kielikaveri.bot.decks import NEW_DECK_PROMPT
+from kielikaveri.bot.decks import router as decks_router
+from kielikaveri.bot.edit import router as edit_router
+from kielikaveri.bot.handlers import router as core_router
+from kielikaveri.bot.learn import router as learn_router
 from kielikaveri.config import Settings
 from kielikaveri.db.decks import active_deck, create_deck, set_active_deck
 from kielikaveri.db.engine import create_all, make_engine, make_session_factory
@@ -646,6 +659,144 @@ async def test_add_new_deck_save_reprompts_on_an_empty_name(session_factory):
 
     message.answer.assert_awaited_once_with(NEW_DECK_PROMPT)
     assert await state.get_state() == AddStates.naming_new_deck.state
+
+
+# --- routing through the real Dispatcher -------------------------------------------
+
+
+class RecordingSession(BaseSession):
+    """Stands in for Telegram: records outgoing API calls instead of sending them."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.sent: list = []
+
+    async def make_request(self, bot, method, timeout=None):
+        self.sent.append(method)
+        if isinstance(method, SendMessage):
+            return TgMessage(
+                message_id=len(self.sent),
+                date=datetime.now(UTC),
+                chat=Chat(id=1, type="private"),
+                text=method.text,
+                reply_markup=method.reply_markup,
+            )
+        return True
+
+    async def stream_content(self, *args, **kwargs):
+        raise NotImplementedError
+
+    async def close(self) -> None:
+        pass
+
+
+@functools.cache
+def routed_dispatcher() -> Dispatcher:
+    # Same router order as bot/main.py's run(). Built once per process: the
+    # routers are module-level and aiogram refuses to attach one twice.
+    dp = Dispatcher()
+    for module_router in (core_router, learn_router, decks_router, edit_router, add_router):
+        dp.include_router(module_router)
+    return dp
+
+
+def tg_user() -> TgUser:
+    return TgUser(id=1, is_bot=False, first_name="Test")
+
+
+def tg_text_update(update_id: int, text: str) -> Update:
+    return Update(
+        update_id=update_id,
+        message=TgMessage(
+            message_id=update_id,
+            date=datetime.now(UTC),
+            chat=Chat(id=1, type="private"),
+            from_user=tg_user(),
+            text=text,
+        ),
+    )
+
+
+def tg_callback_update(update_id: int, data: str) -> Update:
+    return Update(
+        update_id=update_id,
+        callback_query=TgCallbackQuery(
+            id=str(update_id),
+            from_user=tg_user(),
+            chat_instance="test",
+            data=data,
+            message=TgMessage(
+                message_id=update_id,
+                date=datetime.now(UTC),
+                chat=Chat(id=1, type="private"),
+                text="В какую колоду добавить?",
+            ),
+        ),
+    )
+
+
+async def test_new_deck_name_is_routed_to_add_new_deck_save_not_to_chat(
+    session_factory, monkeypatch
+):
+    # Regression: chat_message used to be registered first and swallow the
+    # deck name as plain chat, answering with the clarifying question.
+    check = AsyncMock(
+        side_effect=[
+            ("Вот слово.", False, [WORD_CANDIDATE], TokenUsage(10, 5, 15)),
+            ("Уточни, что сделать с текстом?", True, [], TokenUsage(10, 5, 15)),
+        ]
+    )
+    monkeypatch.setattr("kielikaveri.bot.add.check_and_suggest", check)
+    patch_resolve_note_forms(monkeypatch)
+
+    dp = routed_dispatcher()
+    telegram = RecordingSession()
+    bot = Bot(token="42:TEST", session=telegram)
+    context = {
+        "session_factory": session_factory,
+        "settings": make_settings(),
+        "breaker": make_breaker(),
+    }
+    key = StorageKey(bot_id=bot.id, chat_id=1, user_id=1)
+
+    # /add, then the picker's "new deck" button, then the deck's name
+    await dp.feed_update(bot, tg_text_update(1, "/add hakea"), **context)
+    picker = telegram.sent[-1].reply_markup
+    new_deck_data = next(
+        button.callback_data
+        for row in picker.inline_keyboard
+        for button in row
+        if button.callback_data.startswith("addnewdeck:")
+    )
+
+    await dp.feed_update(bot, tg_callback_update(2, new_deck_data), **context)
+    assert await dp.storage.get_state(key) == AddStates.naming_new_deck.state
+
+    sent_before_name = len(telegram.sent)
+    await dp.feed_update(bot, tg_text_update(3, "Из книги"), **context)
+
+    # The name never reached the LLM - only the original /add text did.
+    check.assert_awaited_once()
+    assert check.call_args.args[3] == "hakea"
+
+    async with session_factory() as session:
+        deck = (await session.scalars(select(Deck).where(Deck.name == "Из книги"))).one()
+        note = (await session.scalars(select(Note).where(Note.lemma == "hakea"))).one()
+        user = await session.get(User, 1)
+    assert deck.user_id == 1
+    assert note.deck_id == deck.id
+    assert user.last_deck_id == deck.id
+
+    assert await dp.storage.get_state(key) is None
+    assert await dp.storage.get_data(key) == {}
+
+    replies = [
+        method.text
+        for method in telegram.sent[sent_before_name:]
+        if isinstance(method, SendMessage)
+    ]
+    assert replies[0] == "Колода «Из книги» создана и стала активной."
+    assert "Уточни, что сделать с текстом?" not in replies
 
 
 async def test_chat_reports_a_failed_candidate_without_blocking_the_others(

@@ -197,6 +197,40 @@ async def delete_confirm(
     )
 
 
+# Must stay above chat_message: aiogram stops propagation at the first
+# handler whose filters pass, in registration order, and chat_message has no
+# state filter - registered after it, the new deck's name went to the LLM
+# as plain chat and no deck was ever created (bug since a4e78e2).
+@router.message(AddStates.naming_new_deck)
+async def add_new_deck_save(
+    message: Message,
+    state: FSMContext,
+    session_factory: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    breaker: CallBreaker,
+) -> None:
+    name = (message.text or "").strip()
+    if not name:
+        await message.answer(NEW_DECK_PROMPT)
+        return
+
+    data = await state.get_data()
+    candidates: list[dict] = data.get("candidates", [])
+    user_id = message.from_user.id
+
+    async with session_factory() as session:
+        deck = await create_deck(session, user_id, name)
+        await set_active_deck(session, user_id, deck.id)
+        await session.commit()
+        deck_id = deck.id
+
+    await state.clear()
+    await message.answer(f"Колода «{deck.name}» создана и стала активной.")
+    await _save_candidates_and_report(
+        message, session_factory, settings, breaker, user_id, deck_id, candidates
+    )
+
+
 @router.message(F.text & ~F.text.startswith("/"))
 async def chat_message(
     message: Message,
@@ -429,36 +463,6 @@ async def add_new_deck_prompt(callback: CallbackQuery, state: FSMContext) -> Non
 @router.callback_query(F.data.startswith("addnewdeck:"))
 async def add_new_deck_prompt_stray(callback: CallbackQuery) -> None:
     await callback.answer("Эта подборка уже неактуальна - пришли текст ещё раз.", show_alert=True)
-
-
-@router.message(AddStates.naming_new_deck)
-async def add_new_deck_save(
-    message: Message,
-    state: FSMContext,
-    session_factory: async_sessionmaker[AsyncSession],
-    settings: Settings,
-    breaker: CallBreaker,
-) -> None:
-    name = (message.text or "").strip()
-    if not name:
-        await message.answer(NEW_DECK_PROMPT)
-        return
-
-    data = await state.get_data()
-    candidates: list[dict] = data.get("candidates", [])
-    user_id = message.from_user.id
-
-    async with session_factory() as session:
-        deck = await create_deck(session, user_id, name)
-        await set_active_deck(session, user_id, deck.id)
-        await session.commit()
-        deck_id = deck.id
-
-    await state.clear()
-    await message.answer(f"Колода «{deck.name}» создана и стала активной.")
-    await _save_candidates_and_report(
-        message, session_factory, settings, breaker, user_id, deck_id, candidates
-    )
 
 
 async def _save_candidates_and_report(
