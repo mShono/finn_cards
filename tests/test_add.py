@@ -43,7 +43,7 @@ WORD_CANDIDATE = {
     "example_fi": "Haen töitä kaupungista.",
     "example_ru": "Я ищу работу в городе.",
     "kind": "word",
-    "meta": {"cefr": "B1"},
+    "meta": {"topics": ["työnhaku"]},
 }
 
 PATTERN_CANDIDATE = {
@@ -963,7 +963,7 @@ async def test_chat_saves_tuli_as_a_noun_with_real_grammar_forms(session_factory
         "example_fi": "Hän tuli kotiin.",
         "example_ru": "Он пришёл домой.",
         "kind": "word",
-        "meta": {"cefr": "A2"},
+        "meta": {"topics": ["koti"]},
     }
     patch_check_and_suggest(monkeypatch, "Добавляю.", [candidate])
     state = make_state()

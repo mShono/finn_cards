@@ -54,7 +54,7 @@ CANDIDATE = {
     "example_fi": "Seurojentalo on kylän keskellä.",
     "example_ru": "Дом собраний в центре деревни.",
     "kind": "word",
-    "meta": {"cefr": "B1"},
+    "meta": {"topics": ["kylä"]},
 }
 
 

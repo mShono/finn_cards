@@ -176,6 +176,22 @@ def build_chat_input(text: str, context_text: str | None) -> str:
     )
 
 
+def _chat_schema_fingerprint() -> str:
+    """sha256 of the strict schema check_and_suggest() actually sends.
+
+    Canonical JSON (sorted keys, no whitespace), so reformatting
+    cards/schema.json alone doesn't invalidate the cache - only a change the
+    model can see does, including one made through EXCLUDED_FIELDS.
+    """
+    canonical = json.dumps(
+        _chat_schema(_load_note_schema()),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def hash_text(text: str, model: str, *, is_follow_up: bool = False) -> str:
     """Cache key for one chat turn.
 
@@ -186,8 +202,16 @@ def hash_text(text: str, model: str, *, is_follow_up: bool = False) -> str:
     because check_and_suggest() was never called again for that text). This
     also closes the model-mismatch gap noted in the plan for the same reason -
     `store_cached_chat` already recorded `model`, but nothing compared it back.
+
+    The response schema is folded in for the same reason: a cached candidate
+    shaped by an older schema would otherwise be replayed and then rejected
+    by the note validator on every resend (found 16.09.2026, when
+    meta.cognates/meta.cefr were dropped from cards/schema.json).
     """
-    composite = f"{model}\n{_chat_instructions(is_follow_up=is_follow_up)}\n{text.strip()}"
+    composite = (
+        f"{model}\n{_chat_schema_fingerprint()}\n"
+        f"{_chat_instructions(is_follow_up=is_follow_up)}\n{text.strip()}"
+    )
     return hashlib.sha256(composite.encode("utf-8")).hexdigest()
 
 
@@ -631,7 +655,7 @@ def _drop_nulls(value):
 
     Strict-mode structured outputs can only express "optional" as a
     ["type", "null"] union (see strict_schema.py) - every optional field the
-    LLM skipped (pos on a pattern candidate, cognates, cefr, source, ...)
+    LLM skipped (pos on a pattern candidate, rektio, source, ...)
     comes back explicitly `null` rather than omitted. cards/schema.json
     itself doesn't allow null on most of those fields, only omission, so the
     two need reconciling before the result can validate against it.

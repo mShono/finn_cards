@@ -20,13 +20,8 @@
     "forms_source": "fst",
     "forms_verified": true,
     "rektio": "pitää + -sta/-stä",
-    "cognates": [
-      { "lemma": "pidike", "pos": "substantiivi", "translation_ru": "держатель" },
-      { "lemma": "pitävä", "pos": "adjektiivi", "translation_ru": "прочный, герметичный" }
-    ],
     "puhekieli": "mä pidän suomen kielestä",
     "confusable_with": [],
-    "cefr": "B1",
     "topics": ["mielipide", "kieli"],
     "origin": "error",
     "source": { "type": "conversation", "ref": "разговор о финском языке", "context_fi": "Minä pitää suomen kielestä." }

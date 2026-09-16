@@ -159,16 +159,6 @@ def generate_forms(lemma: str, pos: str) -> FormsResult:
     )
 
 
-def validate_form(word: str) -> bool:
-    """True if `word` parses as some existing Finnish word form.
-
-    Does not check whether the form fits its sentence context, and must
-    not be used on puhekieli (colloquial forms fall outside the FST).
-    """
-    with _FST_LOCK:
-        return bool(uralicApi.analyze(word, LANG))
-
-
 def lemmatize(word: str) -> list[str]:
     """Distinct dictionary forms `word` can be an inflection of.
 

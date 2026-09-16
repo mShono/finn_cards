@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://kielikaveri.local/cards/schema.json",
   "title": "Kielikaveri card schema",
-  "description": "Note + card format. See cards/instructions.md for how to fill it in. Single source of truth for the schema - the bot (phase 1+) imports this file, it does not redefine the format.",
+  "description": "Note format. See cards/instructions.md for how to fill it in. Single source of truth for the schema - the bot (phase 1+) imports this file, it does not redefine the format.",
   "$defs": {
     "pos": {
       "type": "string",
@@ -20,24 +20,10 @@
         "partikkeli"
       ]
     },
-    "cefr": {
-      "type": "string",
-      "enum": ["A1", "A2", "B1", "B2", "C1", "C2"]
-    },
     "formsSource": {
       "type": "string",
       "enum": ["fst", "fst+llm", "llm"],
       "description": "fst = every principal form resolved to exactly one FST candidate. fst+llm = at least one form had several FST candidates and an LLM (or a human, in phase 0) must pick one. llm = FST produced nothing for at least one form."
-    },
-    "cognate": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["lemma", "pos", "translation_ru"],
-      "properties": {
-        "lemma": { "type": "string" },
-        "pos": { "$ref": "#/$defs/pos" },
-        "translation_ru": { "type": "string" }
-      }
     },
     "source": {
       "type": "object",
@@ -102,10 +88,6 @@
               "type": ["string", "null"],
               "description": "Verb government, e.g. 'pitää + -sta/-stä' - case as its ending, not its name (see cards/instructions.md; partitiivi/illatiivi are the exception, no single ending)."
             },
-            "cognates": {
-              "type": "array",
-              "items": { "$ref": "#/$defs/cognate" }
-            },
             "puhekieli": {
               "type": ["string", "null"],
               "description": "Colloquial form. Not FST-validated - puhekieli falls outside literary FST norms."
@@ -114,7 +96,6 @@
               "type": "array",
               "items": { "type": "string" }
             },
-            "cefr": { "$ref": "#/$defs/cefr" },
             "topics": {
               "type": "array",
               "items": { "type": "string" }
@@ -130,40 +111,7 @@
           "then": { "required": ["pos"] }
         }
       ]
-    },
-    "card": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["id", "note_id", "user_id", "type", "srs"],
-      "properties": {
-        "id": { "type": "string", "format": "uuid" },
-        "note_id": { "type": "string", "format": "uuid" },
-        "user_id": { "type": "string" },
-        "type": {
-          "type": "string",
-          "enum": ["recognition", "production", "inflection", "usage"]
-        },
-        "srs": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["state", "due", "stability", "difficulty", "reps", "lapses"],
-          "properties": {
-            "state": {
-              "type": "string",
-              "enum": ["learning", "review", "relearning"]
-            },
-            "due": { "type": "string", "format": "date-time" },
-            "stability": { "type": "number", "minimum": 0 },
-            "difficulty": { "type": "number", "minimum": 0 },
-            "reps": { "type": "integer", "minimum": 0 },
-            "lapses": { "type": "integer", "minimum": 0 }
-          }
-        }
-      }
     }
   },
-  "oneOf": [
-    { "$ref": "#/$defs/note" },
-    { "$ref": "#/$defs/card" }
-  ]
+  "$ref": "#/$defs/note"
 }

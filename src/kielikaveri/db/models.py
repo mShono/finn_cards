@@ -1,7 +1,7 @@
 """SQLAlchemy 2.0 models mirroring cards/schema.json.
 
 `notes.meta` keeps the schema's free-form `note.meta` object (principal_forms,
-cognates, forms_source, ...) as a single JSON blob rather than normalizing
+rektio, forms_source, ...) as a single JSON blob rather than normalizing
 every field - it is already schema-validated on import (see import_cards.py),
 and phase 1 has no query that needs to filter on its contents.
 """
@@ -78,7 +78,6 @@ class CardType(str, enum.Enum):
     recognition = "recognition"
     production = "production"
     inflection = "inflection"
-    usage = "usage"
 
 
 class CardState(str, enum.Enum):

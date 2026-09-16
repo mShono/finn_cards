@@ -15,13 +15,13 @@ See `cards/instructions.md` for the exact algorithm and its rationale.
 
 ## Layout
 
-- `cards/schema.json` - the note+card JSON Schema. Single source of truth;
+- `cards/schema.json` - the note JSON Schema. Single source of truth;
   nothing else redefines the card format.
 - `cards/instructions.md` - how to fill in a card without inventing forms.
 - `cards/examples/` - three reference notes (verb, noun with consonant
   gradation, verb with non-trivial government/rektio).
 - `src/finn_cards/` - phase 0: `morphology.py` (generate_forms,
-  validate_form, lemmatize, detect_pos, pos_set_for_lemma),
+  lemmatize, detect_pos, pos_set_for_lemma),
   `strict_schema.py` (converts `cards/schema.json` into an OpenAI
   `strict: true` schema).
 - `src/kielikaveri/` - phase 1+: the bot.
@@ -30,7 +30,7 @@ See `cards/instructions.md` for the exact algorithm and its rationale.
     `reviews`, `sources`), mirroring `cards/schema.json`.
   - `db/engine.py` - async engine/session helpers.
   - `bot/main.py` - entrypoint: long polling, whitelist middleware,
-    `/start` `/help` `/stats`.
+    `/start` `/help`.
   - `bot/middleware.py` - `WhitelistMiddleware`, registered on
     `dp.update.outer_middleware`.
   - `bot/text.py` - `split_message`, for replies over Telegram's 4096

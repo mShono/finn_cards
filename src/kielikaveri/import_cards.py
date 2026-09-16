@@ -1,7 +1,7 @@
 """Import note JSON files (cards/schema.json format) into the database.
 
 Only `notes` are imported here - `cards/examples/*.json` are notes, not
-review cards. Review cards (type: recognition/production/inflection/usage)
+review cards. Review cards (type: recognition/production/inflection)
 get created gradually per phase 2's "postpone type" logic, not on import.
 
 Usage: uv run python -m kielikaveri.import_cards --user-id 123
@@ -44,11 +44,6 @@ async def import_notes(session_factory, user_id: int, cards_dir: Path) -> list[s
         for note_file in sorted(cards_dir.glob("*.json")):
             payload = json.loads(note_file.read_text())
             validator.validate(payload)
-            if "kind" not in payload:
-                # schema.json is oneOf[note, card] - "kind" only exists on note
-                raise ValueError(
-                    f"{note_file} is a card, not a note - import_cards only imports notes"
-                )
 
             existing = await session.get(Note, payload["id"])
             if existing is not None:

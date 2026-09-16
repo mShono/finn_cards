@@ -41,7 +41,6 @@ _CARD_TYPE_ORDER: dict[CardType, int] = {
     CardType.recognition: 0,
     CardType.production: 1,
     CardType.inflection: 2,
-    CardType.usage: 3,
 }
 
 

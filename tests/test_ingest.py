@@ -91,6 +91,52 @@ def test_hash_text_differs_when_the_prompt_text_changes(monkeypatch):
     assert before != after
 
 
+def test_hash_text_differs_when_the_strict_schema_changes(monkeypatch, tmp_path):
+    # Regression, found 16.09.2026: dropping meta.cognates/meta.cefr from
+    # cards/schema.json left cached candidates that the note validator would
+    # reject on every resend - the key must follow what the model is sent.
+    from kielikaveri.ingest import EXCLUDED_FIELDS, SCHEMA_PATH
+
+    before = hash_text("Haen töitä.", "gpt-5.6-terra")
+
+    schema = json.loads(SCHEMA_PATH.read_text())
+    schema["$defs"]["note"]["properties"]["meta"]["properties"]["rektio"]["description"] = "x"
+    schema_file = tmp_path / "schema.json"
+    schema_file.write_text(json.dumps(schema, ensure_ascii=False))
+    monkeypatch.setattr("kielikaveri.ingest.SCHEMA_PATH", schema_file)
+    assert hash_text("Haen töitä.", "gpt-5.6-terra") != before
+
+    # Same schema file, but a code-side change to what the model is sent.
+    monkeypatch.setattr("kielikaveri.ingest.SCHEMA_PATH", SCHEMA_PATH)
+    monkeypatch.setattr("kielikaveri.ingest.EXCLUDED_FIELDS", EXCLUDED_FIELDS - {"origin"})
+    assert hash_text("Haen töitä.", "gpt-5.6-terra") != before
+
+
+def test_hash_text_ignores_schema_file_formatting_and_key_order(monkeypatch, tmp_path):
+    from kielikaveri.ingest import SCHEMA_PATH
+
+    def reorder(node, parent_key=None):
+        # Property order reaches the strict schema (its "required" list), so
+        # only reverse keys everywhere else.
+        if isinstance(node, dict):
+            keys = list(node) if parent_key == "properties" else list(reversed(node))
+            return {key: reorder(node[key], key) for key in keys}
+        if isinstance(node, list):
+            return [reorder(item) for item in node]
+        return node
+
+    before = hash_text("Haen töitä.", "gpt-5.6-terra")
+
+    original = SCHEMA_PATH.read_text()
+    reshuffled = json.dumps(reorder(json.loads(original)), indent=4, ensure_ascii=False)
+    assert reshuffled != original
+    schema_file = tmp_path / "schema.json"
+    schema_file.write_text(reshuffled)
+    monkeypatch.setattr("kielikaveri.ingest.SCHEMA_PATH", schema_file)
+
+    assert hash_text("Haen töitä.", "gpt-5.6-terra") == before
+
+
 def test_canonical_key_lemmatizes_an_inflected_llm_lemma():
     # cards/instructions.md: the LLM sometimes returns a word form as "lemma".
     assert canonical_key("töitä", "substantiivi") == ("työ", "substantiivi")
@@ -725,7 +771,7 @@ def test_build_full_note_fills_in_the_fst_only_fields():
         "example_fi": "Haen töitä.",
         "example_ru": "Я ищу работу.",
         "kind": "word",
-        "meta": {"cefr": "B1"},
+        "meta": {"topics": ["työnhaku"]},
     }
     resolved = ResolvedForms({"preesens_1s": "haen"}, "fst", True)
 
@@ -735,7 +781,7 @@ def test_build_full_note_fills_in_the_fst_only_fields():
     assert note["meta"]["forms_source"] == "fst"
     assert note["meta"]["forms_verified"] is True
     assert note["meta"]["origin"] == "text"
-    assert note["meta"]["cefr"] == "B1"
+    assert note["meta"]["topics"] == ["työnhaku"]
 
 
 def test_build_full_note_pattern_kind_gets_placeholder_forms():
