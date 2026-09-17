@@ -2,12 +2,14 @@ from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pytest
-from sqlalchemy import event
+from sqlalchemy import event, select
 
 from kielikaveri.db.engine import create_all, make_engine, make_session_factory
-from kielikaveri.db.models import Card, CardType, Note, NoteKind, Review, User
+from kielikaveri.db.models import Card, CardStatus, CardType, Deck, Note, NoteKind, Review, User
 from kielikaveri.srs.queue import (
+    CardCounters,
     build_session_queue,
+    card_counters,
     count_new_cards_today,
     defer_overdue_tail,
     due_cards,
@@ -26,7 +28,7 @@ async def session_factory(tmp_path):
     await engine.dispose()
 
 
-def make_note(note_id: str, user_id: int) -> Note:
+def make_note(note_id: str, user_id: int, deck_id: str | None = None) -> Note:
     # Lemma derived from note_id: notes are unique per (user, deck, lemma, pos),
     # and every call here means a genuinely different word.
     return Note(
@@ -37,6 +39,7 @@ def make_note(note_id: str, user_id: int) -> Note:
         example_fi="Haen töitä.",
         example_ru="Я ищу работу.",
         kind=NoteKind.word,
+        deck_id=deck_id,
         meta={},
     )
 
@@ -491,6 +494,102 @@ async def test_defer_overdue_tail_leaves_never_reviewed_cards_alone(session_fact
 
     assert postponed == 2
     assert fresh.due == now
+
+
+# --- deck scoping -------------------------------------------------------------
+
+DECK_NOW = datetime(2026, 8, 24, 10, 0, tzinfo=UTC)
+
+
+async def _seed_two_decks(session_factory) -> tuple[str, str]:
+    """Two decks of one user with deliberately different numbers, so any
+    count that leaks across decks comes out wrong.
+
+    deck A: 2 overdue reviews, 1 due new card, 1 future card, 1 unopened form.
+    deck B: 4 overdue reviews, 2 unopened forms.
+    """
+    async with session_factory() as session:
+        session.add(User(id=1))
+        session.add(Deck(id="deck-a", user_id=1, name="A"))
+        session.add(Deck(id="deck-b", user_id=1, name="B"))
+        session.add(make_note("note-a", 1, deck_id="deck-a"))
+        session.add(make_note("note-b", 1, deck_id="deck-b"))
+        await session.flush()
+        for i in range(2):
+            session.add(make_card(f"a-seen-{i}", "note-a", 1, DECK_NOW - timedelta(days=9 - i), 1))
+        session.add(make_card("a-new", "note-a", 1, DECK_NOW - timedelta(hours=1)))
+        session.add(make_card("a-future", "note-a", 1, DECK_NOW + timedelta(days=3), 1))
+        session.add(_unopened_form("a-form-0", "note-a"))
+        for i in range(4):
+            session.add(make_card(f"b-seen-{i}", "note-b", 1, DECK_NOW - timedelta(days=5 - i), 1))
+        for i in range(2):
+            session.add(_unopened_form(f"b-form-{i}", "note-b"))
+        await session.commit()
+    return "deck-a", "deck-b"
+
+
+def _unopened_form(card_id: str, note_id: str) -> Card:
+    return Card(
+        id=card_id,
+        note_id=note_id,
+        user_id=1,
+        type=CardType.inflection,
+        form="genetiivi",
+        due=DECK_NOW - timedelta(days=1),
+        status=CardStatus.not_introduced,
+    )
+
+
+async def test_overdue_count_counts_only_the_given_deck(session_factory):
+    deck_a, deck_b = await _seed_two_decks(session_factory)
+    async with session_factory() as session:
+        due_a = await overdue_count(session, 1, DECK_NOW, deck_id=deck_a)
+        debt_a = await overdue_count(session, 1, DECK_NOW, deck_id=deck_a, reviewed_only=True)
+        debt_b = await overdue_count(session, 1, DECK_NOW, deck_id=deck_b, reviewed_only=True)
+        debt_all = await overdue_count(session, 1, DECK_NOW, reviewed_only=True)
+
+    assert due_a == 3
+    assert debt_a == 2
+    assert debt_b == 4
+    assert debt_all == 6
+
+
+async def test_card_counters_count_only_the_given_deck(session_factory):
+    deck_a, deck_b = await _seed_two_decks(session_factory)
+    async with session_factory() as session:
+        counters_a = await card_counters(session, 1, DECK_NOW, deck_id=deck_a)
+        counters_b = await card_counters(session, 1, DECK_NOW, deck_id=deck_b)
+
+    assert counters_a == CardCounters(total=5, introduced=4, due=3, overdue=2, not_introduced=1)
+    assert counters_b == CardCounters(total=6, introduced=4, due=4, overdue=4, not_introduced=2)
+
+
+async def test_defer_overdue_tail_postpones_only_the_given_deck(session_factory):
+    deck_a, deck_b = await _seed_two_decks(session_factory)
+    async with session_factory() as session:
+        before_a = {
+            c.id: c.due for c in await session.scalars(select(Card).where(Card.note_id == "note-a"))
+        }
+        # Deck A's reviews are due *earlier* than all of deck B's: a defer that
+        # ignored the deck would keep them and postpone B's instead.
+        postponed = await defer_overdue_tail(
+            session, 1, DECK_NOW, keep_n=1, postpone_days=7, deck_id=deck_b
+        )
+        await session.commit()
+
+        after_a = {
+            c.id: c.due for c in await session.scalars(select(Card).where(Card.note_id == "note-a"))
+        }
+        b_seen = {
+            c.id: c.due for c in await session.scalars(select(Card).where(Card.id.like("b-seen-%")))
+        }
+        debt_a = await overdue_count(session, 1, DECK_NOW, deck_id=deck_a, reviewed_only=True)
+
+    assert postponed == 3
+    assert after_a == before_a
+    assert debt_a == 2
+    assert b_seen["b-seen-0"] == DECK_NOW - timedelta(days=5)  # the oldest one is kept
+    assert all(b_seen[f"b-seen-{i}"] == DECK_NOW + timedelta(days=7) for i in (1, 2, 3))
 
 
 # --- ordering contract ------------------------------------------------------
