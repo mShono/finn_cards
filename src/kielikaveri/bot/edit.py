@@ -238,6 +238,15 @@ async def _apply_lemma_edit(
             # generated for resolved.pos, so the note has to agree with them.
             if resolved.pos is not None:
                 note.pos = resolved.pos
+        elif new_lemma != old_lemma:
+            # Forms weren't recomputed (breaker/OpenAI) - the old lemma's forms,
+            # still marked verified, would be quizzed as the new lemma's. Drop
+            # them: no forms is honest, wrong ones are not.
+            note.meta = {
+                key: value
+                for key, value in note.meta.items()
+                if key not in ("principal_forms", "forms_source", "forms_verified")
+            }
         try:
             await session.commit()
         except IntegrityError as error:
