@@ -569,6 +569,7 @@ async def resolve_note_forms(
     missing = set(forms_for_pos(pos)) - covered
 
     forms = dict(result.principal_forms)
+    rejected: dict[str, object] = {}
     if result.ambiguous:
         # Routine, not a degradation: the FST did resolve every form, it just
         # returned several equally-weighted candidates for some of them - the
@@ -582,8 +583,16 @@ async def resolve_note_forms(
         chosen, forms_usage = await resolve_ambiguous_forms(
             client, breaker, model, lemma, pos, result.ambiguous, now
         )
-        forms.update(chosen)
         usage = _add_usage(usage, forms_usage)
+        # The strict enum should make an answer outside the FST candidates
+        # unreachable; if it ever happens, don't persist it - only the
+        # ambiguous forms are read, and a bad one degrades the note.
+        for name, candidates in result.ambiguous.items():
+            value = chosen.get(name)
+            if value in candidates:
+                forms[name] = value
+            else:
+                rejected[name] = value
 
     if missing:
         forms_source, forms_verified = "llm", False
@@ -592,6 +601,16 @@ async def resolve_note_forms(
             lemma,
             pos,
             sorted(missing),
+        )
+    elif rejected:
+        forms_source, forms_verified = "llm", False
+        logger.warning(
+            "event=resolve_note_forms.fallback reason=invalid_choice lemma=%s pos=%s "
+            "rejected=%s chosen=%s",
+            lemma,
+            pos,
+            ",".join(rejected),
+            ",".join(str(value) for value in rejected.values()),
         )
     elif result.ambiguous:
         forms_source, forms_verified = "fst+llm", True

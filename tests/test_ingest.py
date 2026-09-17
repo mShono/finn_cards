@@ -295,6 +295,55 @@ async def test_resolve_note_forms_asks_the_llm_only_for_the_ambiguous_form():
     client.responses.create.assert_called_once()
 
 
+@pytest.mark.parametrize(
+    "llm_payload",
+    [
+        # A value outside the FST enum ("hammasten" is not an FST candidate).
+        {"monikon_genetiivi": "hammasten"},
+        # The ambiguous form is not answered at all.
+        {},
+    ],
+)
+async def test_resolve_note_forms_rejects_an_llm_choice_outside_the_fst_candidates(llm_payload):
+    # Regression, production bug: the strict enum is the only guard on the
+    # LLM's answer, and whatever came back was merged as forms_verified=True.
+    # The FST is real here - only the OpenAI response is faked.
+    client = MagicMock()
+    client.responses.create = AsyncMock(return_value=fake_response(llm_payload))
+
+    resolved, usage = await resolve_note_forms(
+        client, make_breaker(), "gpt-5.6-terra", "hammas", "substantiivi", NOW
+    )
+
+    client.responses.create.assert_called_once()
+    schema = client.responses.create.call_args.kwargs["text"]["format"]["schema"]
+    assert schema["properties"]["monikon_genetiivi"]["enum"] == ["hampaitten", "hampaiden"]
+    assert resolved.forms_verified is False
+    assert resolved.forms_source == "llm"
+    assert resolved.principal_forms["genetiivi"] == "hampaan"
+    assert "monikon_genetiivi" not in resolved.principal_forms
+    assert usage is not None
+
+
+async def test_resolve_note_forms_ignores_an_llm_key_it_was_not_asked_about():
+    # Only the ambiguous forms are the LLM's to answer - an extra key must not
+    # overwrite an unambiguous FST form.
+    client = MagicMock()
+    client.responses.create = AsyncMock(
+        return_value=fake_response({"monikon_genetiivi": "hampaiden", "genetiivi": "hammaksen"})
+    )
+
+    resolved, _usage = await resolve_note_forms(
+        client, make_breaker(), "gpt-5.6-terra", "hammas", "substantiivi", NOW
+    )
+
+    assert resolved.principal_forms["genetiivi"] == "hampaan"
+    assert resolved.principal_forms["monikon_genetiivi"] == "hampaiden"
+    assert "hammaksen" not in resolved.principal_forms.values()
+    assert resolved.forms_source == "fst+llm"
+    assert resolved.forms_verified is True
+
+
 async def test_resolve_note_forms_handles_a_pos_with_no_forms_table():
     # adverbi is a valid note.pos (cards/schema.json), but forms_for_pos()
     # only covers verbi/substantiivi/adjektiivi - must degrade, not crash.
