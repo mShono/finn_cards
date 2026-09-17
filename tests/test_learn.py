@@ -12,6 +12,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from conftest import log_fields
 from sqlalchemy import func, select
 
+from finn_cards.morphology import NOMINAL_FORMS
 from kielikaveri.bot.learn import (
     DECK_ALL_TOKEN,
     LearnStates,
@@ -28,7 +29,17 @@ from kielikaveri.bot.learn import (
 from kielikaveri.config import Settings
 from kielikaveri.db.decks import create_deck
 from kielikaveri.db.engine import create_all, make_engine, make_session_factory
-from kielikaveri.db.models import Card, CardState, CardType, Note, NoteKind, Review, User
+from kielikaveri.db.models import (
+    Card,
+    CardState,
+    CardStatus,
+    CardType,
+    Note,
+    NoteKind,
+    Review,
+    User,
+)
+from kielikaveri.grammar import FORM_TASKS, CurriculumLevel
 from kielikaveri.srs import scheduler as srs_scheduler
 
 NOW = datetime(2026, 8, 24, 10, 0, tzinfo=UTC)
@@ -706,6 +717,154 @@ async def test_learn_debt_choice_batch_starts_a_session_without_deferring_anythi
     messages = [call.args[0] for call in callback.message.answer.call_args_list]
     assert not any("Отложено" in m for m in messages)
     assert await state.get_state() == LearnStates.reviewing
+
+
+# --- deck scoping: debt prompt, defer and curriculum ------------------------
+
+
+async def _seed_overdue_in_two_decks(session_factory, now: datetime, a: int, b: int):
+    """`a` overdue reviews in deck A, `b` in deck B. Deck A's are all due
+    earlier than deck B's, so a defer that ignored the deck would keep A's
+    oldest cards instead of B's."""
+    async with session_factory() as session:
+        session.add(User(id=1))
+        deck_a = await create_deck(session, 1, "Общая")
+        deck_b = await create_deck(session, 1, "Из книги")
+        await session.flush()
+        session.add(make_note("note-a", 1, deck_id=deck_a.id))
+        session.add(make_note("note-b", 1, deck_id=deck_b.id))
+        await session.flush()
+        for i in range(a):
+            session.add(make_card(f"a-{i}", "note-a", 1, due=now - timedelta(days=30 - i), reps=1))
+        for i in range(b):
+            session.add(make_card(f"b-{i}", "note-b", 1, due=now - timedelta(days=10 - i), reps=1))
+        await session.commit()
+    return deck_a.id, deck_b.id
+
+
+async def _choose_deck(session_factory, settings, deck_id: str):
+    state = make_state()
+    await state.set_state(LearnStates.deck_choice)
+    callback = make_callback(f"learn:deck:{deck_id}")
+    await learn_deck_choice(callback, state, session_factory, settings)
+    return state, callback
+
+
+async def test_learn_debt_prompt_ignores_overdue_cards_of_other_decks(session_factory):
+    # _show_next_card measures elapsed time against the real clock.
+    now = datetime.now(UTC)
+    deck_a, deck_b = await _seed_overdue_in_two_decks(session_factory, now, a=5, b=1)
+    settings = make_settings(debt_threshold=3)
+
+    # Deck B owes one review: with A's five counted in, it would cross the
+    # threshold and ask about debt the chosen deck doesn't have.
+    state, callback = await _choose_deck(session_factory, settings, deck_b)
+    assert await state.get_state() == LearnStates.reviewing
+    assert (await state.get_data())["queue"] == ["b-0"]
+    messages = [call.args[0] for call in callback.message.answer.call_args_list]
+    assert not any("Просрочено" in m for m in messages)
+
+    # Deck A's own debt is reported as exactly its own five.
+    state, callback = await _choose_deck(session_factory, settings, deck_a)
+    assert await state.get_state() == LearnStates.debt_choice
+    assert (await state.get_data())["deck_id"] == deck_a
+    prompt = callback.message.answer.call_args.args[0]
+    assert "Просрочено 5 карточек" in prompt
+
+
+async def test_learn_debt_defer_postpones_only_the_chosen_deck(session_factory):
+    now = datetime.now(UTC)
+    _deck_a, deck_b = await _seed_overdue_in_two_decks(session_factory, now, a=5, b=5)
+    settings = make_settings(debt_threshold=3, session_max_cards=2, debt_postpone_days=7)
+
+    state, callback = await _choose_deck(session_factory, settings, deck_b)
+    assert await state.get_state() == LearnStates.debt_choice
+    assert "Просрочено 5 карточек" in callback.message.answer.call_args.args[0]
+
+    # The deck travels to the defer handler through FSM data only.
+    defer = make_callback("learn:debt:defer")
+    await learn_debt_choice(defer, state, session_factory, settings)
+
+    async with session_factory() as session:
+        due_of = {c.id: c.due for c in (await session.scalars(select(Card))).all()}
+    assert all(due_of[f"a-{i}"] <= now for i in range(5))  # deck A untouched
+    assert [i for i in range(5) if due_of[f"b-{i}"] > now] == [2, 3, 4]
+    messages = [call.args[0] for call in defer.message.answer.call_args_list]
+    assert any("Отложено 3" in m for m in messages)
+    assert (await state.get_data())["queue"] == ["b-0", "b-1"]
+
+
+def _noun_with_forms(note_id: str, lemma: str, deck_id: str, created_at: datetime) -> Note:
+    core = [n for n in NOMINAL_FORMS if n in FORM_TASKS]
+    core = [n for n in core if FORM_TASKS[n].level is CurriculumLevel.core]
+    return Note(
+        id=note_id,
+        user_id=1,
+        lemma=lemma,
+        pos="substantiivi",
+        translation_ru="x",
+        example_fi="x",
+        example_ru="x",
+        kind=NoteKind.word,
+        deck_id=deck_id,
+        meta={"forms_verified": True, "principal_forms": {n: f"{lemma}-{n}" for n in core}},
+        created_at=created_at,
+    )
+
+
+async def test_learn_curriculum_opens_forms_only_in_the_chosen_deck(session_factory):
+    now = datetime.now(UTC)
+    async with session_factory() as session:
+        session.add(User(id=1))
+        deck_a = await create_deck(session, 1, "Общая")
+        deck_b = await create_deck(session, 1, "Из книги")
+        await session.flush()
+        # Deck A's note is older, so a curriculum walking every deck would
+        # spend the whole form budget on it before reaching deck B.
+        session.add(_noun_with_forms("note-a", "talo", deck_a.id, now - timedelta(days=20)))
+        session.add(_noun_with_forms("note-b", "kirja", deck_b.id, now - timedelta(days=10)))
+        await session.flush()
+        # Both words already known (two Good answers each) - the only thing
+        # left between them and their forms is the deck and the budget.
+        for note_id in ("note-a", "note-b"):
+            card_id = f"{note_id}-rec"
+            session.add(
+                Card(
+                    id=card_id,
+                    note_id=note_id,
+                    user_id=1,
+                    type=CardType.recognition,
+                    due=now - timedelta(days=1),
+                    reps=2,
+                )
+            )
+            for days in (3, 2):
+                session.add(
+                    Review(
+                        card_id=card_id,
+                        user_id=1,
+                        rating=Rating.Good.value,
+                        reviewed_at=now - timedelta(days=days),
+                    )
+                )
+        await session.commit()
+
+    settings = make_settings(daily_new_forms=2)
+    state, _ = await _choose_deck(session_factory, settings, deck_b.id)
+
+    async with session_factory() as session:
+        forms = (await session.scalars(select(Card).where(Card.type == CardType.inflection))).all()
+    opened = {c.id: c.note_id for c in forms if c.status == CardStatus.introduced}
+    # The real /learn created every note's form cards (sync is not deck-scoped)...
+    assert {c.note_id for c in forms} == {"note-a", "note-b"}
+    # ...but opened only the chosen deck's, and all of today's budget went there.
+    assert sorted(opened.values()) == ["note-b", "note-b"]
+    queue = (await state.get_data())["queue"]
+    async with session_factory() as session:
+        queued_notes = [(await session.get(Card, card_id)).note_id for card_id in queue]
+    assert queue[0] == "note-b-rec"
+    assert sorted(queue[1:]) == sorted(opened)
+    assert set(queued_notes) == {"note-b"}
 
 
 # --- application-level logging ------------------------------------------------

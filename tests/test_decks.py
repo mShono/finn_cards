@@ -24,7 +24,7 @@ from kielikaveri.db.decks import (
     set_active_deck,
 )
 from kielikaveri.db.engine import create_all, make_engine, make_session_factory
-from kielikaveri.db.models import Card, CardType, Note, NoteKind, User
+from kielikaveri.db.models import Card, CardStatus, CardType, Note, NoteKind, User
 
 NOW = datetime(2026, 8, 26, 10, 0, tzinfo=UTC)
 
@@ -280,6 +280,63 @@ async def test_decks_open_puts_each_note_on_an_edit_button_with_its_translation(
     assert edit_buttons[0].text == "✍️ 1. hakea - искать"
     assert "verbi" not in edit_buttons[0].text
     callback.answer.assert_awaited_once()
+
+
+async def test_deck_screens_count_only_their_own_deck_cards(session_factory):
+    # decks_open and decks_list read the clock themselves - due dates are
+    # relative to the real now.
+    past = datetime.now(UTC) - timedelta(days=1)
+    async with session_factory() as session:
+        session.add(User(id=1))
+        deck_a = await create_deck(session, 1, "Общая")
+        deck_b = await create_deck(session, 1, "Из книги")
+        await session.flush()
+        for note_id, deck in (("na", deck_a), ("nb", deck_b)):
+            session.add(
+                Note(
+                    id=note_id,
+                    user_id=1,
+                    lemma=f"sana-{note_id}",
+                    translation_ru="x",
+                    example_fi="x",
+                    example_ru="y",
+                    kind=NoteKind.word,
+                    deck_id=deck.id,
+                    meta={},
+                )
+            )
+        await session.flush()
+        # Deck A: 1 due card. Deck B: 3 due cards and 2 unopened forms.
+        session.add(Card(id="a0", note_id="na", user_id=1, type=CardType.recognition, due=past))
+        for i in range(3):
+            session.add(
+                Card(id=f"b{i}", note_id="nb", user_id=1, type=CardType.recognition, due=past)
+            )
+        for i in range(2):
+            session.add(
+                Card(
+                    id=f"bf{i}",
+                    note_id="nb",
+                    user_id=1,
+                    type=CardType.inflection,
+                    form="genetiivi",
+                    due=past,
+                    status=CardStatus.not_introduced,
+                )
+            )
+        await session.commit()
+
+    callback = make_callback(f"decks:open:{deck_a.id}")
+    await decks_open(callback, session_factory)
+    lines = callback.message.answer.call_args.args[0].splitlines()
+    assert lines[0] == "📂 «Общая» - слов: 1, к повторению: 1"
+    assert lines[1] == "формы: изучается 1, ещё не открыто 0"
+
+    message = make_message()
+    await decks_list(message, session_factory)
+    text = message.answer.call_args.args[0]
+    assert "Общая - слов: 1, к повторению: 1" in text
+    assert "Из книги - слов: 1, к повторению: 3" in text
 
 
 async def _fill_deck(session_factory, deck_id: str, count: int) -> None:
