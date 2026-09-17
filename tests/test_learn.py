@@ -4,12 +4,13 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import fsrs
 import pytest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
 from conftest import log_fields
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from kielikaveri.bot.learn import (
     DECK_ALL_TOKEN,
@@ -27,7 +28,8 @@ from kielikaveri.bot.learn import (
 from kielikaveri.config import Settings
 from kielikaveri.db.decks import create_deck
 from kielikaveri.db.engine import create_all, make_engine, make_session_factory
-from kielikaveri.db.models import Card, CardType, Note, NoteKind, Review, User
+from kielikaveri.db.models import Card, CardState, CardType, Note, NoteKind, Review, User
+from kielikaveri.srs import scheduler as srs_scheduler
 
 NOW = datetime(2026, 8, 24, 10, 0, tzinfo=UTC)
 
@@ -835,3 +837,112 @@ async def test_learn_rate_stale_button_logs_debug_not_a_save(session_factory, ca
     events = [log_fields(r.message) for r in caplog.records]
     assert any(f.get("event") == "learn.rate_stale" for f in events)
     assert not any(f.get("event") == "db.save" for f in events)
+
+
+# --- learn_rate feeds FSRS the card's real review history ---------------------
+
+
+async def test_learn_rate_schedules_off_the_previous_review_not_the_current_one(
+    session_factory, monkeypatch
+):
+    """The end-to-end half of the `last_review` contract (the wrapper's own
+    half lives in test_scheduler.py): the timestamp FSRS schedules from has
+    to come out of the `reviews` rows already in the database, and the row
+    this very answer writes must not be one of them.
+
+    Both halves fail loudly here. Passing no history at all reads as "fully
+    forgotten, yet recalled" and multiplies the interval by orders of
+    magnitude; letting autoflush slip the new row into the max() reads as
+    "answered again a moment later" and shortens it instead - the `bugged`
+    card below is exactly that second outcome, which is why it is asserted
+    against rather than just compared to the correct one.
+
+    Real py-fsrs on both sides, never a mock - a faked scheduler would
+    happily agree with whatever the wrapper did.
+    """
+    # Fuzzing randomizes Review-state intervals, so neither side gets it.
+    monkeypatch.setattr(srs_scheduler._scheduler, "enable_fuzzing", False)
+    reference_scheduler = fsrs.Scheduler(enable_fuzzing=False)
+
+    # A history the learner really could have: first seen 20 days ago, then
+    # answered again at each due date - the last of them long enough ago
+    # that the gap since actually matters to FSRS.
+    started = datetime.now(UTC).replace(microsecond=0) - timedelta(days=20)
+    reference = fsrs.Card(due=started)
+    history: list[datetime] = []
+    when = started
+    for _ in range(3):
+        reference, _ = reference_scheduler.review_card(reference, Rating.Good, when)
+        history.append(when)
+        when = reference.due
+
+    async with session_factory() as session:
+        session.add(User(id=1))
+        session.add(make_note())
+        await session.flush()
+        session.add(
+            Card(
+                id="card-A",
+                note_id="note-1",
+                user_id=1,
+                type=CardType.recognition,
+                state=CardState(reference.state.name.lower()),
+                step=reference.step,
+                stability=reference.stability,
+                difficulty=reference.difficulty,
+                due=reference.due,
+                reps=len(history),
+            )
+        )
+        for reviewed_at in history:
+            session.add(
+                Review(
+                    card_id="card-A", user_id=1, rating=Rating.Good.value, reviewed_at=reviewed_at
+                )
+            )
+        await session.commit()
+
+    async with session_factory() as session:
+        stored = await session.scalar(
+            select(func.max(Review.reviewed_at)).where(Review.card_id == "card-A")
+        )
+    assert stored == history[-1]  # the previous answer really is in the DB
+
+    state = make_state()
+    await state.update_data(
+        queue=["card-A"],
+        reviewed_count=0,
+        session_started_at=datetime.now(UTC).isoformat(),
+        session_max_minutes=10,
+    )
+    await learn_rate(make_callback("learn:rate:card-A:3"), state, session_factory)
+
+    async with session_factory() as session:
+        card = await session.get(Card, "card-A")
+        reviews = (
+            await session.scalars(
+                select(Review).where(Review.card_id == "card-A").order_by(Review.reviewed_at)
+            )
+        ).all()
+
+    assert len(reviews) == len(history) + 1
+    # learn_rate stamps its own `now`; the row it wrote is what it used.
+    now = reviews[-1].reviewed_at
+    expected, _ = reference_scheduler.review_card(reference, Rating.Good, now)
+    answered_a_moment_ago = fsrs.Card(
+        state=reference.state,
+        step=reference.step,
+        stability=reference.stability,
+        difficulty=reference.difficulty,
+        due=reference.due,
+        last_review=now,
+    )
+    bugged, _ = reference_scheduler.review_card(answered_a_moment_ago, Rating.Good, now)
+
+    assert card.state.value == expected.state.name.lower()
+    assert card.step == expected.step
+    assert card.stability == pytest.approx(expected.stability)
+    assert card.difficulty == pytest.approx(expected.difficulty)
+    assert abs(card.due - expected.due) <= timedelta(seconds=1)
+    # Not the shorter interval an autoflushed `max()` would have produced.
+    assert card.stability != pytest.approx(bugged.stability)

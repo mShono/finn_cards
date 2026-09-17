@@ -24,6 +24,7 @@ from aiogram.types import (
     Message,
 )
 from openai import OpenAI
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from kielikaveri.config import Settings
@@ -365,8 +366,17 @@ async def learn_rate(
 
     async with session_factory() as session:
         card = await session.get(Card, card_id)
+        # When this card was last answered - FSRS schedules off the gap since
+        # then. Read *before* the new row below is added to the session:
+        # adding it first would let autoflush include this very answer in the
+        # max(), making last_review == now, and a zero gap reads as a perfect
+        # recall. None here means "never answered", which is what FSRS wants
+        # for a card's first review.
+        last_review = await session.scalar(
+            select(func.max(Review.reviewed_at)).where(Review.card_id == card.id)
+        )
         # Moves every SRS column on the card; the `reviews` row below is ours.
-        apply_review(card, rating, now)
+        apply_review(card, rating, now, last_review)
 
         session.add(
             Review(card_id=card.id, user_id=card.user_id, rating=rating.value, reviewed_at=now)

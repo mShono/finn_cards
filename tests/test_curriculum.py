@@ -2,7 +2,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from finn_cards.morphology import NOMINAL_FORMS
 from kielikaveri.db.engine import create_all, make_engine, make_session_factory
@@ -28,9 +28,9 @@ from kielikaveri.srs.scheduler import Rating, apply_review
 
 NOW = datetime(2026, 9, 10, 9, 0, tzinfo=UTC)
 # When the tests' simulated learner first met a card. Far enough back that
-# two correct answers still leave it due again by NOW: FSRS hands out long
-# intervals very fast (two "Хорошо" in one sitting already buy months),
-# which is exactly why the curriculum stopped depending on them.
+# a card answered correctly a few times is still due again by NOW: the
+# intervals compound quickly once a card leaves the learning steps, and the
+# curriculum deliberately no longer depends on them.
 FIRST_SEEN = NOW - timedelta(days=200)
 
 CORE_NOUN_FORMS = [n for n, t in FORM_TASKS.items() if t.level is CurriculumLevel.core]
@@ -88,7 +88,12 @@ async def answer(
             # seeing it would hand FSRS a near-perfect recall and a wildly
             # long interval, which is not what a learner's history looks like.
             when = at if i == 0 else card.due
-            apply_review(card, rating, when)
+            # Same order as bot/learn.py: the previous answer's timestamp is
+            # read before this answer's row exists, so it can't count itself.
+            last_review = await session.scalar(
+                select(func.max(Review.reviewed_at)).where(Review.card_id == card.id)
+            )
+            apply_review(card, rating, when, last_review)
             session.add(
                 Review(
                     card_id=card.id,
@@ -764,7 +769,13 @@ async def test_session_max_cards_still_caps_the_queue(session_factory):
 
 async def test_rerunning_sync_creates_no_duplicates_and_keeps_introductions(session_factory):
     await seed_three_nouns(session_factory)
-    await learn_word(session_factory, "n0")
+    # Three correct answers, not the two the unlock gate asks for: two
+    # "Good" in one sitting leave stability at ~2.3 days, still under
+    # graduation's 3.0 threshold, so they open no production card. The third
+    # answer, two days later, is what genuinely makes the card worth
+    # producing - and gives this test the one legitimate creation it
+    # distinguishes from a duplicate below.
+    await learn_word(session_factory, "n0", times=3)
     async with session_factory() as session:
         opened = await introduce_due_forms(session, 1, NOW, daily_new_forms=2, boundary_hour=4)
         opened_ids = [c.id for c in opened]

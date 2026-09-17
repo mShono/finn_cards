@@ -46,13 +46,24 @@ class SrsState:
     step: int | None = None
 
 
-def review(current: SrsState, rating: Rating, now: datetime) -> SrsState:
+def review(
+    current: SrsState, rating: Rating, now: datetime, last_review: datetime | None = None
+) -> SrsState:
     """Apply one review to `current`, returning the resulting SRS state.
 
     `reps`/`lapses` aren't fields py-fsrs tracks on its own Card - we count
     them ourselves: reps increments on every review, lapses increments only
     when a card that was in State.review (i.e. already learned) gets
     demoted out of it - the FSRS definition of "forgetting" a card.
+
+    `last_review` is when this card was answered the time before - the
+    caller's `reviews` row for it, None if there is none yet. FSRS needs it
+    to know how much was forgotten since: without it, retrievability reads
+    as 0 ("fully forgotten, yet recalled"), which inflates stability by
+    orders of magnitude from the second answer on - two "Good" in one
+    sitting bought 143 days instead of 2. We don't store it on the card
+    itself: `reviews` already holds every answer, so a column here would be
+    a second copy of the same fact.
     """
     was_review = current.state == CardState.review
 
@@ -62,7 +73,7 @@ def review(current: SrsState, rating: Rating, now: datetime) -> SrsState:
         stability=current.stability,
         difficulty=current.difficulty,
         due=current.due,
-        last_review=None,
+        last_review=last_review,
     )
     updated, _log = _scheduler.review_card(fsrs_card, rating, now)
 
@@ -80,7 +91,9 @@ def review(current: SrsState, rating: Rating, now: datetime) -> SrsState:
     )
 
 
-def apply_review(card: Card, rating: Rating, now: datetime) -> None:
+def apply_review(
+    card: Card, rating: Rating, now: datetime, last_review: datetime | None = None
+) -> None:
     """Apply one review to `card`'s SRS columns, in place.
 
     The Card <-> SrsState mapping lives here, not at the call sites, because
@@ -90,7 +103,9 @@ def apply_review(card: Card, rating: Rating, now: datetime) -> None:
     learning phase on the next review.
 
     Still no DB access - this only assigns attributes on an ORM instance.
-    Writing the `reviews` row and committing stay with the caller.
+    Reading `last_review` out of `reviews`, writing the new row there and
+    committing all stay with the caller, which is the half that holds a
+    session (see bot/learn.py's rating handler).
     """
     updated = review(
         SrsState(
@@ -104,6 +119,7 @@ def apply_review(card: Card, rating: Rating, now: datetime) -> None:
         ),
         rating,
         now,
+        last_review,
     )
     card.state = updated.state
     card.due = updated.due
