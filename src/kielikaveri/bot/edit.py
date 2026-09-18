@@ -29,6 +29,7 @@ from kielikaveri.db.models import Note, NoteKind, is_note_duplicate_error
 from kielikaveri.ingest import canonical_key, resolve_note_forms
 from kielikaveri.llm.breaker import CallBreaker, CircuitOpenError
 from kielikaveri.llm.client import make_client
+from kielikaveri.srs.graduation import resync_inflection_cards
 
 logger = logging.getLogger(__name__)
 
@@ -248,6 +249,14 @@ async def _apply_lemma_edit(
                 if key not in ("principal_forms", "forms_source", "forms_verified")
             }
         try:
+            # The form set above can be another one than the cards on this
+            # note were built from - a different lemma, a different POS, or
+            # none at all when the recompute failed. Inside the try, and
+            # before the commit, on purpose: the SELECT it starts flushes the
+            # lemma written above, so a lost duplicate race still surfaces as
+            # the IntegrityError below, and its rollback then takes the card
+            # changes with it.
+            deleted, created = await resync_inflection_cards(session, note, datetime.now(UTC))
             await session.commit()
         except IntegrityError as error:
             # The clash lookup above said this lemma was free, but a
@@ -263,10 +272,13 @@ async def _apply_lemma_edit(
             return
 
     logger.info(
-        "event=edit.save note_id=%s field=lemma old=%r new=%r forms_source=%s",
+        "event=edit.save note_id=%s field=lemma old=%r new=%r forms_source=%s "
+        "cards_deleted=%d cards_created=%d",
         note_id,
         old_lemma,
         new_lemma,
         resolved.forms_source if resolved is not None else "unchanged",
+        len(deleted),
+        len(created),
     )
     await message.answer(f"Слово: «{old_lemma}» → «{new_lemma}».")

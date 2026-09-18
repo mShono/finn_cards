@@ -15,10 +15,10 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from kielikaveri.db.models import Card, CardStatus, CardType, Note
+from kielikaveri.db.models import Card, CardStatus, CardType, Note, Review
 from kielikaveri.grammar import FORM_TASKS
 
 PRODUCTION_STABILITY_THRESHOLD_DAYS = 3.0
@@ -148,6 +148,56 @@ def _ensure_inflection_cards(
         covered.add(name)
 
     return created
+
+
+async def resync_inflection_cards(
+    session: AsyncSession, note: Note, now: datetime
+) -> tuple[list[str], list[Card]]:
+    """Match the note's inflection cards to the principal forms it has *now*.
+
+    ensure_card_types only ever adds, which is right while a note's forms
+    only ever get filled in. /edit breaks that assumption: a new lemma - or
+    a lemma whose part of speech turned out to be another one
+    (ingest.resolve_note_pos) - rewrites meta.principal_forms wholesale, and
+    the cards keyed by the forms that are gone quiz nothing the note still
+    has. learn.render_card falls back to (lemma, lemma) for them, so they
+    are unanswerable, yet they keep their place in the queue, spend the
+    daily form budget and hold up the curriculum's level gate.
+
+    So they are deleted, with their reviews - and their reviews especially:
+    queue.count_new_cards_today counts rows in `reviews` without joining
+    `cards` (no ON DELETE CASCADE anywhere, see bot/add.py's delete_confirm),
+    so leaving them behind would keep a deleted card eating today's new-card
+    budget. Creation stays where it was: _ensure_inflection_cards, under the
+    same forms_verified gate ensure_card_types applies.
+
+    FSRS history is deliberately not carried over to the new forms - a
+    card's stability describes the form it was rated on, not the slot it sat
+    in. A form the note still has keeps its own card untouched, so the
+    everyday lemma fix (puhua -> hakea: same POS, same form keys) changes
+    nothing at all.
+
+    Returns (deleted card ids, created cards). Does not commit.
+    """
+    existing = (
+        await session.scalars(
+            select(Card).where(Card.note_id == note.id, Card.type == CardType.inflection)
+        )
+    ).all()
+    forms: dict = note.meta.get("principal_forms") or {}
+    # form is None only on the legacy form-less cards _ensure_inflection_cards
+    # adopts into a form below - they are tied to no form key, so no rewrite
+    # of the form set can strand them.
+    stale = [card for card in existing if card.form is not None and card.form not in forms]
+    stale_ids = [card.id for card in stale]
+    if stale_ids:
+        await session.execute(delete(Review).where(Review.card_id.in_(stale_ids)))
+        await session.execute(delete(Card).where(Card.id.in_(stale_ids)))
+
+    if note.meta.get("forms_verified") is not True:
+        return stale_ids, []
+    kept = [card for card in existing if card.form is None or card.form in forms]
+    return stale_ids, _ensure_inflection_cards(session, note, kept, now)
 
 
 async def sync_user_card_types(session: AsyncSession, user_id: int, now: datetime) -> list[Card]:
