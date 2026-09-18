@@ -1,12 +1,12 @@
-"""The /decks command: create decks, pick which one new notes go to, and
-drill into one to see and edit its cards.
+"""The /decks command: create decks and drill into one to see and edit
+its cards.
 
 Decks are manual and user-named on purpose (plan: chose this over an
 automatic new-vs-mature split - the learner decides what's grouped with
-what). This module manages the deck list, the "active" one /add saves into,
-and the per-deck card list; editing a card itself lives in bot/edit.py -
-this module only links to it via the noteedit: callback. /learn's own deck
-picker lives in bot/learn.py.
+what). This module manages the deck list and the per-deck card list;
+editing a card itself lives in bot/edit.py - this module only links to it
+via the noteedit: callback. Which deck a save goes to is asked per batch in
+bot/add.py, and /learn's own deck picker lives in bot/learn.py.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from kielikaveri.db.decks import active_deck, create_deck, list_decks, set_active_deck
+from kielikaveri.db.decks import create_deck, get_or_create_default_deck, list_decks
 from kielikaveri.db.models import Deck, Note
 from kielikaveri.srs.queue import card_counters
 
@@ -74,15 +74,11 @@ def _note_button_text(index: int, note: Note) -> str:
     return f"{label} - {translation}" if translation else label
 
 
-def _decks_keyboard(decks: list[Deck], current_id: str) -> InlineKeyboardMarkup:
-    rows = []
-    for deck in decks:
-        row = [InlineKeyboardButton(text="📂 " + deck.name, callback_data=f"decks:open:{deck.id}")]
-        if deck.id != current_id:
-            row.append(
-                InlineKeyboardButton(text="✅ выбрать", callback_data=f"decks:activate:{deck.id}")
-            )
-        rows.append(row)
+def _decks_keyboard(decks: list[Deck]) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="📂 " + deck.name, callback_data=f"decks:open:{deck.id}")]
+        for deck in decks
+    ]
     rows.append([InlineKeyboardButton(text="➕ Новая колода", callback_data="decks:new")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -91,11 +87,10 @@ async def _decks_list_text_and_keyboard(
     session_factory: async_sessionmaker[AsyncSession], user_id: int, now: datetime
 ) -> tuple[str, InlineKeyboardMarkup]:
     async with session_factory() as session:
-        # active_deck() first - it may create a default deck, and list_decks()
-        # must see it (a fresh user with zero decks would otherwise get an
-        # empty "Колод пока нет." list while the trailing line below still
-        # names a deck that isn't shown anywhere).
-        current = await active_deck(session, user_id)
+        # Default deck first - it may get created here, and list_decks() must
+        # see it (a fresh user with zero decks would otherwise get an empty
+        # "Колод пока нет." list).
+        await get_or_create_default_deck(session, user_id)
         await session.commit()
         decks = await list_decks(session, user_id)
 
@@ -105,12 +100,10 @@ async def _decks_list_text_and_keyboard(
                 select(func.count()).select_from(Note).where(Note.deck_id == deck.id)
             )
             counters = await card_counters(session, user_id, now, deck_id=deck.id)
-            marker = "📌 " if deck.id == current.id else "• "
-            lines.append(f"{marker}{deck.name} - слов: {notes_count}, к повторению: {counters.due}")
+            lines.append(f"• {deck.name} - слов: {notes_count}, к повторению: {counters.due}")
 
     text = "Твои колоды:\n" + "\n".join(lines) if lines else "Колод пока нет."
-    text += f"\n\nСейчас новое сохраняется в «{current.name}» - нажми 📂, чтобы открыть колоду."
-    return text, _decks_keyboard(decks, current.id)
+    return text, _decks_keyboard(decks)
 
 
 @router.message(Command("decks"))
@@ -201,19 +194,6 @@ async def decks_open(
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("decks:activate:"))
-async def decks_activate(
-    callback: CallbackQuery, session_factory: async_sessionmaker[AsyncSession]
-) -> None:
-    deck_id = callback.data.split(":", 2)[2]
-    user_id = callback.from_user.id
-    async with session_factory() as session:
-        await set_active_deck(session, user_id, deck_id)
-        await session.commit()
-    logger.info("event=decks.activate deck_id=%s", deck_id)
-    await callback.answer("Готово - новое пойдёт сюда.")
-
-
 @router.callback_query(F.data == "decks:new")
 async def decks_new_prompt(callback: CallbackQuery, state: FSMContext) -> None:
     logger.debug("event=decks.new_prompt")
@@ -234,9 +214,8 @@ async def decks_new_save(
     user_id = message.from_user.id
     async with session_factory() as session:
         deck = await create_deck(session, user_id, name)
-        await set_active_deck(session, user_id, deck.id)
         await session.commit()
 
     logger.info("event=decks.create deck_id=%s name=%r", deck.id, deck.name)
     await state.clear()
-    await message.answer(f"Колода «{deck.name}» создана и стала активной - новое пойдёт туда.")
+    await message.answer(f"Колода «{deck.name}» создана.")

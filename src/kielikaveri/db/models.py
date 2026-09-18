@@ -104,15 +104,6 @@ class User(Base):
     # table still carries user_id so multi-user is a non-event later.
     id: Mapped[int] = mapped_column(primary_key=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=lambda: datetime.now(UTC))
-    # The deck new notes are filed into by default - see db/decks.py's
-    # active_deck(). None until the user's first save picks (and thereby
-    # creates) one. Deliberately a plain column, not ForeignKey("decks.id") -
-    # decks.user_id already points at users.id, and a FK back the other way
-    # makes the two tables mutually dependent (SQLAlchemy can't topologically
-    # sort them for create_all/migrations - confirmed by a SAWarning during
-    # `alembic revision --autogenerate`). SQLite doesn't enforce FKs in this
-    # setup anyway (see db/decks.py's set_active_deck comment).
-    last_deck_id: Mapped[str | None] = mapped_column(String, nullable=True)
 
 
 class Deck(Base):
@@ -164,7 +155,7 @@ class Note(Base):
     kind: Mapped[NoteKind] = mapped_column(Enum(NoteKind, native_enum=False))
     # Nullable at the DB level only for old rows predating decks (backfilled
     # to a "Общая" deck by the migration that added this column) - app code
-    # always resolves one via db.decks.active_deck() before insert.
+    # always resolves one (the deck picked for the batch) before insert.
     deck_id: Mapped[str | None] = mapped_column(ForeignKey("decks.id"), nullable=True)
     meta: Mapped[dict] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=lambda: datetime.now(UTC))

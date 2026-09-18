@@ -41,9 +41,9 @@ from kielikaveri.bot.edit import router as edit_router
 from kielikaveri.bot.handlers import router as core_router
 from kielikaveri.bot.learn import router as learn_router
 from kielikaveri.config import Settings
-from kielikaveri.db.decks import active_deck, create_deck, set_active_deck
+from kielikaveri.db.decks import create_deck, get_or_create_default_deck
 from kielikaveri.db.engine import create_all, make_engine, make_session_factory
-from kielikaveri.db.models import Card, Deck, IngestCache, Note, Review, User
+from kielikaveri.db.models import Card, Deck, IngestCache, Note, Review
 from kielikaveri.ingest import ResolvedForms, TokenUsage
 from kielikaveri.llm.breaker import CallBreaker, CircuitOpenError
 
@@ -382,9 +382,8 @@ async def test_add_deck_choice_saves_into_the_picked_deck_and_reports_the_new_co
 ):
     patch_resolve_note_forms(monkeypatch)
     async with session_factory() as session:
-        deck_a = await create_deck(session, 1, "Общая")
+        await create_deck(session, 1, "Общая")
         deck_b = await create_deck(session, 1, "Из книги")
-        await set_active_deck(session, 1, deck_a.id)
         await session.commit()
 
     state = make_state()
@@ -396,9 +395,7 @@ async def test_add_deck_choice_saves_into_the_picked_deck_and_reports_the_new_co
 
     async with session_factory() as session:
         note = (await session.scalars(select(Note))).one()
-        user = await session.get(User, 1)
     assert note.deck_id == deck_b.id
-    assert user.last_deck_id == deck_b.id
     report = callback.message.answer.call_args.args[0]
     assert "Из книги" in report
     assert "1 слов" in report
@@ -659,10 +656,8 @@ async def test_add_new_deck_save_creates_the_deck_and_saves_into_it(session_fact
 
     async with session_factory() as session:
         note = (await session.scalars(select(Note))).one()
-        user = await session.get(User, 1)
         deck = await session.get(Deck, note.deck_id)
     assert deck.name == "Из книги"
-    assert user.last_deck_id == deck.id
     report = message.answer.call_args_list[-1].args[0]
     assert "1 слов" in report
     assert await state.get_state() is None
@@ -801,10 +796,8 @@ async def test_new_deck_name_is_routed_to_add_new_deck_save_not_to_chat(
     async with session_factory() as session:
         deck = (await session.scalars(select(Deck).where(Deck.name == "Из книги"))).one()
         note = (await session.scalars(select(Note).where(Note.lemma == "hakea"))).one()
-        user = await session.get(User, 1)
     assert deck.user_id == 1
     assert note.deck_id == deck.id
-    assert user.last_deck_id == deck.id
 
     assert await dp.storage.get_state(key) is None
     assert await dp.storage.get_data(key) == {}
@@ -814,7 +807,7 @@ async def test_new_deck_name_is_routed_to_add_new_deck_save_not_to_chat(
         for method in telegram.sent[sent_before_name:]
         if isinstance(method, SendMessage)
     ]
-    assert replies[0] == "Колода «Из книги» создана и стала активной."
+    assert replies[0] == "Колода «Из книги» создана."
     assert "Уточни, что сделать с текстом?" not in replies
 
 
@@ -837,7 +830,7 @@ async def test_chat_reports_a_failed_candidate_without_blocking_the_others(
 
     data = await state.get_data()
     async with session_factory() as session:
-        deck_id = (await active_deck(session, 1)).id
+        deck_id = (await get_or_create_default_deck(session, 1)).id
     callback = make_callback(f"adddeck:{data['batch_id']}:{deck_id}")
     await add_deck_choice(callback, state, session_factory, make_settings(), make_breaker())
 
@@ -855,11 +848,12 @@ async def test_chat_reports_an_honest_error_instead_of_dying_silently(session_fa
     # saw a confirmation-sounding reply and then nothing, with no way to
     # tell whether anything was saved. Dedup itself moved to
     # _save_candidates_and_report (03.09.2026, per-deck dedup) so it's no
-    # longer in this try block - active_deck() stands in as "something in
-    # here can still fail" instead.
+    # longer in this try block - get_or_create_default_deck() stands in as
+    # "something in here can still fail" instead.
     patch_check_and_suggest(monkeypatch, "Добавляю.", [WORD_CANDIDATE])
     monkeypatch.setattr(
-        "kielikaveri.bot.add.active_deck", AsyncMock(side_effect=RuntimeError("db exploded"))
+        "kielikaveri.bot.add.get_or_create_default_deck",
+        AsyncMock(side_effect=RuntimeError("db exploded")),
     )
     message = make_message("добавь hakea")
 
@@ -1072,7 +1066,6 @@ async def test_add_save_logs_event_with_saved_and_duplicate_counts(
     patch_resolve_note_forms(monkeypatch)
     async with session_factory() as session:
         deck = await create_deck(session, 1, "Общая")
-        await set_active_deck(session, 1, deck.id)
         await session.commit()
 
     state = make_state()
@@ -1125,7 +1118,7 @@ async def test_chat_saves_tuli_as_a_noun_with_real_grammar_forms(session_factory
 
     data = await state.get_data()
     async with session_factory() as session:
-        deck_id = (await active_deck(session, 1)).id
+        deck_id = (await get_or_create_default_deck(session, 1)).id
     callback = make_callback(f"adddeck:{data['batch_id']}:{deck_id}")
     await add_deck_choice(callback, state, session_factory, make_settings(), make_breaker())
 
@@ -1163,7 +1156,7 @@ async def test_chat_dedups_against_the_corrected_pos(session_factory, monkeypatc
         )
         data = await state.get_data()
         async with session_factory() as session:
-            deck_id = (await active_deck(session, 1)).id
+            deck_id = (await get_or_create_default_deck(session, 1)).id
         callback = make_callback(f"adddeck:{data['batch_id']}:{deck_id}")
         await add_deck_choice(callback, state, session_factory, make_settings(), make_breaker())
         return callback

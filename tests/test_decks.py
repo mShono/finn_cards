@@ -11,18 +11,11 @@ from aiogram.types import InlineKeyboardButton
 from kielikaveri.bot.decks import (
     NOTES_PER_PAGE,
     DeckStates,
-    decks_activate,
     decks_list,
     decks_new_save,
     decks_open,
 )
-from kielikaveri.db.decks import (
-    active_deck,
-    create_deck,
-    get_or_create_default_deck,
-    list_decks,
-    set_active_deck,
-)
+from kielikaveri.db.decks import create_deck, get_or_create_default_deck, list_decks
 from kielikaveri.db.engine import create_all, make_engine, make_session_factory
 from kielikaveri.db.models import Card, CardStatus, CardType, Note, NoteKind, User
 
@@ -79,56 +72,10 @@ async def test_get_or_create_default_deck_returns_the_existing_first_deck(sessio
     assert again.id == first_id
 
 
-async def test_active_deck_falls_back_to_default_when_no_user_row_exists(session_factory):
-    # The live bot has no guaranteed `users` row for a Telegram user (see
-    # db/decks.py's set_active_deck comment) - active_deck must not crash.
-    async with session_factory() as session:
-        deck = await active_deck(session, 1)
-        await session.commit()
-    assert deck.name == "Общая"
-
-
-async def test_set_active_deck_creates_a_missing_user_row(session_factory):
-    async with session_factory() as session:
-        deck = await create_deck(session, 1, "Из текста")
-        await set_active_deck(session, 1, deck.id)
-        await session.commit()
-
-    async with session_factory() as session:
-        current = await active_deck(session, 1)
-        user = await session.get(User, 1)
-    assert current.id == deck.id
-    assert user is not None
-
-
-async def test_active_deck_prefers_the_last_picked_deck_over_the_first(session_factory):
-    async with session_factory() as session:
-        deck_a = await create_deck(session, 1, "Общая")
-        deck_b = await create_deck(session, 1, "Из книги")
-        await set_active_deck(session, 1, deck_b.id)
-        await session.commit()
-
-    async with session_factory() as session:
-        current = await active_deck(session, 1)
-    assert current.id == deck_b.id
-    assert current.id != deck_a.id
-
-
-async def test_active_deck_ignores_a_deleted_last_deck_id(session_factory):
-    async with session_factory() as session:
-        deck_a = await create_deck(session, 1, "Общая")
-        session.add(User(id=1, last_deck_id="does-not-exist"))
-        await session.commit()
-
-    async with session_factory() as session:
-        current = await active_deck(session, 1)
-    assert current.id == deck_a.id
-
-
 # --- bot.decks -------------------------------------------------------------------
 
 
-async def test_decks_list_marks_the_active_deck_and_reports_counts(session_factory):
+async def test_decks_list_names_every_deck_and_reports_counts(session_factory):
     async with session_factory() as session:
         session.add(User(id=1))
         deck = await create_deck(session, 1, "Общая")
@@ -168,9 +115,9 @@ async def test_decks_list_marks_the_active_deck_and_reports_counts(session_facto
 
 
 async def test_decks_list_shows_the_default_deck_it_just_created_for_a_fresh_user(session_factory):
-    # Regression: active_deck() can create a "Общая" deck as a side effect -
-    # decks_list must show that same deck, not the empty list_decks() result
-    # from before the creation.
+    # Regression: get_or_create_default_deck() can create a "Общая" deck as a
+    # side effect - decks_list must show that same deck, not the empty
+    # list_decks() result from before the creation.
     message = make_message()
 
     await decks_list(message, session_factory)
@@ -184,7 +131,7 @@ async def test_decks_list_shows_the_default_deck_it_just_created_for_a_fresh_use
     assert any("Новая колода" in b.text for b in buttons)
 
 
-async def test_decks_new_save_creates_a_deck_and_makes_it_active(session_factory):
+async def test_decks_new_save_creates_the_deck(session_factory):
     state = make_state()
     await state.set_state(DeckStates.naming)
     message = make_message("Из книги")
@@ -193,9 +140,7 @@ async def test_decks_new_save_creates_a_deck_and_makes_it_active(session_factory
 
     async with session_factory() as session:
         decks = await list_decks(session, 1)
-        current = await active_deck(session, 1)
     assert [d.name for d in decks] == ["Из книги"]
-    assert current.name == "Из книги"
     assert await state.get_state() is None
     assert "Из книги" in message.answer.call_args.args[0]
 
@@ -213,22 +158,7 @@ async def test_decks_new_save_reprompts_on_empty_name(session_factory):
     assert await state.get_state() == DeckStates.naming
 
 
-async def test_decks_activate_switches_the_active_deck(session_factory):
-    async with session_factory() as session:
-        await create_deck(session, 1, "Общая")
-        deck_b = await create_deck(session, 1, "Из книги")
-        await session.commit()
-
-    callback = make_callback(f"decks:activate:{deck_b.id}")
-    await decks_activate(callback, session_factory)
-
-    async with session_factory() as session:
-        current = await active_deck(session, 1)
-    assert current.id == deck_b.id
-    callback.answer.assert_awaited_once()
-
-
-async def test_decks_keyboard_offers_open_and_activate_for_every_deck(session_factory):
+async def test_decks_keyboard_offers_exactly_one_open_button_per_deck(session_factory):
     async with session_factory() as session:
         await create_deck(session, 1, "Общая")
         await create_deck(session, 1, "Из книги")
@@ -238,12 +168,11 @@ async def test_decks_keyboard_offers_open_and_activate_for_every_deck(session_fa
     await decks_list(message, session_factory)
 
     rows = message.answer.call_args.kwargs["reply_markup"].inline_keyboard
-    open_labels = {b.text for row in rows for b in row if b.callback_data.startswith("decks:open:")}
-    activate_rows = [row for row in rows if any("decks:activate:" in b.callback_data for b in row)]
-    assert open_labels == {"📂 Общая", "📂 Из книги"}
-    # The active deck ("Общая", created first) has no activate button - only
-    # the non-active one does.
-    assert len(activate_rows) == 1
+    open_labels = [b.text for row in rows for b in row if b.callback_data.startswith("decks:open:")]
+    assert open_labels == ["📂 Общая", "📂 Из книги"]
+    # Every deck row is a single button - picking a deck happens per save,
+    # so there is nothing to "select" here.
+    assert all(len(row) == 1 for row in rows)
 
 
 async def test_decks_open_puts_each_note_on_an_edit_button_with_its_translation(session_factory):
