@@ -405,6 +405,25 @@ async def test_add_deck_choice_saves_into_the_picked_deck_and_reports_the_new_co
     assert await state.get_state() is None
 
 
+async def test_add_deck_choice_acknowledges_the_tap_before_the_report(session_factory, monkeypatch):
+    patch_resolve_note_forms(monkeypatch)
+    async with session_factory() as session:
+        deck = await create_deck(session, 1, "Общая")
+        await session.commit()
+
+    state = make_state()
+    await state.set_state(AddStates.choosing_deck)
+    await state.update_data(batch_id="batch-1", candidates=[WORD_CANDIDATE])
+    callback = make_callback(f"adddeck:batch-1:{deck.id}")
+
+    await add_deck_choice(callback, state, session_factory, make_settings(), make_breaker())
+
+    # First reply lands right after the tap, the slow report comes after it.
+    sent = [call.args[0] for call in callback.message.answer.call_args_list]
+    assert sent[0] == "Добавляю..."
+    assert len(sent) > 1
+
+
 async def test_add_deck_choice_drops_a_duplicate_already_in_the_target_deck(
     session_factory, monkeypatch
 ):

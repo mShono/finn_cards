@@ -425,6 +425,10 @@ async def add_deck_choice(
     await state.clear()
     await callback.answer()
 
+    # Saving + card generation takes seconds - acknowledge the tap first so
+    # the picker doesn't look frozen while it runs.
+    await callback.message.answer("Добавляю...")
+
     await _save_candidates_and_report(
         callback.message,
         session_factory,
