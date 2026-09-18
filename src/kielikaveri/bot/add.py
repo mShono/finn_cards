@@ -42,7 +42,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from kielikaveri.bot.decks import NEW_DECK_PROMPT
 from kielikaveri.bot.text import split_message
 from kielikaveri.config import Settings
-from kielikaveri.db.decks import active_deck, create_deck, list_decks, set_active_deck
+from kielikaveri.db.decks import create_deck, get_or_create_default_deck, list_decks
 from kielikaveri.db.models import (
     Card,
     Deck,
@@ -220,12 +220,11 @@ async def add_new_deck_save(
 
     async with session_factory() as session:
         deck = await create_deck(session, user_id, name)
-        await set_active_deck(session, user_id, deck.id)
         await session.commit()
         deck_id = deck.id
 
     await state.clear()
-    await message.answer(f"Колода «{deck.name}» создана и стала активной.")
+    await message.answer(f"Колода «{deck.name}» создана.")
     await _save_candidates_and_report(
         message, session_factory, settings, breaker, user_id, deck_id, candidates
     )
@@ -355,10 +354,10 @@ async def _handle_chat_turn(
         # you're adding to (plan: per-deck dedup, requested 03.09.2026, was
         # global-per-user before). Nothing to filter on yet at this point.
         async with session_factory() as session:
-            # active_deck() first - guarantees at least one deck (creating the
-            # default "Общая" for a brand new user) before the picker below is
-            # built, so it's never shown empty.
-            await active_deck(session, user_id)
+            # Default deck first - guarantees at least one deck (creating the
+            # "Общая" for a brand new user) before the picker below is built,
+            # so it's never shown empty.
+            await get_or_create_default_deck(session, user_id)
             await session.commit()
             decks = await list_decks(session, user_id)
 
@@ -616,11 +615,9 @@ async def _save_candidates_and_report(
     lines = [f"🇫🇮 {lemma} → {translation}" for lemma, translation in saved]
     if saved:
         async with session_factory() as session:
-            await set_active_deck(session, user_id, deck_id)
             count = await session.scalar(
                 select(func.count()).select_from(Note).where(Note.deck_id == deck_id)
             )
-            await session.commit()
         lines.append(f"\nКолода «{deck_name}»: теперь {count} слов.")
     if duplicate_lemmas:
         lines.append(f"Уже есть в «{deck_name}», не дублирую: {', '.join(duplicate_lemmas)}.")
