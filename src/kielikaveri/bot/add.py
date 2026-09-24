@@ -40,6 +40,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from kielikaveri.bot.decks import NEW_DECK_PROMPT
+from kielikaveri.bot.edit import CANCEL_WORDS
 from kielikaveri.bot.text import split_message
 from kielikaveri.config import Settings
 from kielikaveri.db.decks import create_deck, get_or_create_default_deck, list_decks
@@ -212,6 +213,12 @@ async def add_new_deck_save(
     name = (message.text or "").strip()
     if not name:
         await message.answer(NEW_DECK_PROMPT)
+        return
+    # Same cancel words as a card edit - they used to become a deck's name
+    if name.lower() in CANCEL_WORDS:
+        logger.debug("event=add.new_deck_cancelled")
+        await state.clear()
+        await message.answer("Отменено, слова не сохранила.")
         return
 
     data = await state.get_data()

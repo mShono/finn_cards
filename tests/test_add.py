@@ -15,7 +15,7 @@ from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.methods import SendMessage
 from aiogram.types import CallbackQuery as TgCallbackQuery
-from aiogram.types import Chat, Update
+from aiogram.types import Chat, InlineKeyboardMarkup, Update
 from aiogram.types import Message as TgMessage
 from aiogram.types import User as TgUser
 from conftest import log_fields
@@ -34,12 +34,8 @@ from kielikaveri.bot.add import (
     delete_command,
     delete_confirm,
 )
-from kielikaveri.bot.add import router as add_router
 from kielikaveri.bot.decks import NEW_DECK_PROMPT
-from kielikaveri.bot.decks import router as decks_router
-from kielikaveri.bot.edit import router as edit_router
-from kielikaveri.bot.handlers import router as core_router
-from kielikaveri.bot.learn import router as learn_router
+from kielikaveri.bot.main import build_dispatcher
 from kielikaveri.config import Settings
 from kielikaveri.db.decks import create_deck, get_or_create_default_deck
 from kielikaveri.db.engine import create_all, make_engine, make_session_factory
@@ -693,7 +689,11 @@ class RecordingSession(BaseSession):
                 date=datetime.now(UTC),
                 chat=Chat(id=1, type="private"),
                 text=method.text,
-                reply_markup=method.reply_markup,
+                # A received Message only ever carries an inline keyboard -
+                # /start's reply keyboard isn't echoed back by Telegram either.
+                reply_markup=method.reply_markup
+                if isinstance(method.reply_markup, InlineKeyboardMarkup)
+                else None,
             )
         return True
 
@@ -706,12 +706,9 @@ class RecordingSession(BaseSession):
 
 @functools.cache
 def routed_dispatcher() -> Dispatcher:
-    # Same router order as bot/main.py's run(). Built once per process: the
-    # routers are module-level and aiogram refuses to attach one twice.
-    dp = Dispatcher()
-    for module_router in (core_router, learn_router, decks_router, edit_router, add_router):
-        dp.include_router(module_router)
-    return dp
+    # bot/main.py's own build_dispatcher - same middlewares, same router
+    # order. Built once per process: aiogram refuses to attach a router twice.
+    return build_dispatcher({1})
 
 
 def tg_user() -> TgUser:

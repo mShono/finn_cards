@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from aiogram import Router
 from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
 from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
 
 router = Router(name="core")
@@ -20,7 +21,9 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
 
 
 @router.message(Command("start"))
-async def start(message: Message) -> None:
+async def start(message: Message, state: FSMContext) -> None:
+    # A fresh start - whatever the bot was waiting for is dropped
+    await state.clear()
     await message.answer(
         "Привет! Kielikaveri на связи - бот для практики финского.\n"
         "Кнопки внизу - учить, добавлять слова, колоды. "
