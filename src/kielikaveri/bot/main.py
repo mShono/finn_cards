@@ -6,7 +6,7 @@ from datetime import timedelta
 from aiogram import Bot, Dispatcher
 from aiogram.types import BotCommand
 
-from kielikaveri.bot.add import AddStates
+from kielikaveri.bot.add import WORDS_NOT_SAVED_TEXT, AddStates
 from kielikaveri.bot.add import router as add_router
 from kielikaveri.bot.decks import DeckStates
 from kielikaveri.bot.decks import router as decks_router
@@ -17,7 +17,9 @@ from kielikaveri.bot.learn import router as learn_router
 from kielikaveri.bot.middleware import (
     InputEscapeMiddleware,
     RequestLoggingMiddleware,
+    UnsavedWordsMiddleware,
     WhitelistMiddleware,
+    is_navigation,
 )
 from kielikaveri.config import Settings, load_settings
 from kielikaveri.db.engine import make_engine, make_session_factory
@@ -43,6 +45,23 @@ INPUT_STATES = {
     DeckStates.naming.state,
 }
 MENU_TEXTS = {button.text for row in MAIN_KEYBOARD.keyboard for button in row}
+# The deck picker itself survives browsing (🗂 Колоды, /help) - its buttons
+# still work after. Only these overwrite its state and kill it.
+PICKER_BREAKERS = {"/learn", "/start", "📚 Учить"}
+
+
+def drops_unsaved_words(raw_state: str | None, text: str) -> bool:
+    """Whether this message ends a deck pick without saving its words."""
+    if raw_state == AddStates.naming_new_deck.state:
+        # InputEscapeMiddleware drops the naming on any navigation
+        return is_navigation(text, MENU_TEXTS, CANCEL_WORDS)
+    if raw_state == AddStates.choosing_deck.state:
+        if text in PICKER_BREAKERS:
+            return True
+        # "/learn@bot args" -> "/learn"
+        command = text.split(maxsplit=1)[0].split("@")[0] if text.startswith("/") else ""
+        return command in PICKER_BREAKERS
+    return False
 
 
 def build_dispatcher(whitelist: set[int]) -> Dispatcher:
@@ -58,6 +77,8 @@ def build_dispatcher(whitelist: set[int]) -> Dispatcher:
     # log request_completed for updates the whitelist check blocks too.
     dp.update.outer_middleware(RequestLoggingMiddleware())
     dp.update.outer_middleware(WhitelistMiddleware(whitelist))
+    # Before InputEscapeMiddleware - it must see the words before they're dropped
+    dp.message.outer_middleware(UnsavedWordsMiddleware(drops_unsaved_words, WORDS_NOT_SAVED_TEXT))
     dp.message.outer_middleware(InputEscapeMiddleware(INPUT_STATES, MENU_TEXTS, CANCEL_WORDS))
     dp.include_router(router)
     dp.include_router(learn_router)

@@ -24,6 +24,7 @@ from kielikaveri.bot.add import (
     LEARN_STOPPED_TEXT,
     LEARN_TEXT_HINT,
     UNKNOWN_COMMAND_TEXT,
+    WORDS_NOT_SAVED_TEXT,
     AddStates,
 )
 from kielikaveri.bot.decks import DeckStates
@@ -186,7 +187,8 @@ async def test_add_prompt_during_deck_naming_drops_the_naming(routed, text):
     await routed["set_state"](AddStates.naming_new_deck, NAMING_DATA)
 
     replies = await routed["send"](text)
-    assert replies[0].startswith("Просто напиши мне текст")
+    # After the warning about the unsaved words
+    assert replies[-1].startswith("Просто напиши мне текст")
     assert await routed["get_state"]() is None
 
     # The text the prompt asked for goes to the chat, not into a deck name
@@ -199,7 +201,9 @@ async def test_add_prompt_during_deck_naming_drops_the_naming(routed, text):
 async def test_cancel_during_deck_naming_creates_no_deck(routed, text):
     await routed["set_state"](AddStates.naming_new_deck, NAMING_DATA)
 
-    assert await routed["send"](text) == ["Отменено, слова не сохранила."]
+    assert await routed["send"](text) == [
+        "Отменено, слова не сохранила. Чтобы сохранить, пришли текст ещё раз."
+    ]
     assert await _deck_names(routed["session_factory"]) == []
     assert await routed["get_state"]() is None
     async with routed["session_factory"]() as session:
@@ -428,7 +432,8 @@ async def test_start_resets_any_state(routed, state, data):
 
     replies = await routed["send"]("/start")
 
-    assert replies[0].startswith("Привет!")
+    # Deck naming warns about its unsaved words first
+    assert replies[-1].startswith("Привет!")
     assert await routed["get_state"]() is None
 
 
@@ -462,3 +467,58 @@ async def test_known_commands_are_not_unknown(routed, text):
 
     assert replies
     assert UNKNOWN_COMMAND_TEXT not in replies
+
+
+# --- words not saved yet (UnsavedWordsMiddleware) -----------------------------------
+
+
+@pytest.mark.parametrize("text", ["📚 Учить", "🗂 Колоды", "💬 Добавить", "/help", "/foo"])
+async def test_leaving_deck_naming_warns_the_words_are_lost(routed, text):
+    await routed["set_state"](AddStates.naming_new_deck, NAMING_DATA)
+
+    replies = await routed["send"](text)
+
+    # Warning first, then the command itself still runs
+    assert replies[0] == WORDS_NOT_SAVED_TEXT
+    assert len(replies) > 1
+    assert await routed["get_state"]() != AddStates.naming_new_deck.state
+
+
+async def test_naming_the_deck_gives_no_warning(routed, monkeypatch):
+    save = AsyncMock()
+    monkeypatch.setattr("kielikaveri.bot.add._save_candidates_and_report", save)
+    await routed["set_state"](AddStates.naming_new_deck, NAMING_DATA)
+
+    replies = await routed["send"]("Из книги")
+
+    assert WORDS_NOT_SAVED_TEXT not in replies
+    save.assert_awaited_once()
+
+
+@pytest.mark.parametrize("text", ["📚 Учить", "/learn", "/start"])
+async def test_learn_or_start_during_deck_pick_warns_the_words_are_lost(routed, text):
+    await routed["set_state"](AddStates.choosing_deck, NAMING_DATA)
+
+    replies = await routed["send"](text)
+
+    assert replies[0] == WORDS_NOT_SAVED_TEXT
+    assert len(replies) > 1
+    assert await routed["get_state"]() != AddStates.choosing_deck.state
+
+
+@pytest.mark.parametrize("text", ["🗂 Колоды", "/decks", "/help", "💬 Добавить", "/add"])
+async def test_browsing_during_deck_pick_keeps_the_words_quietly(routed, text):
+    await routed["set_state"](AddStates.choosing_deck, NAMING_DATA)
+
+    replies = await routed["send"](text)
+
+    assert WORDS_NOT_SAVED_TEXT not in replies
+    # The picker's buttons still work afterwards
+    assert await routed["get_state"]() == AddStates.choosing_deck.state
+    assert await routed["get_data"]() == NAMING_DATA
+
+
+async def test_learn_without_pending_words_gives_no_warning(routed):
+    replies = await routed["send"]("📚 Учить")
+
+    assert WORDS_NOT_SAVED_TEXT not in replies

@@ -80,6 +80,8 @@ LEARN_TEXT_HINT = (
 )
 LEARN_STOPPED_TEXT = "Повторение остановлено."
 UNKNOWN_COMMAND_TEXT = "Не знаю такой команды. Список команд - /help"
+RESEND_HINT = "Чтобы сохранить, пришли текст ещё раз."
+WORDS_NOT_SAVED_TEXT = f"Слова из прошлого текста не сохранила. {RESEND_HINT}"
 
 
 class AddStates(StatesGroup):
@@ -239,7 +241,7 @@ async def add_new_deck_save(
     if name.lower() in CANCEL_WORDS:
         logger.debug("event=add.new_deck_cancelled")
         await state.clear()
-        await message.answer("Отменено, слова не сохранила.")
+        await message.answer(f"Отменено, слова не сохранила. {RESEND_HINT}")
         return
 
     data = await state.get_data()

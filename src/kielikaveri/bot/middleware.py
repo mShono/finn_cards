@@ -181,6 +181,43 @@ class WhitelistMiddleware(BaseMiddleware):
         return None
 
 
+def is_navigation(text: str, menu_texts: set[str], cancel_words: set[str]) -> bool:
+    """A command or a main-menu button - but not a cancel word, which the
+    input handlers answer themselves."""
+    if text.strip().lower() in cancel_words:
+        return False
+    return text.startswith("/") or text in menu_texts
+
+
+class UnsavedWordsMiddleware(BaseMiddleware):
+    """Registered on dp.message.outer_middleware before InputEscapeMiddleware -
+    it must see the state before that one drops it.
+
+    Words suggested from a text live only in FSM data until a deck is picked.
+    A message that is about to drop them (`drops_words` decides by state and
+    text) gets a warning first, so they are never lost silently.
+    """
+
+    def __init__(self, drops_words: Callable[[str | None, str], bool], warning: str) -> None:
+        self._drops_words = drops_words
+        self._warning = warning
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        raw_state = data.get("raw_state")
+        text = getattr(event, "text", None) or ""
+        if self._drops_words(raw_state, text):
+            state_data = await data["state"].get_data()
+            if state_data.get("candidates"):
+                logger.debug("event=route.unsaved_words_dropped state=%s", raw_state)
+                await event.answer(self._warning)
+        return await handler(event, data)
+
+
 class InputEscapeMiddleware(BaseMiddleware):
     """Registered on dp.message.outer_middleware - runs after the Dispatcher's
     FSMContextMiddleware has resolved `state`/`raw_state`, before any filter.
@@ -214,13 +251,10 @@ class InputEscapeMiddleware(BaseMiddleware):
     ) -> Any:
         raw_state = data.get("raw_state")
         text = getattr(event, "text", None) or ""
-        if raw_state in self._input_states and self._is_navigation(text):
+        if raw_state in self._input_states and is_navigation(
+            text, self._menu_texts, self._cancel_words
+        ):
             logger.debug("event=route.input_abandoned state=%s", raw_state)
             await data["state"].clear()
             data["raw_state"] = None
         return await handler(event, data)
-
-    def _is_navigation(self, text: str) -> bool:
-        if text.strip().lower() in self._cancel_words:
-            return False
-        return text.startswith("/") or text in self._menu_texts
