@@ -39,6 +39,7 @@ BOT_COMMANDS = [
 INPUT_STATES = {
     EditStates.awaiting_value.state,
     AddStates.naming_new_deck.state,
+    AddStates.awaiting_instruction.state,
     DeckStates.naming.state,
 }
 MENU_TEXTS = {button.text for row in MAIN_KEYBOARD.keyboard for button in row}

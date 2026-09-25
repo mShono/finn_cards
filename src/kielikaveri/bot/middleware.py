@@ -186,7 +186,8 @@ class InputEscapeMiddleware(BaseMiddleware):
     FSMContextMiddleware has resolved `state`/`raw_state`, before any filter.
 
     In a state that takes the next message as free-text input (a card's new
-    value, a new deck's name), a command or a main-menu button is navigation,
+    value, a new deck's name, the answer to a clarifying question), a command
+    or a main-menu button is navigation,
     not input: without this, "/add talo" became a card's translation and
     "💬 Добавить" left the deck-name prompt armed for the next message.
     Such a message drops the pending input and is routed as if no state were

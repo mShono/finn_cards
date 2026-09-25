@@ -254,6 +254,33 @@ async def test_plain_name_during_decks_naming_still_creates_the_deck(routed):
     assert await routed["get_state"]() is None
 
 
+# --- AddStates.awaiting_instruction (clarifying question) ---------------------------
+
+QUESTION_DATA = {"pending_text": "kuusi"}
+
+
+@pytest.mark.parametrize("text", ["💬 Добавить", "🗂 Колоды", "/help"])
+async def test_navigation_during_question_drops_the_question(routed, text):
+    await routed["set_state"](AddStates.awaiting_instruction, QUESTION_DATA)
+
+    await routed["send"](text)
+    assert await routed["get_state"]() is None
+
+    # The next text is a fresh one, not an answer about "kuusi"
+    await routed["send"]("Asun Helsingissä")
+    routed["check"].assert_awaited_once()
+    assert routed["check"].await_args.kwargs["context_text"] is None
+
+
+async def test_plain_answer_to_question_still_carries_the_context(routed):
+    await routed["set_state"](AddStates.awaiting_instruction, QUESTION_DATA)
+
+    await routed["send"]("ель")
+
+    routed["check"].assert_awaited_once()
+    assert routed["check"].await_args.kwargs["context_text"] == "kuusi"
+
+
 # --- states outside InputEscapeMiddleware -------------------------------------------
 
 
