@@ -19,7 +19,7 @@ from test_add import (
     tg_text_update,
 )
 
-from kielikaveri.bot.add import AddStates
+from kielikaveri.bot.add import ADD_PROMPT, LEARN_STOPPED_TEXT, LEARN_TEXT_HINT, AddStates
 from kielikaveri.bot.edit import EditStates
 from kielikaveri.bot.learn import LearnStates
 from kielikaveri.db.decks import get_or_create_default_deck
@@ -56,11 +56,16 @@ async def routed(tmp_path, monkeypatch):
         await dp.feed_update(bot, tg_text_update(len(telegram.sent) + 1, text), **context)
         return [m.text for m in telegram.sent[since:] if isinstance(m, SendMessage)]
 
-    async def tap(data: str) -> None:
+    async def tap(data: str) -> list[str]:
+        since = len(telegram.sent)
         await dp.feed_update(bot, tg_callback_update(len(telegram.sent) + 1, data), **context)
+        return [m.text for m in telegram.sent[since:] if isinstance(m, SendMessage)]
 
     async def get_state() -> str | None:
         return await dp.storage.get_state(key)
+
+    async def get_data() -> dict:
+        return await dp.storage.get_data(key)
 
     async def set_state(state, data: dict | None = None) -> None:
         await dp.storage.set_state(key, state)
@@ -72,6 +77,7 @@ async def routed(tmp_path, monkeypatch):
         "send": send,
         "tap": tap,
         "get_state": get_state,
+        "get_data": get_data,
         "set_state": set_state,
     }
     await dp.storage.set_state(key, None)
@@ -239,11 +245,99 @@ async def test_edit_menu_cancel_still_drops_an_edit_in_progress(routed):
     assert await routed["get_state"]() is None
 
 
-async def test_decks_button_during_review_keeps_the_session(routed):
+@pytest.mark.parametrize(
+    "text, expected_reply",
+    [
+        ("🗂 Колоды", "Твои колоды"),
+        ("📚 Учить", "🇫🇮 hakea"),
+    ],
+)
+async def test_menu_button_during_review_keeps_the_session(routed, text, expected_reply):
     await _start_review(routed)
 
-    await routed["send"]("🗂 Колоды")
+    replies = await routed["send"](text)
 
+    assert replies[0].startswith(expected_reply)
+    assert await routed["get_state"]() == LearnStates.reviewing.state
+
+
+@pytest.mark.parametrize("text", ["💬 Добавить", "/add"])
+@pytest.mark.parametrize(
+    "state", [LearnStates.deck_choice, LearnStates.debt_choice, LearnStates.reviewing]
+)
+async def test_add_during_learn_ends_the_session(routed, state, text):
+    await routed["set_state"](state, {"queue": ["c1"], "reviewed_count": 0})
+
+    replies = await routed["send"](text)
+
+    assert replies == [LEARN_STOPPED_TEXT, ADD_PROMPT]
+    assert await routed["get_state"]() is None
+    assert await routed["get_data"]() == {}
+
+    # The text the prompt asks for now reaches the chat
+    assert await routed["send"]("talo") == ["Ответ"]
+    routed["check"].assert_awaited_once()
+
+
+async def test_add_with_text_during_review_ends_the_session_before_the_chat(routed):
+    routed["check"].return_value = ("Вот", False, [WORD_CANDIDATE], TokenUsage(1, 1, 2))
+    await _start_review(routed)
+
+    replies = await routed["send"]("/add talo")
+
+    assert replies == [LEARN_STOPPED_TEXT, "Вот", "В какую колоду добавить?"]
+    routed["check"].assert_awaited_once()
+    assert await routed["get_state"]() == AddStates.choosing_deck.state
+    # No leftovers of the session next to the picker's own data
+    assert set(await routed["get_data"]()) == {"batch_id", "candidates"}
+
+
+async def test_add_button_outside_learn_only_prompts(routed):
+    replies = await routed["send"]("💬 Добавить")
+
+    assert replies == [ADD_PROMPT]
+
+
+# --- plain text during /learn -------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "state, data",
+    [
+        (LearnStates.deck_choice, {}),
+        (LearnStates.debt_choice, {"debt_now": "2026-09-25T10:00:00+00:00", "deck_id": None}),
+        (
+            LearnStates.reviewing,
+            {
+                "queue": ["c1"],
+                "session_started_at": "2026-09-25T10:00:00+00:00",
+                "reviewed_count": 0,
+                "session_max_minutes": 10,
+            },
+        ),
+    ],
+)
+async def test_plain_text_during_learn_gets_a_hint_not_the_llm(routed, state, data):
+    # Candidates would open the deck picker and overwrite the learn state
+    routed["check"].return_value = ("Вот", False, [WORD_CANDIDATE], TokenUsage(1, 1, 2))
+    await routed["set_state"](state, data)
+
+    replies = await routed["send"]("talo")
+
+    assert replies == [LEARN_TEXT_HINT]
+    routed["check"].assert_not_awaited()
+    assert await routed["get_state"]() == state.state
+    assert await routed["get_data"]() == data
+
+
+async def test_reveal_still_works_after_plain_text_during_review(routed):
+    routed["check"].return_value = ("Вот", False, [WORD_CANDIDATE], TokenUsage(1, 1, 2))
+    await _start_review(routed)
+
+    await routed["send"]("talo")
+    replies = await routed["tap"]("learn:reveal:c1")
+
+    assert replies == ["искать\n\nHaen töitä.\nЯ ищу работу."]
     assert await routed["get_state"]() == LearnStates.reviewing.state
 
 
