@@ -8,6 +8,7 @@ from aiogram.types import BotCommand
 
 from kielikaveri.bot.add import AddStates
 from kielikaveri.bot.add import router as add_router
+from kielikaveri.bot.decks import DeckStates
 from kielikaveri.bot.decks import router as decks_router
 from kielikaveri.bot.edit import CANCEL_WORDS, EditStates
 from kielikaveri.bot.edit import router as edit_router
@@ -35,7 +36,11 @@ BOT_COMMANDS = [
 
 # States whose handler takes the next message as a value - see
 # InputEscapeMiddleware for why commands and menu buttons must skip them.
-INPUT_STATES = {EditStates.awaiting_value.state, AddStates.naming_new_deck.state}
+INPUT_STATES = {
+    EditStates.awaiting_value.state,
+    AddStates.naming_new_deck.state,
+    DeckStates.naming.state,
+}
 MENU_TEXTS = {button.text for row in MAIN_KEYBOARD.keyboard for button in row}
 
 

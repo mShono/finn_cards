@@ -79,6 +79,7 @@ LEARN_TEXT_HINT = (
     "Чтобы написать мне текст, нажми «💬 Добавить» - повторение закончится."
 )
 LEARN_STOPPED_TEXT = "Повторение остановлено."
+UNKNOWN_COMMAND_TEXT = "Не знаю такой команды. Список команд - /help"
 
 
 class AddStates(StatesGroup):
@@ -276,6 +277,15 @@ async def chat_message(
     breaker: CallBreaker,
 ) -> None:
     await _handle_chat_turn(message, state, session_factory, settings, breaker, message.text)
+
+
+# Last message handler of the last router: every known command is matched
+# above, so a "/..." that got this far is a typo or a removed command.
+# State is left as is - an unknown command mid-review must not end it.
+@router.message(F.text.startswith("/"))
+async def unknown_command(message: Message) -> None:
+    logger.debug("event=route.unknown_command")
+    await message.answer(UNKNOWN_COMMAND_TEXT)
 
 
 async def _handle_chat_turn(

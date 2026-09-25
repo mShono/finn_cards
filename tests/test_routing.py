@@ -19,7 +19,14 @@ from test_add import (
     tg_text_update,
 )
 
-from kielikaveri.bot.add import ADD_PROMPT, LEARN_STOPPED_TEXT, LEARN_TEXT_HINT, AddStates
+from kielikaveri.bot.add import (
+    ADD_PROMPT,
+    LEARN_STOPPED_TEXT,
+    LEARN_TEXT_HINT,
+    UNKNOWN_COMMAND_TEXT,
+    AddStates,
+)
+from kielikaveri.bot.decks import DeckStates
 from kielikaveri.bot.edit import EditStates
 from kielikaveri.bot.learn import LearnStates
 from kielikaveri.db.decks import get_or_create_default_deck
@@ -207,6 +214,46 @@ async def test_plain_name_during_deck_naming_still_creates_the_deck(routed):
     assert await _deck_names(routed["session_factory"]) == ["Из книги"]
 
 
+# --- DeckStates.naming (🗂 Колоды → ➕) ---------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text, expected_reply",
+    [
+        ("/add", "Просто напиши мне текст"),
+        ("💬 Добавить", "Просто напиши мне текст"),
+        ("/delete hakea", "Не нашла такое слово."),
+    ],
+)
+async def test_command_during_decks_naming_runs_the_command_and_creates_no_deck(
+    routed, text, expected_reply
+):
+    await routed["set_state"](DeckStates.naming)
+
+    replies = await routed["send"](text)
+
+    assert replies[0].startswith(expected_reply)
+    assert await routed["get_state"]() is None
+    assert await _deck_names(routed["session_factory"]) == []
+
+
+@pytest.mark.parametrize("text", ["/cancel", "отмена", "Отмена"])
+async def test_cancel_during_decks_naming_creates_no_deck(routed, text):
+    await routed["set_state"](DeckStates.naming)
+
+    assert await routed["send"](text) == ["Отменено."]
+    assert await _deck_names(routed["session_factory"]) == []
+    assert await routed["get_state"]() is None
+
+
+async def test_plain_name_during_decks_naming_still_creates_the_deck(routed):
+    await routed["set_state"](DeckStates.naming)
+
+    assert await routed["send"]("Из книги") == ["Колода «Из книги» создана."]
+    assert await _deck_names(routed["session_factory"]) == ["Из книги"]
+    assert await routed["get_state"]() is None
+
+
 # --- states outside InputEscapeMiddleware -------------------------------------------
 
 
@@ -356,3 +403,35 @@ async def test_start_resets_any_state(routed, state, data):
 
     assert replies[0].startswith("Привет!")
     assert await routed["get_state"]() is None
+
+
+# --- unknown commands ---------------------------------------------------------------
+
+
+@pytest.mark.parametrize("text", ["/foo", "/foo bar", "/cancel", "/Learn"])
+async def test_unknown_command_gets_an_answer(routed, text):
+    assert await routed["send"](text) == [UNKNOWN_COMMAND_TEXT]
+    routed["check"].assert_not_awaited()
+
+
+async def test_unknown_command_during_review_keeps_the_session(routed):
+    await _start_review(routed)
+
+    assert await routed["send"]("/foo") == [UNKNOWN_COMMAND_TEXT]
+    assert await routed["get_state"]() == LearnStates.reviewing.state
+
+
+async def test_unknown_command_during_input_drops_the_input(routed):
+    await routed["set_state"](DeckStates.naming)
+
+    assert await routed["send"]("/foo") == [UNKNOWN_COMMAND_TEXT]
+    assert await routed["get_state"]() is None
+    assert await _deck_names(routed["session_factory"]) == []
+
+
+@pytest.mark.parametrize("text", ["/help", "/decks"])
+async def test_known_commands_are_not_unknown(routed, text):
+    replies = await routed["send"](text)
+
+    assert replies
+    assert UNKNOWN_COMMAND_TEXT not in replies
