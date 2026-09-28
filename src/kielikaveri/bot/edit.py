@@ -168,6 +168,10 @@ async def note_edit_apply(
     await _apply_lemma_edit(message, session_factory, settings, breaker, note, value)
 
 
+def _clash_reply(lemma: str) -> str:
+    return f"«{lemma}» уже есть в этой колоде отдельной карточкой - сначала удали одну из них."
+
+
 async def _apply_lemma_edit(
     message: Message,
     session_factory: async_sessionmaker[AsyncSession],
@@ -181,13 +185,20 @@ async def _apply_lemma_edit(
     # construction string itself, not something the FST can resolve).
     new_lemma, _pos = canonical_key(raw_value, note.pos)
 
+    # Deck-scoped, same as /add's dedup and uq_notes_user_deck_lemma_pos: the
+    # same word in another deck is allowed (requested 03.09.2026), so /edit
+    # must not refuse a rename /add would have let through.
     async with session_factory() as session:
         pos_filter = Note.pos.is_(None) if note.pos is None else Note.pos == note.pos
+        deck_filter = (
+            Note.deck_id.is_(None) if note.deck_id is None else Note.deck_id == note.deck_id
+        )
         clash = await session.scalar(
             select(Note).where(
                 Note.user_id == message.from_user.id,
                 Note.lemma == new_lemma,
                 pos_filter,
+                deck_filter,
                 Note.id != note.id,
             )
         )
@@ -198,9 +209,7 @@ async def _apply_lemma_edit(
             new_lemma,
             clash.id,
         )
-        await message.answer(
-            f"«{new_lemma}» уже есть в базе отдельной карточкой - сначала удали одну из них."
-        )
+        await message.answer(_clash_reply(new_lemma))
         return
 
     old_lemma = note.lemma
@@ -273,9 +282,7 @@ async def _apply_lemma_edit(
                 raise
             await session.rollback()
             logger.info("event=edit.lemma_clash_race note_id=%s new_lemma=%s", note_id, new_lemma)
-            await message.answer(
-                f"«{new_lemma}» уже есть в базе отдельной карточкой - сначала удали одну из них."
-            )
+            await message.answer(_clash_reply(new_lemma))
             return
 
     logger.info(
