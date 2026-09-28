@@ -31,7 +31,8 @@ from datetime import UTC, datetime
 import jsonschema
 import openai
 from aiogram import F, Router
-from aiogram.filters import Command, CommandObject
+from aiogram.dispatcher.event.bases import SkipHandler
+from aiogram.filters import Command, CommandObject, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -40,6 +41,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from kielikaveri.bot.decks import NEW_DECK_PROMPT
+from kielikaveri.bot.edit import CANCEL_WORDS
+from kielikaveri.bot.learn import LearnStates
 from kielikaveri.bot.text import split_message
 from kielikaveri.config import Settings
 from kielikaveri.db.decks import create_deck, get_or_create_default_deck, list_decks
@@ -71,6 +74,14 @@ router = Router(name="add")
 
 ADD_BUTTON_TEXT = "💬 Добавить"
 ADD_PROMPT = "Просто напиши мне текст на финском или свой перевод - отвечу в чате."
+LEARN_TEXT_HINT = (
+    "Сейчас идёт повторение. Используй кнопки ниже.\n"
+    "Чтобы написать мне текст, нажми «💬 Добавить» - повторение закончится."
+)
+LEARN_STOPPED_TEXT = "Повторение остановлено."
+UNKNOWN_COMMAND_TEXT = "Не знаю такой команды. Список команд - /help"
+RESEND_HINT = "Чтобы сохранить, пришли текст ещё раз."
+WORDS_NOT_SAVED_TEXT = f"Слова из прошлого текста не сохранила. {RESEND_HINT}"
 
 
 class AddStates(StatesGroup):
@@ -80,6 +91,19 @@ class AddStates(StatesGroup):
     choosing_deck = State()
     # Data: same as choosing_deck, carried over - waiting for the new deck's name.
     naming_new_deck = State()
+
+
+# Adding ends a live session first: the prompt invites plain text, which
+# learn_plain_text would only answer with a hint, and "/add <text>" would
+# overwrite the learn state from inside the chat turn. SkipHandler then
+# passes the message on to the regular button/command handler below.
+@router.message(StateFilter(LearnStates), Command("add"))
+@router.message(StateFilter(LearnStates), F.text == ADD_BUTTON_TEXT)
+async def add_during_learn(message: Message, state: FSMContext) -> None:
+    logger.info("event=learn.session_end reason=add")
+    await state.clear()
+    await message.answer(LEARN_STOPPED_TEXT)
+    raise SkipHandler
 
 
 @router.message(F.text == ADD_BUTTON_TEXT)
@@ -213,6 +237,12 @@ async def add_new_deck_save(
     if not name:
         await message.answer(NEW_DECK_PROMPT)
         return
+    # Same cancel words as a card edit - they used to become a deck's name
+    if name.lower() in CANCEL_WORDS:
+        logger.debug("event=add.new_deck_cancelled")
+        await state.clear()
+        await message.answer(f"Отменено, слова не сохранила. {RESEND_HINT}")
+        return
 
     data = await state.get_data()
     candidates: list[dict] = data.get("candidates", [])
@@ -230,6 +260,16 @@ async def add_new_deck_save(
     )
 
 
+# Right before chat_message, not in learn.py: menu buttons are matched by
+# earlier handlers, so only plain text is left here. In chat_message it would
+# reach the LLM, whose clarifying question or deck picker overwrites the
+# learn state and kills the session's buttons.
+@router.message(StateFilter(LearnStates), F.text & ~F.text.startswith("/"))
+async def learn_plain_text(message: Message) -> None:
+    logger.debug("event=learn.plain_text_ignored")
+    await message.answer(LEARN_TEXT_HINT)
+
+
 @router.message(F.text & ~F.text.startswith("/"))
 async def chat_message(
     message: Message,
@@ -239,6 +279,15 @@ async def chat_message(
     breaker: CallBreaker,
 ) -> None:
     await _handle_chat_turn(message, state, session_factory, settings, breaker, message.text)
+
+
+# Last message handler of the last router: every known command is matched
+# above, so a "/..." that got this far is a typo or a removed command.
+# State is left as is - an unknown command mid-review must not end it.
+@router.message(F.text.startswith("/"))
+async def unknown_command(message: Message) -> None:
+    logger.debug("event=route.unknown_command")
+    await message.answer(UNKNOWN_COMMAND_TEXT)
 
 
 async def _handle_chat_turn(

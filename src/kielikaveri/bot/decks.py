@@ -23,6 +23,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from kielikaveri.bot.edit import CANCEL_WORDS
 from kielikaveri.db.decks import create_deck, get_or_create_default_deck, list_decks
 from kielikaveri.db.models import Deck, Note
 from kielikaveri.srs.queue import card_counters
@@ -209,6 +210,12 @@ async def decks_new_save(
     name = (message.text or "").strip()
     if not name:
         await message.answer(NEW_DECK_PROMPT)
+        return
+    # Same cancel words as a card edit - they used to become a deck's name
+    if name.lower() in CANCEL_WORDS:
+        logger.debug("event=decks.new_cancelled")
+        await state.clear()
+        await message.answer("Отменено.")
         return
 
     user_id = message.from_user.id

@@ -6,12 +6,21 @@ from datetime import timedelta
 from aiogram import Bot, Dispatcher
 from aiogram.types import BotCommand
 
+from kielikaveri.bot.add import WORDS_NOT_SAVED_TEXT, AddStates
 from kielikaveri.bot.add import router as add_router
+from kielikaveri.bot.decks import DeckStates
 from kielikaveri.bot.decks import router as decks_router
+from kielikaveri.bot.edit import CANCEL_WORDS, EditStates
 from kielikaveri.bot.edit import router as edit_router
-from kielikaveri.bot.handlers import router
+from kielikaveri.bot.handlers import MAIN_KEYBOARD, router
 from kielikaveri.bot.learn import router as learn_router
-from kielikaveri.bot.middleware import RequestLoggingMiddleware, WhitelistMiddleware
+from kielikaveri.bot.middleware import (
+    InputEscapeMiddleware,
+    RequestLoggingMiddleware,
+    UnsavedWordsMiddleware,
+    WhitelistMiddleware,
+    is_navigation,
+)
 from kielikaveri.config import Settings, load_settings
 from kielikaveri.db.engine import make_engine, make_session_factory
 from kielikaveri.llm.breaker import CallBreaker
@@ -27,6 +36,61 @@ BOT_COMMANDS = [
     BotCommand(command="help", description="Справка"),
 ]
 
+# States whose handler takes the next message as a value - see
+# InputEscapeMiddleware for why commands and menu buttons must skip them.
+INPUT_STATES = {
+    EditStates.awaiting_value.state,
+    AddStates.naming_new_deck.state,
+    AddStates.awaiting_instruction.state,
+    DeckStates.naming.state,
+}
+MENU_TEXTS = {button.text for row in MAIN_KEYBOARD.keyboard for button in row}
+# The deck picker itself survives browsing (🗂 Колоды, /help) - its buttons
+# still work after. Only these overwrite its state and kill it.
+PICKER_BREAKERS = {"/learn", "/start", "📚 Учить"}
+
+
+def drops_unsaved_words(raw_state: str | None, text: str) -> bool:
+    """Whether this message ends a deck pick without saving its words."""
+    if raw_state == AddStates.naming_new_deck.state:
+        # InputEscapeMiddleware drops the naming on any navigation
+        return is_navigation(text, MENU_TEXTS, CANCEL_WORDS)
+    if raw_state == AddStates.choosing_deck.state:
+        if text in PICKER_BREAKERS:
+            return True
+        # "/learn@bot args" -> "/learn"
+        command = text.split(maxsplit=1)[0].split("@")[0] if text.startswith("/") else ""
+        return command in PICKER_BREAKERS
+    return False
+
+
+def build_dispatcher(whitelist: set[int]) -> Dispatcher:
+    """Middlewares and routers, in order. Separate from run() so routing
+    tests go through exactly this, not a hand-copied router list.
+
+    Callable once per process - aiogram refuses to attach a router twice.
+    """
+    dp = Dispatcher()
+    # Registered after construction, so both run after the Dispatcher's own
+    # UserContextMiddleware and can rely on event_from_user being set.
+    # RequestLoggingMiddleware first - it must wrap WhitelistMiddleware to
+    # log request_completed for updates the whitelist check blocks too.
+    dp.update.outer_middleware(RequestLoggingMiddleware())
+    dp.update.outer_middleware(WhitelistMiddleware(whitelist))
+    # Before InputEscapeMiddleware - it must see the words before they're dropped
+    dp.message.outer_middleware(UnsavedWordsMiddleware(drops_unsaved_words, WORDS_NOT_SAVED_TEXT))
+    dp.message.outer_middleware(InputEscapeMiddleware(INPUT_STATES, MENU_TEXTS, CANCEL_WORDS))
+    dp.include_router(router)
+    dp.include_router(learn_router)
+    dp.include_router(decks_router)
+    dp.include_router(edit_router)
+    # add_router last - chat_message's plain-text catch-all would otherwise
+    # shadow every other router's text/state-based message handlers (e.g.
+    # decks.py's DeckStates.naming prompt, edit.py's EditStates.awaiting_value
+    # prompt) registered after it.
+    dp.include_router(add_router)
+    return dp
+
 
 async def run(settings: Settings) -> None:
     if not settings.bot_token:
@@ -39,22 +103,7 @@ async def run(settings: Settings) -> None:
 
     bot = Bot(token=settings.bot_token)
     await bot.set_my_commands(BOT_COMMANDS)
-    dp = Dispatcher()
-    # Registered after construction, so both run after the Dispatcher's own
-    # UserContextMiddleware and can rely on event_from_user being set.
-    # RequestLoggingMiddleware first - it must wrap WhitelistMiddleware to
-    # log request_completed for updates the whitelist check blocks too.
-    dp.update.outer_middleware(RequestLoggingMiddleware())
-    dp.update.outer_middleware(WhitelistMiddleware(settings.whitelist))
-    dp.include_router(router)
-    dp.include_router(learn_router)
-    dp.include_router(decks_router)
-    dp.include_router(edit_router)
-    # add_router last - chat_message's plain-text catch-all would otherwise
-    # shadow every other router's text/state-based message handlers (e.g.
-    # decks.py's DeckStates.naming prompt, edit.py's EditStates.awaiting_value
-    # prompt) registered after it.
-    dp.include_router(add_router)
+    dp = build_dispatcher(settings.whitelist)
 
     # Schema is managed by alembic (`alembic upgrade head`), not created here.
     engine = make_engine(settings.database_url)

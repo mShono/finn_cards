@@ -179,3 +179,82 @@ class WhitelistMiddleware(BaseMiddleware):
         logger.warning("event=route.blocked reason=no_sender")
         data["_route_blocked"] = True
         return None
+
+
+def is_navigation(text: str, menu_texts: set[str], cancel_words: set[str]) -> bool:
+    """A command or a main-menu button - but not a cancel word, which the
+    input handlers answer themselves."""
+    if text.strip().lower() in cancel_words:
+        return False
+    return text.startswith("/") or text in menu_texts
+
+
+class UnsavedWordsMiddleware(BaseMiddleware):
+    """Registered on dp.message.outer_middleware before InputEscapeMiddleware -
+    it must see the state before that one drops it.
+
+    Words suggested from a text live only in FSM data until a deck is picked.
+    A message that is about to drop them (`drops_words` decides by state and
+    text) gets a warning first, so they are never lost silently.
+    """
+
+    def __init__(self, drops_words: Callable[[str | None, str], bool], warning: str) -> None:
+        self._drops_words = drops_words
+        self._warning = warning
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        raw_state = data.get("raw_state")
+        text = getattr(event, "text", None) or ""
+        if self._drops_words(raw_state, text):
+            state_data = await data["state"].get_data()
+            if state_data.get("candidates"):
+                logger.debug("event=route.unsaved_words_dropped state=%s", raw_state)
+                await event.answer(self._warning)
+        return await handler(event, data)
+
+
+class InputEscapeMiddleware(BaseMiddleware):
+    """Registered on dp.message.outer_middleware - runs after the Dispatcher's
+    FSMContextMiddleware has resolved `state`/`raw_state`, before any filter.
+
+    In a state that takes the next message as free-text input (a card's new
+    value, a new deck's name, the answer to a clarifying question), a command
+    or a main-menu button is navigation,
+    not input: without this, "/add talo" became a card's translation and
+    "💬 Добавить" left the deck-name prompt armed for the next message.
+    Such a message drops the pending input and is routed as if no state were
+    set. Cancel words are left alone - the input handlers answer those.
+
+    Clearing inside a handler instead would not work: StateFilter reads the
+    `raw_state` resolved once per update, not the storage, so every later
+    handler would still see the old state. Rewriting data["raw_state"] here
+    is what the rest of the routing actually sees.
+    """
+
+    def __init__(
+        self, input_states: set[str], menu_texts: set[str], cancel_words: set[str]
+    ) -> None:
+        self._input_states = input_states
+        self._menu_texts = menu_texts
+        self._cancel_words = cancel_words
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        raw_state = data.get("raw_state")
+        text = getattr(event, "text", None) or ""
+        if raw_state in self._input_states and is_navigation(
+            text, self._menu_texts, self._cancel_words
+        ):
+            logger.debug("event=route.input_abandoned state=%s", raw_state)
+            await data["state"].clear()
+            data["raw_state"] = None
+        return await handler(event, data)
