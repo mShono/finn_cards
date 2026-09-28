@@ -13,6 +13,7 @@ from conftest import log_fields
 from sqlalchemy import func, select
 
 from finn_cards.morphology import NOMINAL_FORMS
+from kielikaveri.bot.add import delete_confirm
 from kielikaveri.bot.learn import (
     DECK_ALL_TOKEN,
     LearnStates,
@@ -122,7 +123,7 @@ async def _drain_session(
         shown.append(card_id)
         reveal = make_callback(f"learn:reveal:{card_id}")
         reveal.message = message
-        await learn_reveal(reveal, session_factory)
+        await learn_reveal(reveal, session_factory, state)
         rate = make_callback(f"learn:rate:{card_id}:3")
         rate.message = message
         await learn_rate(rate, state, session_factory)
@@ -454,7 +455,7 @@ async def test_learn_reveal_shows_the_back_and_a_rating_keyboard_for_that_card(s
 
     callback = make_callback("learn:reveal:card-A")
 
-    await learn_reveal(callback, session_factory)
+    await learn_reveal(callback, session_factory, make_state())
 
     callback.message.answer.assert_awaited_once()
     text, kwargs = (
@@ -489,7 +490,7 @@ async def test_learn_listen_sends_synthesized_audio_of_the_example_sentence(
     callback = make_callback("learn:listen:card-A")
     settings = make_settings(openai_api_key="sk-test", openai_tts_model="tts-1")
 
-    await learn_listen(callback, session_factory, settings)
+    await learn_listen(callback, session_factory, settings, make_state())
 
     callback.message.answer_audio.assert_awaited_once()
     audio = callback.message.answer_audio.call_args.args[0]
@@ -508,7 +509,7 @@ async def test_learn_listen_without_an_openai_key_answers_gracefully(session_fac
     callback = make_callback("learn:listen:card-A")
     settings = make_settings(openai_api_key="")
 
-    await learn_listen(callback, session_factory, settings)
+    await learn_listen(callback, session_factory, settings, make_state())
 
     callback.answer.assert_awaited_once_with(
         "Озвучка недоступна - не настроен OpenAI.", show_alert=True
@@ -950,7 +951,7 @@ async def test_learn_reveal_logs_reveal_event(session_factory, caplog):
     callback = make_callback("learn:reveal:card-A")
 
     with caplog.at_level(logging.DEBUG, logger="kielikaveri.bot.learn"):
-        await learn_reveal(callback, session_factory)
+        await learn_reveal(callback, session_factory, make_state())
 
     events = [log_fields(r.message) for r in caplog.records]
     reveal = next(f for f in events if f.get("event") == "learn.reveal")
@@ -1105,3 +1106,136 @@ async def test_learn_rate_schedules_off_the_previous_review_not_the_current_one(
     assert abs(card.due - expected.due) <= timedelta(seconds=1)
     # Not the shorter interval an autoflushed `max()` would have produced.
     assert card.stability != pytest.approx(bugged.stability)
+
+
+# --- a word deleted mid-session (/delete, 🗑 in a deck) ------------------------
+# delete_confirm has no state filter, so it runs while LearnStates.reviewing
+# is live and leaves the deleted word's card ids in the FSM queue.
+
+
+async def _seed_two_words(session_factory) -> None:
+    """note-1 (hakea) with card-A and card-C, note-2 (naapuri) with card-B."""
+    async with session_factory() as session:
+        session.add(User(id=1))
+        session.add(make_note("note-1"))
+        doomed = make_note("note-2")
+        doomed.lemma = "naapuri"
+        session.add(doomed)
+        await session.flush()
+        session.add(make_card("card-A", "note-1", 1, due=NOW))
+        session.add(make_card("card-B", "note-2", 1, due=NOW))
+        session.add(make_card("card-C", "note-1", 1, due=NOW))
+        await session.commit()
+
+
+async def _start_mid_session(queue: list[str]) -> FSMContext:
+    state = make_state()
+    await state.set_state(LearnStates.reviewing)
+    await state.update_data(
+        queue=queue,
+        reviewed_count=0,
+        session_started_at=datetime.now(UTC).isoformat(),
+        session_max_minutes=10,
+    )
+    return state
+
+
+async def _delete_word(session_factory, note_id: str) -> None:
+    await delete_confirm(make_callback(f"delnote:{note_id}"), session_factory)
+
+
+def _shown_card_id(answer: AsyncMock) -> str:
+    markup = answer.call_args.kwargs["reply_markup"]
+    return markup.inline_keyboard[0][0].callback_data.split(":", 2)[2]
+
+
+async def test_rating_skips_a_card_deleted_further_down_the_queue(session_factory):
+    await _seed_two_words(session_factory)
+    state = await _start_mid_session(["card-A", "card-B", "card-C"])
+    await _delete_word(session_factory, "note-2")
+    callback = make_callback("learn:rate:card-A:3")
+
+    await learn_rate(callback, state, session_factory)
+
+    assert _shown_card_id(callback.message.answer) == "card-C"
+    data = await state.get_data()
+    assert data["queue"] == ["card-C"]
+    assert data["reviewed_count"] == 1
+
+
+async def test_reveal_of_a_deleted_head_card_moves_on_to_the_next_one(session_factory):
+    await _seed_two_words(session_factory)
+    state = await _start_mid_session(["card-B", "card-A"])
+    await _delete_word(session_factory, "note-2")
+    callback = make_callback("learn:reveal:card-B")
+
+    await learn_reveal(callback, session_factory, state)
+
+    callback.answer.assert_awaited_once_with("Это слово удалено.")
+    assert _shown_card_id(callback.message.answer) == "card-A"
+    data = await state.get_data()
+    assert data["queue"] == ["card-A"]
+    assert data["reviewed_count"] == 0
+
+
+async def test_rating_a_deleted_head_card_records_nothing_and_is_not_counted(session_factory):
+    await _seed_two_words(session_factory)
+    state = await _start_mid_session(["card-B", "card-A"])
+    await _delete_word(session_factory, "note-2")
+    callback = make_callback("learn:rate:card-B:3")
+
+    await learn_rate(callback, state, session_factory)
+
+    async with session_factory() as session:
+        assert (await session.scalars(select(Review))).all() == []
+    callback.answer.assert_awaited_once_with("Это слово удалено.")
+    assert _shown_card_id(callback.message.answer) == "card-A"
+    data = await state.get_data()
+    assert data["queue"] == ["card-A"]
+    assert data["reviewed_count"] == 0  # rolled back, not inflated by the lost card
+
+
+async def test_listen_on_a_deleted_head_card_synthesizes_nothing(session_factory, monkeypatch):
+    await _seed_two_words(session_factory)
+    state = await _start_mid_session(["card-B", "card-A"])
+    await _delete_word(session_factory, "note-2")
+    tts = AsyncMock()
+    monkeypatch.setattr("kielikaveri.bot.learn.synthesize_speech", tts)
+    callback = make_callback("learn:listen:card-B")
+    settings = make_settings(openai_api_key="sk-test", openai_tts_model="tts-1")
+
+    await learn_listen(callback, session_factory, settings, state)
+
+    tts.assert_not_called()
+    callback.message.answer_audio.assert_not_awaited()
+    assert _shown_card_id(callback.message.answer) == "card-A"
+
+
+async def test_reveal_of_a_deleted_card_from_an_old_message_leaves_the_session_alone(
+    session_factory,
+):
+    # card-B is no longer at the head - its message is an old one scrolled
+    # past. Re-showing the head would duplicate the card already on screen.
+    await _seed_two_words(session_factory)
+    state = await _start_mid_session(["card-A", "card-C"])
+    await _delete_word(session_factory, "note-2")
+    callback = make_callback("learn:reveal:card-B")
+
+    await learn_reveal(callback, session_factory, state)
+
+    callback.answer.assert_awaited_once_with("Это слово удалено.")
+    callback.message.answer.assert_not_awaited()
+    assert (await state.get_data())["queue"] == ["card-A", "card-C"]
+
+
+async def test_session_ends_when_every_remaining_card_was_deleted(session_factory):
+    await _seed_two_words(session_factory)
+    state = await _start_mid_session(["card-B"])
+    await _delete_word(session_factory, "note-2")
+    callback = make_callback("learn:rate:card-B:3")
+
+    await learn_rate(callback, state, session_factory)
+
+    text = callback.message.answer.call_args.args[0]
+    assert "Сессия окончена: 0 карточек пройдено - всё на сегодня!" in text
+    assert await state.get_data() == {}

@@ -241,7 +241,7 @@ async def run_learn(session_factory) -> list[tuple[str, str, str]]:
             answer=AsyncMock(),
             message=message,
         )
-        await learn_reveal(reveal, session_factory)
+        await learn_reveal(reveal, session_factory, state)
         back = message.answer.call_args.args[0]
         rate = SimpleNamespace(
             data=f"learn:rate:{card_id}:{Rating.Good.value}",
