@@ -21,7 +21,7 @@ from kielikaveri.bot.edit import (
 )
 from kielikaveri.config import Settings
 from kielikaveri.db.engine import create_all, make_engine, make_session_factory
-from kielikaveri.db.models import Note, NoteKind
+from kielikaveri.db.models import Deck, Note, NoteKind
 from kielikaveri.ingest import ResolvedForms
 from kielikaveri.llm.breaker import CallBreaker, CircuitOpenError
 
@@ -86,6 +86,12 @@ async def _add_note(session_factory, **overrides) -> Note:
         session.add(note)
         await session.commit()
     return note
+
+
+async def _add_decks(session_factory, *deck_ids: str) -> None:
+    async with session_factory() as session:
+        session.add_all(Deck(id=deck_id, user_id=1, name=deck_id) for deck_id in deck_ids)
+        await session.commit()
 
 
 def _fst_meta(lemma: str, pos: str) -> dict:
@@ -273,6 +279,89 @@ async def test_note_edit_apply_lemma_rejects_a_clash_with_an_existing_note(sessi
         note = await session.get(Note, "n1")
     assert note.lemma == "hakea"
     assert "уже есть" in message.answer.call_args.args[0]
+
+
+async def test_note_edit_apply_lemma_rejects_a_clash_within_the_same_deck(session_factory):
+    await _add_decks(session_factory, "d1")
+    await _add_note(session_factory, id="n1", lemma="hakea", pos="verbi", deck_id="d1")
+    await _add_note(
+        session_factory, id="n2", lemma="mennä", pos="verbi", translation_ru="идти", deck_id="d1"
+    )
+    state = make_state()
+    await state.set_state(EditStates.awaiting_value)
+    await state.update_data(note_id="n1", field="lemma")
+    message = make_message("mennä")
+
+    await note_edit_apply(message, state, session_factory, make_settings(), make_breaker())
+
+    async with session_factory() as session:
+        note = await session.get(Note, "n1")
+    assert note.lemma == "hakea"
+    assert "уже есть в этой колоде" in message.answer.call_args.args[0]
+
+
+async def test_note_edit_apply_lemma_allows_the_same_word_in_another_deck(
+    session_factory, monkeypatch
+):
+    # /add lets one word live in two decks (03.09.2026) and so does the
+    # unique index - /edit must not be the one place that refuses it.
+    await _add_decks(session_factory, "d1", "d2")
+    await _add_note(
+        session_factory,
+        id="n1",
+        lemma="puhua",
+        translation_ru="говорить",
+        example_fi="Puhun suomea.",
+        deck_id="d1",
+        meta=_fst_meta("puhua", "verbi"),
+    )
+    await _add_note(
+        session_factory, id="n2", lemma="hakea", deck_id="d2", meta=_fst_meta("hakea", "verbi")
+    )
+    patch_openai_client(monkeypatch)
+    state = make_state()
+    await state.set_state(EditStates.awaiting_value)
+    await state.update_data(note_id="n1", field="lemma")
+    message = make_message("hakea")
+
+    await note_edit_apply(message, state, session_factory, make_settings(), make_breaker())
+
+    async with session_factory() as session:
+        edited = await session.get(Note, "n1")
+        other = await session.get(Note, "n2")
+    assert (edited.lemma, edited.deck_id) == ("hakea", "d1")
+    assert (other.lemma, other.deck_id) == ("hakea", "d2")
+    assert "уже есть" not in message.answer.call_args.args[0]
+
+
+async def test_note_edit_apply_lemma_with_a_pos_change_allows_the_word_in_another_deck(
+    session_factory, monkeypatch
+):
+    # hakea (verbi) -> talo resolves to substantiivi; talo/substantiivi in
+    # another deck is no clash, whichever pos the pre-resolve lookup used.
+    await _add_decks(session_factory, "d1", "d2")
+    await _add_note(session_factory, id="n1", deck_id="d1", meta=_fst_meta("hakea", "verbi"))
+    await _add_note(
+        session_factory,
+        id="n2",
+        lemma="talo",
+        pos="substantiivi",
+        translation_ru="дом",
+        deck_id="d2",
+        meta=_fst_meta("talo", "substantiivi"),
+    )
+    patch_openai_client(monkeypatch)
+    state = make_state()
+    await state.set_state(EditStates.awaiting_value)
+    await state.update_data(note_id="n1", field="lemma")
+    message = make_message("talo")
+
+    await note_edit_apply(message, state, session_factory, make_settings(), make_breaker())
+
+    async with session_factory() as session:
+        note = await session.get(Note, "n1")
+    assert (note.lemma, note.pos, note.deck_id) == ("talo", "substantiivi", "d1")
+    assert "уже есть" not in message.answer.call_args.args[0]
 
 
 async def test_note_edit_apply_lemma_handles_a_clash_that_appears_during_the_llm_call(
