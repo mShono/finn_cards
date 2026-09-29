@@ -42,6 +42,7 @@ logger = logging.getLogger(__name__)
 router = Router(name="learn")
 
 DECK_ALL_TOKEN = "all"
+DELETED_CARD_TEXT = "Это слово удалено."
 
 
 class LearnStates(StatesGroup):
@@ -150,11 +151,38 @@ async def _start_session(
     await _show_next_card(answer_to, state, session_factory)
 
 
+async def _drop_deleted_head(session: AsyncSession, queue: list[str]) -> list[str]:
+    """The queue without deleted cards at its head. A word deleted
+    mid-session (/delete, 🗑 in a deck) leaves its card ids in the FSM queue -
+    delete_confirm has no state filter and knows nothing about /learn."""
+    while queue and await session.get(Card, queue[0]) is None:
+        logger.info("event=learn.skip_deleted card_id=%s", queue[0])
+        queue = queue[1:]
+    return queue
+
+
+async def _skip_deleted_card(
+    callback: CallbackQuery,
+    state: FSMContext,
+    session_factory: async_sessionmaker[AsyncSession],
+    card_id: str,
+) -> None:
+    await callback.answer(DELETED_CARD_TEXT)
+    # Only a tap on the current card moves the session on - re-showing the
+    # head from an old message's button would duplicate the card on screen.
+    queue: list[str] = (await state.get_data()).get("queue", [])
+    if queue and queue[0] == card_id:
+        await _show_next_card(callback.message, state, session_factory)
+
+
 async def _show_next_card(
     answer_to: Message, state: FSMContext, session_factory: async_sessionmaker[AsyncSession]
 ) -> None:
     data = await state.get_data()
-    queue: list[str] = data["queue"]
+    async with session_factory() as session:
+        queue = await _drop_deleted_head(session, data["queue"])
+    if queue != data["queue"]:
+        await state.update_data(queue=queue)
     started_at = datetime.fromisoformat(data["session_started_at"])
     reviewed_count: int = data["reviewed_count"]
     elapsed_minutes = (datetime.now(UTC) - started_at).total_seconds() / 60
@@ -319,14 +347,19 @@ async def learn_debt_choice(
 async def learn_reveal(
     callback: CallbackQuery,
     session_factory: async_sessionmaker[AsyncSession],
+    state: FSMContext,
 ) -> None:
     card_id = callback.data.split(":", 2)[2]
     logger.debug("event=learn.reveal card_id=%s", card_id)
     async with session_factory() as session:
         card = await session.get(Card, card_id)
-        note = await session.get(Note, card.note_id)
-        _front, back = render_card(card, note)
+        if card is not None:
+            note = await session.get(Note, card.note_id)
+            _front, back = render_card(card, note)
 
+    if card is None:
+        await _skip_deleted_card(callback, state, session_factory, card_id)
+        return
     await callback.message.answer(back, reply_markup=_rating_keyboard(card_id))
     await callback.answer()
 
@@ -366,6 +399,13 @@ async def learn_rate(
 
     async with session_factory() as session:
         card = await session.get(Card, card_id)
+        if card is None:
+            # Deleted mid-session. The head is already popped above - undo
+            # only the count claimed with it, nothing was reviewed.
+            await state.update_data(reviewed_count=data.get("reviewed_count", 0))
+            await callback.answer(DELETED_CARD_TEXT)
+            await _show_next_card(callback.message, state, session_factory)
+            return
         # When this card was last answered - FSRS schedules off the gap since
         # then. Read *before* the new row below is added to the session:
         # adding it first would let autoflush include this very answer in the
@@ -396,6 +436,7 @@ async def learn_listen(
     callback: CallbackQuery,
     session_factory: async_sessionmaker[AsyncSession],
     settings: Settings,
+    state: FSMContext,
 ) -> None:
     if not settings.openai_api_key:
         await callback.answer("Озвучка недоступна - не настроен OpenAI.", show_alert=True)
@@ -404,8 +445,11 @@ async def learn_listen(
     card_id = callback.data.split(":", 2)[2]
     async with session_factory() as session:
         card = await session.get(Card, card_id)
-        note = await session.get(Note, card.note_id)
+        note = await session.get(Note, card.note_id) if card is not None else None
 
+    if card is None:
+        await _skip_deleted_card(callback, state, session_factory, card_id)
+        return
     logger.debug("event=learn.listen card_id=%s", card_id)
     client = OpenAI(api_key=settings.openai_api_key)
     audio = synthesize_speech(
