@@ -10,6 +10,7 @@ from conftest import log_fields
 from kielikaveri.db.engine import create_all, make_engine, make_session_factory
 from kielikaveri.db.models import Note, NoteKind
 from kielikaveri.ingest import (
+    ResolvedLemma,
     TokenUsage,
     _chat_schema,
     _load_note_schema,
@@ -23,6 +24,7 @@ from kielikaveri.ingest import (
     hash_text,
     resolve_ambiguous_forms,
     resolve_note_forms,
+    resolve_note_lemma,
     resolve_note_pos,
     store_cached_chat,
 )
@@ -186,6 +188,24 @@ def test_chat_schema_wraps_the_note_schema_and_excludes_fst_fields():
     note_item = schema["properties"]["candidates"]["items"]
     assert "principal_forms" not in note_item["properties"]["meta"]["properties"]
     assert "origin" not in note_item["properties"]["meta"]["properties"]
+
+
+def test_chat_schema_asks_for_the_surface_form_but_the_note_never_keeps_it():
+    note_item = _chat_schema(_load_note_schema())["properties"]["candidates"]["items"]
+    assert note_item["properties"]["surface_fi"]["type"] == ["string", "null"]
+    assert "surface_fi" in note_item["required"]
+
+    candidate = {
+        "lemma": "rientää",
+        "pos": "verbi",
+        "translation_ru": "спешить",
+        "example_fi": "Hän riensi kotiin.",
+        "example_ru": "Он поспешил домой.",
+        "kind": "word",
+        "meta": {},
+        "surface_fi": "riensi",
+    }
+    assert "surface_fi" not in build_full_note(candidate, None)
 
 
 # --- check_and_suggest ---------------------------------------------------------
@@ -528,6 +548,143 @@ async def test_resolve_note_pos_does_not_fall_back_to_a_pick_when_the_breaker_is
         )
 
     client.responses.create.assert_not_called()
+
+
+# --- resolve_note_lemma: lemma from the surface form -----------------------------
+# Real FST, only the OpenAI client is faked - see the resolve_note_pos section.
+
+
+async def test_resolve_note_lemma_replaces_a_made_up_lemma_with_the_fsts():
+    # The live case: the LLM read "riensi" and answered "riensiä", which is
+    # not a Finnish word. The FST can't analyze that, but it can analyze
+    # "riensi" - one lemma, so nothing to ask.
+    client = MagicMock()
+    client.responses.create = AsyncMock()
+
+    resolved, usage = await resolve_note_lemma(
+        client, make_breaker(), "gpt-5.6-terra", "riensiä", "verbi", "riensi", "Hän riensi.", NOW
+    )
+
+    assert resolved == ResolvedLemma("rientää", in_dictionary=True)
+    assert usage is None
+    client.responses.create.assert_not_called()
+
+
+async def test_resolve_note_lemma_leaves_a_known_lemma_alone():
+    client = MagicMock()
+    client.responses.create = AsyncMock()
+
+    resolved, _usage = await resolve_note_lemma(
+        client, make_breaker(), "gpt-5.6-terra", "hakea", "verbi", "haen", "Haen töitä.", NOW
+    )
+
+    assert resolved == ResolvedLemma("hakea", in_dictionary=True)
+    client.responses.create.assert_not_called()
+
+
+async def test_resolve_note_lemma_still_lemmatizes_an_inflected_llm_lemma():
+    # canonical_key()'s behaviour is kept: "töitä" is a form the FST knows.
+    resolved, _usage = await resolve_note_lemma(
+        MagicMock(), make_breaker(), "gpt-5.6-terra", "töitä", "substantiivi", None, None, NOW
+    )
+
+    assert resolved == ResolvedLemma("työ", in_dictionary=True)
+
+
+async def test_resolve_note_lemma_flags_a_word_the_fst_does_not_know_at_all():
+    # Could be slang, a loan or a rare word - saved as is, never rejected.
+    client = MagicMock()
+    client.responses.create = AsyncMock()
+
+    resolved, usage = await resolve_note_lemma(
+        client, make_breaker(), "gpt-5.6-terra", "xyzquu", "substantiivi", "xyzquu", None, NOW
+    )
+
+    assert resolved == ResolvedLemma("xyzquu", in_dictionary=False)
+    assert usage is None
+    client.responses.create.assert_not_called()
+
+
+async def test_resolve_note_lemma_flags_an_unknown_lemma_without_a_surface_form():
+    # Candidates cached or parked in FSM state before surface_fi existed.
+    resolved, _usage = await resolve_note_lemma(
+        MagicMock(), make_breaker(), "gpt-5.6-terra", "riensiä", "verbi", None, None, NOW
+    )
+
+    assert resolved == ResolvedLemma("riensiä", in_dictionary=False)
+
+
+async def test_resolve_note_lemma_narrows_several_lemmas_by_the_llm_pos():
+    # "tuli" is a form of "tulla" (verb) and the lemma "tuli" (noun). The
+    # LLM's pos describes this very reading, so it settles it without a call.
+    client = MagicMock()
+    client.responses.create = AsyncMock()
+
+    resolved, usage = await resolve_note_lemma(
+        client, make_breaker(), "gpt-5.6-terra", "tuleta", "verbi", "tuli", "Hän tuli.", NOW
+    )
+
+    assert resolved == ResolvedLemma("tulla", in_dictionary=True)
+    assert usage is None
+    client.responses.create.assert_not_called()
+
+
+async def test_resolve_note_lemma_asks_the_llm_with_an_enum_built_from_the_fst():
+    # "kuusi" is a form of both "kuu" and "kuusi", both nouns - pos can't
+    # decide, only the sentence can.
+    client = MagicMock()
+    client.responses.create = AsyncMock(return_value=fake_response({"lemma": "kuusi"}))
+
+    resolved, usage = await resolve_note_lemma(
+        client,
+        make_breaker(),
+        "gpt-5.6-terra",
+        "kuusie",
+        "substantiivi",
+        "kuusi",
+        "Pihalla kasvaa kuusi.",
+        NOW,
+    )
+
+    kwargs = client.responses.create.call_args.kwargs
+    schema = kwargs["text"]["format"]["schema"]
+    assert schema["properties"]["lemma"]["enum"] == ["kuu", "kuusi"]
+    assert kwargs["text"]["format"]["strict"] is True
+    assert "Pihalla kasvaa kuusi." in kwargs["input"]
+    assert resolved == ResolvedLemma("kuusi", in_dictionary=True)
+    assert usage is not None
+
+
+async def test_resolve_note_lemma_rejects_a_choice_outside_the_fst_set():
+    client = MagicMock()
+    client.responses.create = AsyncMock(return_value=fake_response({"lemma": "kuusikko"}))
+
+    resolved, _usage = await resolve_note_lemma(
+        client, make_breaker(), "gpt-5.6-terra", "kuusie", "substantiivi", "kuusi", None, NOW
+    )
+
+    assert resolved == ResolvedLemma("kuusie", in_dictionary=False)
+
+
+async def test_resolve_note_lemma_does_not_fall_back_to_a_pick_when_the_breaker_is_open():
+    client = MagicMock()
+    client.responses.create = AsyncMock()
+    breaker = CallBreaker(max_calls=0, window=timedelta(minutes=10))
+
+    with pytest.raises(CircuitOpenError):
+        await resolve_note_lemma(
+            client, breaker, "gpt-5.6-terra", "kuusie", "substantiivi", "kuusi", None, NOW
+        )
+
+    client.responses.create.assert_not_called()
+
+
+async def test_resolve_note_lemma_leaves_a_pattern_alone():
+    resolved, _usage = await resolve_note_lemma(
+        MagicMock(), make_breaker(), "gpt-5.6-terra", "hakea + partitiivi", None, None, None, NOW
+    )
+
+    assert resolved == ResolvedLemma("hakea + partitiivi", in_dictionary=True)
 
 
 # --- resolve_note_forms: pos correction ------------------------------------------

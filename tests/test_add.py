@@ -1166,3 +1166,100 @@ async def test_chat_dedups_against_the_corrected_pos(session_factory, monkeypatc
         notes = (await session.scalars(select(Note))).all()
     assert len(notes) == 1
     assert "не дублирую" in second.message.answer.call_args.args[0]
+
+
+# --- lemma from the surface form end to end ----------------------------------------
+
+
+async def _add_via_chat(session_factory, breaker: CallBreaker | None = None) -> SimpleNamespace:
+    state = make_state()
+    await chat_message(
+        make_message("добавь"), state, session_factory, make_settings(), make_breaker()
+    )
+    data = await state.get_data()
+    async with session_factory() as session:
+        deck_id = (await get_or_create_default_deck(session, 1)).id
+    callback = make_callback(f"adddeck:{data['batch_id']}:{deck_id}")
+    await add_deck_choice(
+        callback, state, session_factory, make_settings(), breaker or make_breaker()
+    )
+    return callback
+
+
+RIENTAA_CANDIDATE = {
+    "lemma": "riensiä",
+    "pos": "verbi",
+    "translation_ru": "спешить",
+    "example_fi": "He riensivät kotiin.",
+    "example_ru": "Они поспешили домой.",
+    "kind": "word",
+    "meta": {},
+    "surface_fi": "riensivät",
+}
+
+
+async def test_chat_saves_a_made_up_lemma_under_the_fsts_lemma(session_factory, monkeypatch):
+    """Regression, live 03.09.2026: the LLM answered "riensiä" for the text's
+    "riensivät" - not a Finnish word. The note landed under that made-up
+    lemma with no forms at all.
+    """
+    patch_check_and_suggest(monkeypatch, "Добавляю.", [RIENTAA_CANDIDATE])
+
+    callback = await _add_via_chat(session_factory)
+
+    async with session_factory() as session:
+        note = (await session.scalars(select(Note))).one()
+    assert note.lemma == "rientää"
+    assert note.meta["forms_verified"] is True
+    assert "surface_fi" not in note.meta
+    report = callback.message.answer.call_args.args[0]
+    assert "🇫🇮 rientää → спешить" in report
+    assert "⚠️" not in report
+
+
+async def test_chat_dedups_against_the_fsts_lemma(session_factory, monkeypatch):
+    patch_check_and_suggest(monkeypatch, "Добавляю.", [RIENTAA_CANDIDATE])
+
+    await _add_via_chat(session_factory)
+    second = await _add_via_chat(session_factory)
+
+    async with session_factory() as session:
+        assert len((await session.scalars(select(Note))).all()) == 1
+    assert "не дублирую: rientää" in second.message.answer.call_args.args[0]
+
+
+async def test_chat_flags_a_word_the_fst_does_not_know(session_factory, monkeypatch):
+    candidate = {**RIENTAA_CANDIDATE, "lemma": "xyzquu", "surface_fi": "xyzquu"}
+    patch_check_and_suggest(monkeypatch, "Добавляю.", [candidate, PATTERN_CANDIDATE])
+
+    callback = await _add_via_chat(session_factory)
+
+    async with session_factory() as session:
+        lemmas = {note.lemma for note in (await session.scalars(select(Note))).all()}
+    assert lemmas == {"xyzquu", "hakea + partitiivi"}  # saved, not rejected
+    report = callback.message.answer.call_args.args[0]
+    assert "🇫🇮 xyzquu → спешить ⚠️" in report
+    assert "🇫🇮 hakea + partitiivi → искать + партитив\n" in report  # no flag on a pattern
+    assert "не нашла в словаре" in report
+
+
+async def test_chat_reports_a_failed_lemma_choice_without_blocking_the_others(
+    session_factory, monkeypatch
+):
+    # "kuusi" needs the tie-break call, and the breaker is already open.
+    candidate = {
+        **RIENTAA_CANDIDATE,
+        "lemma": "kuusie",
+        "pos": "substantiivi",
+        "surface_fi": "kuusi",
+    }
+    patch_check_and_suggest(monkeypatch, "Добавляю.", [candidate, PATTERN_CANDIDATE])
+
+    callback = await _add_via_chat(session_factory, make_breaker(max_calls=0))
+
+    async with session_factory() as session:
+        assert [n.lemma for n in (await session.scalars(select(Note))).all()] == [
+            "hakea + partitiivi"
+        ]
+    report = callback.message.answer.call_args.args[0]
+    assert "Не удалось сохранить «kuusie» - предохранитель сработал." in report
