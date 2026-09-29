@@ -78,8 +78,9 @@ def test_convert_to_strict_raises_on_dynamic_map_field(schema):
 def test_fst_tag_to_pos_covers_exactly_the_schema_pos_enum(schema):
     # FST_TAG_TO_POS (morphology.py) and $defs/pos (schema.json) are two
     # independent lists that must name the same set of parts of speech.
-    # Nothing else checks this - edit one without the other and detect_pos()
-    # silently stops recognizing a pos value, with no test failure.
+    # Nothing else checks this - edit one without the other and
+    # pos_set_for_lemma() silently stops recognizing a pos value, with no
+    # test failure.
     schema_pos_values = set(schema["$defs"]["pos"]["enum"])
     assert set(FST_TAG_TO_POS.values()) == schema_pos_values
 

@@ -5,7 +5,6 @@ import pytest
 from conftest import log_fields
 
 from finn_cards.morphology import (
-    detect_pos,
     generate_forms,
     lemmatize,
     pos_set_for_lemma,
@@ -34,31 +33,11 @@ def test_lemmatize_compound_with_no_whole_word_entry():
     assert lemmatize("keittiöpöydässä") == ["keittiöpöytä"]
 
 
-def test_detect_pos_verb():
-    assert "verbi" in detect_pos("hakea")
-
-
-def test_detect_pos_adjective_not_confused_with_adverb():
-    # "+A" is a substring of "+Adv" - detect_pos must match whole tag
-    # components, not substrings, or every adjective would look like an
-    # adverb too.
-    assert detect_pos("lyhyt") == ["adjektiivi"]
-
-
-def test_detect_pos_compound_not_polluted_by_modifier_class():
-    # bug: "sinivalkoinen" (adjective) also has a Cmp#-split reading
-    # "sini+N+Sg+Nom+Cmp#valkoinen+N+Sg+Nom" where the *modifier*
-    # component is tagged +N. Taking the first tag from every reading
-    # returned ["substantiivi", "adjektiivi"] - the lexicalized
-    # non-compound reading ("sinivalkoinen+A+Sg+Nom") must win.
-    assert detect_pos("sinivalkoinen") == ["adjektiivi"]
-
-
 # --- pos_set_for_lemma --------------------------------------------------------
 #
-# The point of every test here: detect_pos() answers "what can this string
-# be", pos_set_for_lemma() answers "what can this lemma be". The two differ
-# exactly when a string also happens to be some other lemma's inflected form,
+# The point of every test here: pos_set_for_lemma() answers "what can this
+# lemma be", not "what can this string be". The two differ exactly when a
+# string also happens to be some other lemma's inflected form,
 # which is where generate_forms() used to be handed a part of speech that
 # produced nothing.
 
@@ -67,14 +46,14 @@ def test_pos_set_for_lemma_ignores_another_lemmas_reading():
     # "tuli" analyzes as tulla+V+Act+Ind+Prt+Sg3 ("he came") *and* as
     # tuli+N+Sg+Nom ("fire"). The verb reading belongs to the lemma "tulla",
     # so it must not end up in the lemma "tuli"'s own set.
-    assert "verbi" in detect_pos("tuli")
+    assert "tulla" in lemmatize("tuli")
     assert pos_set_for_lemma("tuli") == {"substantiivi"}
 
 
 def test_pos_set_for_lemma_drops_voida_readings_from_voi():
     # Five of "voi"'s eight readings are forms of the verb "voida"; the rest
     # are the lemma "voi" itself (butter / particle / interjection).
-    assert "verbi" in detect_pos("voi")
+    assert "voida" in lemmatize("voi")
     assert pos_set_for_lemma("voi") == {"substantiivi", "partikkeli", "interjektio"}
 
 
@@ -93,6 +72,8 @@ def test_pos_set_for_lemma_keeps_both_when_one_lemma_really_has_two():
 
 
 def test_pos_set_for_lemma_unambiguous_word():
+    # "+A" is a substring of "+Adv" - tags must match whole, or every
+    # adjective would look like an adverb too.
     assert pos_set_for_lemma("kissa") == {"substantiivi"}
     assert pos_set_for_lemma("lyhyt") == {"adjektiivi"}
 
@@ -102,9 +83,9 @@ def test_pos_set_for_lemma_unknown_word_is_empty():
 
 
 def test_pos_set_for_lemma_not_polluted_by_compound_modifier_class():
-    # Same trap detect_pos() guards against: "sinivalkoinen" has a Cmp#
-    # reading whose first component "sini" is a noun, but the lexicalized
-    # whole-word reading says adjective and wins.
+    # "sinivalkoinen" has a Cmp# reading whose first component "sini" is a
+    # noun, but the lexicalized whole-word reading says adjective and wins.
+    # Taking the class from every reading gave {"substantiivi", "adjektiivi"}.
     assert pos_set_for_lemma("sinivalkoinen") == {"adjektiivi"}
 
 
@@ -176,7 +157,7 @@ def test_concurrent_calls_do_not_crash():
 
     def worker(lemma: str, pos: str) -> None:
         try:
-            assert detect_pos(lemma)
+            assert pos_set_for_lemma(lemma)
             assert lemmatize(lemma)
             generate_forms(lemma, pos)
         except Exception as exc:  # noqa: BLE001
