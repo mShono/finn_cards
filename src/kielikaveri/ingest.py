@@ -2,8 +2,8 @@
 candidates (plan 3.11, "Текст", revised - a chat instead of a fixed
 one-by-one confirmation list).
 
-Up to three separate LLM calls, all structured (strict: true) - the third
-only fires for a genuinely ambiguous lemma:
+Up to four separate LLM calls, all structured (strict: true) - all but the
+first only fire for a genuine ambiguity the FST can't settle alone:
 
 1. check_and_suggest() - reads one chat message (pasted text, or a
    translation attempt) and returns a conversational Russian reply plus
@@ -22,6 +22,10 @@ only fires for a genuinely ambiguous lemma:
    and there is more than one to choose from ("hakea" is both a verb and a
    noun), only the sentence can decide, so the LLM picks again from an enum
    of exactly the FST's set. See resolve_note_pos().
+4. choose_lemma() - the same pattern for the lemma: when the LLM's lemma
+   is unknown to the FST, the FST lemmatizes the word as the text spells it
+   instead, and the LLM only picks among those lemmas. See
+   resolve_note_lemma().
 """
 
 from __future__ import annotations
@@ -65,6 +69,10 @@ EXCLUDED_FIELDS = frozenset({"id", "principal_forms", "forms_source", "forms_ver
 CHAT_SCHEMA_NAME = "kielikaveri_chat_reply"
 FORM_CHOICE_SCHEMA_NAME = "kielikaveri_form_choice"
 POS_CHOICE_SCHEMA_NAME = "kielikaveri_pos_choice"
+LEMMA_CHOICE_SCHEMA_NAME = "kielikaveri_lemma_choice"
+
+# Candidate-only field, see _chat_schema().
+SURFACE_FIELD = "surface_fi"
 
 
 @dataclass
@@ -85,12 +93,32 @@ class ResolvedForms:
     pos: str | None = None
 
 
+@dataclass
+class ResolvedLemma:
+    lemma: str
+    # False: the FST knows neither the lemma nor the word as the text spells
+    # it - saved anyway, but /add flags it for the student to check.
+    in_dictionary: bool
+
+
 def _load_note_schema() -> dict:
     return json.loads(SCHEMA_PATH.read_text())
 
 
 def _chat_schema(note_schema: dict) -> dict:
     note_strict = convert_to_strict(note_schema, "note", exclude=EXCLUDED_FIELDS)
+    # Not a note field, so not in cards/schema.json: the word exactly as the
+    # student's text spells it. The FST lemmatizes it itself when the LLM's
+    # own lemma is made up (resolve_note_lemma). build_full_note() never
+    # copies it into the note.
+    note_strict["properties"][SURFACE_FIELD] = {
+        "type": ["string", "null"],
+        "description": (
+            "kind=word: the word exactly as it is spelled in the student's text, "
+            "unchanged. null for kind=pattern."
+        ),
+    }
+    note_strict["required"].append(SURFACE_FIELD)
     return {
         "type": "object",
         "additionalProperties": False,
@@ -149,7 +177,13 @@ def _chat_instructions(*, is_follow_up: bool) -> str:
         "Важно для `lemma` и `example_fi` в любом кандидате: только финские "
         "слова и предложения. Никогда не подставляй английский или русский "
         "перевод вместо финской леммы (проверяй сам себя - лемма должна быть "
-        "словом финского языка, а не его переводом)."
+        "словом финского языка, а не его переводом).\n\n"
+        '`surface_fi` в кандидате `kind: "word"` - это слово ровно так, как '
+        "оно написано у ученика: та же словоформа, то же написание, ничего не "
+        "исправляй и не приводи к лемме (в тексте `riensi` - значит "
+        '`surface_fi: "riensi"`, лемма при этом `rientää`). Если ученик '
+        "назвал слово отдельно, без текста, - это слово и есть `surface_fi`. "
+        'Для `kind: "pattern"` - null.'
     )
     if is_follow_up:
         text += (
@@ -627,6 +661,132 @@ async def resolve_note_forms(
     return ResolvedForms(forms, forms_source, forms_verified, pos), usage
 
 
+async def choose_lemma(
+    client: AsyncOpenAI,
+    breaker: CallBreaker,
+    model: str,
+    surface: str,
+    allowed: list[str],
+    context: str | None,
+    now: datetime,
+) -> tuple[str, TokenUsage]:
+    """Have the LLM pick which FST lemma `surface` is a form of - never invent one.
+
+    Same shape as choose_pos(): the enum is exactly lemmatize(surface), so
+    the schema itself rules out a lemma the FST never produced.
+    """
+    breaker.check(now)
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["lemma"],
+        "properties": {"lemma": {"type": "string", "enum": allowed}},
+    }
+    _log_llm_request("choose_lemma", model, surface=surface)
+    start = time.monotonic()
+    response = await client.responses.create(
+        model=model,
+        instructions=(
+            f"Слово '{surface}' по данным морфологического анализатора может быть "
+            "формой нескольких разных лемм. Выбери лемму, формой которой слово "
+            "является в присланном предложении. Если предложения нет, выбери самую "
+            "обычную. Схема ответа разрешает только значения из присланного списка."
+        ),
+        input=json.dumps(
+            {"surface": surface, "allowed_lemmas": allowed, "example_fi": context or ""},
+            ensure_ascii=False,
+        ),
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": LEMMA_CHOICE_SCHEMA_NAME,
+                "schema": schema,
+                "strict": True,
+            }
+        },
+    )
+    duration_ms = int((time.monotonic() - start) * 1000)
+    usage = _usage_from(response)
+    _log_llm_response("choose_lemma", model, duration_ms, usage, surface=surface)
+    return json.loads(response.output_text)["lemma"], usage
+
+
+async def resolve_note_lemma(
+    client: AsyncOpenAI,
+    breaker: CallBreaker,
+    model: str,
+    lemma: str,
+    pos: str | None,
+    surface: str | None,
+    context: str | None,
+    now: datetime,
+) -> tuple[ResolvedLemma, TokenUsage | None]:
+    """The lemma a candidate is saved under - the FST's, whenever it has one.
+
+    The LLM sometimes makes a lemma up ("riensiä" for the text's "riensi",
+    whose real lemma is "rientää"). The FST can't analyze a made-up string,
+    but it can analyze the word as the text spells it (`surface`, see
+    _chat_schema()), so:
+
+    * the FST knows `lemma` - canonical_key() rules, nothing new;
+    * it doesn't, and lemmatize(surface) gives one lemma - take it;
+    * several - keep the ones whose part of speech matches the LLM's `pos`
+      (it describes the same reading in the same sentence); one left - take
+      it, otherwise the LLM picks from an enum of them (choose_lemma());
+    * nothing, or no `surface` (candidates cached before the field existed) -
+      keep `lemma` as is, but flagged: it may be a real word the FST lacks
+      (slang, a loan, a rare word), so it can't simply be rejected.
+    """
+    if pos is None:
+        # kind="pattern" - a construction, not a lemma (see canonical_key).
+        return ResolvedLemma(lemma, in_dictionary=True), None
+
+    known = _dictionary_lemma(lemma)
+    if known is not None:
+        return ResolvedLemma(known, in_dictionary=True), None
+
+    options = lemmatize(surface) if surface else []
+    if not options:
+        logger.info("event=resolve_note_lemma.unknown lemma=%s surface=%s", lemma, surface)
+        return ResolvedLemma(lemma, in_dictionary=False), None
+
+    usage = None
+    if len(options) > 1:
+        options = [option for option in options if pos in pos_set_for_lemma(option)] or options
+    if len(options) == 1:
+        chosen = options[0]
+    else:
+        chosen, usage = await choose_lemma(
+            client, breaker, model, surface, sorted(options), context, now
+        )
+        if chosen not in options:
+            # The strict enum should make this unreachable - keep the LLM's
+            # lemma rather than an arbitrary option, and flag it honestly.
+            logger.warning(
+                "event=resolve_note_lemma.invalid_choice lemma=%s surface=%s chosen=%s",
+                lemma,
+                surface,
+                chosen,
+            )
+            return ResolvedLemma(lemma, in_dictionary=False), usage
+
+    logger.info(
+        "event=resolve_note_lemma.corrected llm_lemma=%s surface=%s lemma=%s",
+        lemma,
+        surface,
+        chosen,
+    )
+    return ResolvedLemma(chosen, in_dictionary=True), usage
+
+
+def _dictionary_lemma(word: str) -> str | None:
+    """`word` itself if the FST knows it as a lemma, else the first lemma it inflects, else None."""
+    lemmas = lemmatize(word)
+    if word in lemmas:
+        return word
+    return lemmas[0] if lemmas else None
+
+
 def canonical_key(lemma: str, pos: str | None) -> tuple[str, str | None]:
     """Dedup key (plan phase 3): lemmatize the LLM's candidate, don't trust it as a lemma.
 
@@ -643,10 +803,7 @@ def canonical_key(lemma: str, pos: str | None) -> tuple[str, str | None]:
     """
     if pos is None:
         return lemma, None
-    lemmas = lemmatize(lemma)
-    if lemma in lemmas:
-        return lemma, pos
-    return (lemmas[0], pos) if lemmas else (lemma, pos)
+    return _dictionary_lemma(lemma) or lemma, pos
 
 
 async def existing_note_keys(

@@ -55,14 +55,15 @@ from kielikaveri.db.models import (
 )
 from kielikaveri.import_cards import load_validator
 from kielikaveri.ingest import (
+    SURFACE_FIELD,
     build_chat_input,
     build_full_note,
-    canonical_key,
     check_and_suggest,
     existing_note_keys,
     get_cached_chat,
     hash_text,
     resolve_note_forms,
+    resolve_note_lemma,
     store_cached_chat,
 )
 from kielikaveri.llm.breaker import CallBreaker, CircuitOpenError
@@ -82,6 +83,9 @@ LEARN_STOPPED_TEXT = "Повторение остановлено."
 UNKNOWN_COMMAND_TEXT = "Не знаю такой команды. Список команд - /help"
 RESEND_HINT = "Чтобы сохранить, пришли текст ещё раз."
 WORDS_NOT_SAVED_TEXT = f"Слова из прошлого текста не сохранила. {RESEND_HINT}"
+NOT_IN_DICTIONARY_HINT = (
+    "⚠️ - не нашла в словаре, проверь написание: /decks → колода → слово → «✍️ Слово»."
+)
 
 
 class AddStates(StatesGroup):
@@ -534,22 +538,43 @@ async def _save_candidates_and_report(
         deck_name = deck.name if deck else "?"
         existing = await existing_note_keys(session, user_id, deck_id=deck_id)
 
+    client = make_client(settings.openai_api_key, settings.openai_timeout_seconds)
     seen: set[tuple[str, str | None]] = set()
-    to_add: list[dict] = []
+    # (candidate, in_dictionary) - see ingest.ResolvedLemma.
+    to_add: list[tuple[dict, bool]] = []
     duplicate_lemmas: list[str] = []
+    failed: list[tuple[str, str]] = []
     for candidate in candidates:
-        key = canonical_key(candidate["lemma"], candidate.get("pos"))
+        # Settle the lemma before the dedup check - the FST's, not the LLM's
+        # raw string, which may be an inflected form ("töitä") or made up
+        # entirely ("riensiä"). Without this the check would compare one
+        # lemma and the saved card would still get the other.
+        try:
+            resolved_lemma, _usage = await resolve_note_lemma(
+                client,
+                breaker,
+                settings.openai_text_model,
+                candidate["lemma"],
+                candidate.get("pos"),
+                candidate.get(SURFACE_FIELD),
+                candidate.get("example_fi"),
+                now,
+            )
+        except CircuitOpenError:
+            failed.append((candidate["lemma"], "предохранитель сработал"))
+            continue
+        except openai.APIError:
+            logger.exception("event=llm.error op=resolve_note_lemma lemma=%s", candidate["lemma"])
+            failed.append((candidate["lemma"], "OpenAI недоступен"))
+            continue
+        key = (resolved_lemma.lemma, candidate.get("pos"))
         if key in existing or key in seen:
             duplicate_lemmas.append(key[0])
             continue
         seen.add(key)
-        # canonical_key() lemmatizes to catch dupes even when the LLM handed
-        # back an inflected form as "lemma" (cards/instructions.md) - without
-        # this, the dedup check sees the corrected lemma but the saved card
-        # still gets the raw inflected string.
         if key[0] != candidate["lemma"]:
             candidate = {**candidate, "lemma": key[0]}
-        to_add.append(candidate)
+        to_add.append((candidate, resolved_lemma.in_dictionary))
 
     logger.info(
         "event=add.dedup deck=%s candidates=%d to_add=%d duplicates=%d",
@@ -559,13 +584,11 @@ async def _save_candidates_and_report(
         len(duplicate_lemmas),
     )
 
-    saved: list[tuple[str, str]] = []
-    failed: list[tuple[str, str]] = []
-    for candidate in to_add:
+    saved: list[tuple[str, str, bool]] = []
+    for candidate, in_dictionary in to_add:
         logger.debug("event=add.candidate lemma=%s kind=%s", candidate["lemma"], candidate["kind"])
         resolved = None
         if candidate["kind"] == "word":
-            client = make_client(settings.openai_api_key, settings.openai_timeout_seconds)
             try:
                 resolved, _usage = await resolve_note_forms(
                     client,
@@ -649,7 +672,7 @@ async def _save_candidates_and_report(
                 )
                 duplicate_lemmas.append(full_note["lemma"])
                 continue
-        saved.append((full_note["lemma"], full_note["translation_ru"]))
+        saved.append((full_note["lemma"], full_note["translation_ru"], in_dictionary))
 
     duration_ms = int((time.monotonic() - start) * 1000)
     logger.info(
@@ -661,7 +684,12 @@ async def _save_candidates_and_report(
         duration_ms,
     )
 
-    lines = [f"🇫🇮 {lemma} → {translation}" for lemma, translation in saved]
+    lines = [
+        f"🇫🇮 {lemma} → {translation}" + ("" if in_dictionary else " ⚠️")
+        for lemma, translation, in_dictionary in saved
+    ]
+    if not all(in_dictionary for _lemma, _translation, in_dictionary in saved):
+        lines.append(NOT_IN_DICTIONARY_HINT)
     if saved:
         async with session_factory() as session:
             count = await session.scalar(
