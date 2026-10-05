@@ -563,6 +563,31 @@ async def test_learn_start_goes_straight_to_reviewing_when_under_the_debt_thresh
     assert "hakea" in message.answer.call_args.args[0]  # the card's front, not a debt prompt
 
 
+async def test_learn_start_does_not_count_never_reviewed_cards_as_debt(session_factory):
+    # The handler-level twin of test_queue.py's
+    # test_debt_ignores_cards_that_have_never_been_reviewed: that one pins
+    # overdue_count(reviewed_only=True), this one pins that learn_start passes
+    # the flag. Freshly introduced forms get due=now, so without it every
+    # batch of new forms would read as missed reviews and trigger the prompt.
+    async with session_factory() as session:
+        session.add(User(id=1))
+        session.add(make_note())
+        await session.flush()
+        for i in range(3):
+            session.add(make_card(f"card-{i}", "note-1", 1, due=NOW - timedelta(days=1)))
+        await session.commit()
+
+    state = make_state()
+    settings = make_settings(debt_threshold=2)
+    message = make_message()
+
+    await learn_start(message, state, session_factory, settings)
+
+    assert await state.get_state() == LearnStates.reviewing
+    messages = [call.args[0] for call in message.answer.call_args_list]
+    assert not any("Просрочено" in m for m in messages)
+
+
 # --- learn_start / learn_deck_choice: deck picking ---------------------------
 
 
