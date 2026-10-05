@@ -65,9 +65,9 @@ def main() -> None:
     for lemma, pos in WORDS:
         # The curated list above pairs a *lemma* with its part of speech,
         # so the question is what the FST allows for that lemma - not what
-        # the bare string can analyze as. detect_pos("tuli") includes "verbi"
-        # from the unrelated lemma "tulla", which would report a mismatch
-        # that isn't one.
+        # the bare string can analyze as. The string "tuli" can be "verbi"
+        # via the unrelated lemma "tulla", so a string-level check would
+        # accept a part of speech the lemma "tuli" never has.
         allowed = pos_set_for_lemma(lemma)
         if pos not in allowed:
             pos_mismatches.append((lemma, pos, sorted(allowed)))

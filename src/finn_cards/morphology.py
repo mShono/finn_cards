@@ -180,39 +180,18 @@ def lemmatize(word: str) -> list[str]:
     return lemmas
 
 
-def detect_pos(word: str) -> list[str]:
-    """Distinct parts of speech `word` analyzes as, in our vocabulary.
-
-    Must run before generate_forms(): adjectives need the +A tag, nouns
-    +N, and generate() on the wrong tag silently returns nothing.
-
-    A Cmp#-split reading (e.g. "sini+N+Sg+Nom+Cmp#valkoinen+N+Sg+Nom" for
-    "sinivalkoinen") tags each *component* with its own class, which need
-    not match the compound's actual class - "sinivalkoinen" is only ever
-    an adjective, but its first component "sini" is a noun. A lexicalized
-    whole-word reading with no Cmp# (e.g. "sinivalkoinen+A+Sg+Nom") gives
-    the real class, so it takes priority; Cmp# readings are only a
-    fallback for words with no whole-word dictionary entry at all.
-    """
-    with _FST_LOCK:
-        readings = uralicApi.analyze(word, LANG)
-
-    whole_word = [reading for reading, _weight in readings if "Cmp#" not in reading]
-    return _pos_from_readings(whole_word) or _pos_from_readings(
-        reading for reading, _weight in readings
-    )
-
-
 def pos_set_for_lemma(lemma: str) -> set[str]:
     """Parts of speech the FST allows for *this lemma*, not for this string.
 
-    detect_pos() answers "what can this string be", which necessarily mixes
-    in readings belonging to other lemmas: "tuli" analyzes both as
+    generate_forms() needs the right class tag (+A for adjectives, +N for
+    nouns) - on the wrong one the FST silently returns nothing. Analyzing
+    the bare string is not enough to find it, because the analysis mixes in
+    readings belonging to other lemmas: "tuli" analyzes both as
     "tulla+V+Act+Ind+Prt+Sg3" (the past tense of "tulla") and as
-    "tuli+N+Sg+Nom" ("fire"), so its POS list contains "verbi" even though
-    the lemma "tuli" is only ever a noun - and generate_forms("tuli",
-    "verbi") then silently produces nothing. Keeping only the readings whose
-    own lemma is `lemma` is what separates the two questions.
+    "tuli+N+Sg+Nom" ("fire"), so the string can be "verbi" even though the
+    lemma "tuli" is only ever a noun - and generate_forms("tuli", "verbi")
+    then silently produces nothing. Keeping only the readings whose own
+    lemma is `lemma` is what separates the two questions.
 
     Returns a set on purpose. Every reading here carries FST weight 0.0, so
     their order is not a ranking and must never be used to pick one: a lemma
@@ -226,11 +205,14 @@ def pos_set_for_lemma(lemma: str) -> set[str]:
 
     own = [reading for reading, _weight in readings if _reading_lemma(reading) == lemma]
 
-    # Same priority as detect_pos(): a lexicalized whole-word reading states
-    # the real class, Cmp# readings only stand in for compounds that have no
-    # whole-word entry at all ("keittiöpöytä"). There the class is the head's,
-    # i.e. the last component - "keittiö+N+Sg+Nom+Cmp#pöytä+N+Sg+Nom" is a
-    # noun because of "pöytä", not because of "keittiö".
+    # A lexicalized whole-word reading states the real class. A Cmp# reading
+    # tags each component with its own class, which need not be the
+    # compound's: "sinivalkoinen" is only an adjective, but its Cmp# split
+    # starts with the noun "sini". So Cmp# readings only stand in for
+    # compounds that have no whole-word entry at all ("keittiöpöytä"). There
+    # the class is the head's, i.e. the last component -
+    # "keittiö+N+Sg+Nom+Cmp#pöytä+N+Sg+Nom" is a noun because of "pöytä",
+    # not because of "keittiö".
     whole_word = {
         pos for pos in (_reading_pos(r) for r in own if "Cmp#" not in r) if pos is not None
     }
@@ -255,15 +237,6 @@ def _reading_pos(reading: str) -> str | None:
         if pos:
             return pos
     return None
-
-
-def _pos_from_readings(readings) -> list[str]:
-    found: list[str] = []
-    for reading in readings:
-        pos = _reading_pos(reading)
-        if pos and pos not in found:
-            found.append(pos)
-    return found
 
 
 def _dedupe(items) -> list[str]:
