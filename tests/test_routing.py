@@ -30,7 +30,7 @@ from kielikaveri.bot.add import (
 )
 from kielikaveri.bot.decks import DeckStates
 from kielikaveri.bot.edit import EditStates
-from kielikaveri.bot.learn import LearnStates
+from kielikaveri.bot.learn import SIDE_PROMPT, LearnStates
 from kielikaveri.db.decks import get_or_create_default_deck
 from kielikaveri.db.engine import create_all, make_engine, make_session_factory
 from kielikaveri.db.models import Card, CardType, Deck, Note, NoteKind
@@ -330,6 +330,8 @@ async def _start_review(routed) -> None:
         )
         await session.commit()
     await routed["send"]("/learn")
+    assert await routed["get_state"]() == LearnStates.side_choice.state
+    await routed["tap"]("learn:side:mix")
     assert await routed["get_state"]() == LearnStates.reviewing.state
 
 
@@ -351,25 +353,34 @@ async def test_edit_menu_cancel_still_drops_an_edit_in_progress(routed):
     assert await routed["get_state"]() is None
 
 
-@pytest.mark.parametrize(
-    "text, expected_reply",
-    [
-        ("🗂 Колоды", "Твои колоды"),
-        ("📚 Учить", "🇫🇮 hakea"),
-    ],
-)
-async def test_menu_button_during_review_keeps_the_session(routed, text, expected_reply):
+async def test_decks_button_during_review_keeps_the_session(routed):
     await _start_review(routed)
 
-    replies = await routed["send"](text)
+    replies = await routed["send"]("🗂 Колоды")
 
-    assert replies[0].startswith(expected_reply)
+    assert replies[0].startswith("Твои колоды")
     assert await routed["get_state"]() == LearnStates.reviewing.state
+
+
+async def test_learn_button_during_review_starts_over_with_the_side_question(routed):
+    await _start_review(routed)
+
+    replies = await routed["send"]("📚 Учить")
+
+    assert replies == [SIDE_PROMPT]
+    assert await routed["get_state"]() == LearnStates.side_choice.state
+    assert await routed["tap"]("learn:side:mix") == ["🇫🇮 hakea"]
 
 
 @pytest.mark.parametrize("text", ["💬 Добавить", "/add"])
 @pytest.mark.parametrize(
-    "state", [LearnStates.deck_choice, LearnStates.debt_choice, LearnStates.reviewing]
+    "state",
+    [
+        LearnStates.deck_choice,
+        LearnStates.side_choice,
+        LearnStates.debt_choice,
+        LearnStates.reviewing,
+    ],
 )
 async def test_add_during_learn_ends_the_session(routed, state, text):
     await routed["set_state"](state, {"queue": ["c1"], "reviewed_count": 0})
@@ -411,6 +422,7 @@ async def test_add_button_outside_learn_only_prompts(routed):
     "state, data",
     [
         (LearnStates.deck_choice, {}),
+        (LearnStates.side_choice, {"deck_id": None}),
         (LearnStates.debt_choice, {"debt_now": "2026-09-25T10:00:00+00:00", "deck_id": None}),
         (
             LearnStates.reviewing,

@@ -31,7 +31,13 @@ from sqlalchemy import func, select
 
 from finn_cards.morphology import NOMINAL_FORMS, VERB_FORMS
 from kielikaveri.bot.edit import EditStates, note_edit_apply
-from kielikaveri.bot.learn import learn_rate, learn_reveal, learn_start, render_card
+from kielikaveri.bot.learn import (
+    learn_rate,
+    learn_reveal,
+    learn_side_choice,
+    learn_start,
+    render_card,
+)
 from kielikaveri.config import Settings
 from kielikaveri.db.engine import create_all, make_engine, make_session_factory
 from kielikaveri.db.models import Card, CardStatus, CardType, Note, NoteKind, Review, User
@@ -228,6 +234,10 @@ async def run_learn(session_factory) -> list[tuple[str, str, str]]:
     state = make_fsm()
     message = SimpleNamespace(from_user=SimpleNamespace(id=1), answer=AsyncMock())
     await learn_start(message, state, session_factory, make_settings())
+    side = SimpleNamespace(
+        data="learn:side:mix", from_user=SimpleNamespace(id=1), answer=AsyncMock(), message=message
+    )
+    await learn_side_choice(side, state, session_factory, make_settings())
     shown = []
     for _ in range(100):
         markup = message.answer.call_args.kwargs.get("reply_markup")
