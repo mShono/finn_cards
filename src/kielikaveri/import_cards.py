@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import uuid
 from pathlib import Path
 
 import jsonschema
@@ -24,6 +25,23 @@ from kielikaveri.db.models import Note, User
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CARDS_DIR = REPO_ROOT / "cards" / "examples"
 SCHEMA_PATH = REPO_ROOT / "cards" / "schema.json"
+# Fixed forever - changing it would make every re-import duplicate its notes.
+_NOTE_ID_NAMESPACE = uuid.UUID("5b0e7c1e-3f4a-4d8b-9c2a-6e1f0a7d4b93")
+
+
+def note_id_for(user_id: int, file_id: str) -> str:
+    """The id a file's note gets in `user_id`'s collection.
+
+    notes.id is a global primary key, but a file id is shared by everyone who
+    imports that file - inserting it verbatim lets only the first importer
+    have the note. A uuid5 of (file id, user) is per-user yet stable, so a
+    re-run for the same user finds the row it made last time.
+
+    Hashed as a name under a fixed namespace rather than using the file id as
+    the namespace: the validator doesn't enforce `"format": "uuid"`, so a
+    file id isn't guaranteed to parse as one.
+    """
+    return str(uuid.uuid5(_NOTE_ID_NAMESPACE, f"{user_id}:{file_id}"))
 
 
 def load_validator() -> jsonschema.Draft202012Validator:
@@ -45,7 +63,16 @@ async def import_notes(session_factory, user_id: int, cards_dir: Path) -> list[s
             payload = json.loads(note_file.read_text())
             validator.validate(payload)
 
-            existing = await session.get(Note, payload["id"])
+            note_id = note_id_for(user_id, payload["id"])
+            # The raw file id too: imports before per-user ids stored it
+            # verbatim, and those rows must still count as already imported.
+            # Scoped to this user - the same raw id under someone else is
+            # their note, not a reason to skip this one.
+            existing = await session.scalar(
+                select(Note.id).where(
+                    Note.user_id == user_id, Note.id.in_([note_id, payload["id"]])
+                )
+            )
             if existing is not None:
                 continue
 
@@ -73,7 +100,7 @@ async def import_notes(session_factory, user_id: int, cards_dir: Path) -> list[s
 
             session.add(
                 Note(
-                    id=payload["id"],
+                    id=note_id,
                     user_id=user_id,
                     lemma=payload["lemma"],
                     pos=payload.get("pos"),
@@ -84,7 +111,7 @@ async def import_notes(session_factory, user_id: int, cards_dir: Path) -> list[s
                     meta=payload["meta"],
                 )
             )
-            imported.append(payload["id"])
+            imported.append(note_id)
 
         await session.commit()
 
