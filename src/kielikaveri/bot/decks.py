@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 router = Router(name="decks")
 
-NEW_DECK_PROMPT = "Как назвать новую колоду?"
+NEW_DECK_PROMPT = "Как назвать новую колоду? Пришли название (или «отмена»)."
 
 # One row per card, so a deck screen is paged - keeps the keyboard under
 # Telegram's button-count limit and the message under its length limit.

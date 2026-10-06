@@ -1,6 +1,7 @@
 """Commands and menu buttons sent while a handler waits for free-text input,
 routed through bot/main.py's real Dispatcher (see InputEscapeMiddleware)."""
 
+import re
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 
@@ -216,6 +217,33 @@ async def test_plain_name_during_deck_naming_still_creates_the_deck(routed):
     await routed["send"]("Из книги")
 
     assert await _deck_names(routed["session_factory"]) == ["Из книги"]
+
+
+@pytest.mark.parametrize(
+    "state, data, tap_data, cancelled_reply",
+    [
+        (
+            AddStates.choosing_deck,
+            NAMING_DATA,
+            "addnewdeck:abc123",
+            "Отменено, слова не сохранила. Чтобы сохранить, пришли текст ещё раз.",
+        ),
+        (None, None, "decks:new", "Отменено."),
+    ],
+    ids=["add-picker", "decks-screen"],
+)
+async def test_new_deck_prompt_names_a_word_that_cancels_it(
+    routed, state, data, tap_data, cancelled_reply
+):
+    await routed["set_state"](state, data)
+
+    (prompt,) = await routed["tap"](tap_data)
+    # The cancel was invisible: the prompt only asked for a name
+    (offered,) = re.findall(r"«(.+?)»", prompt)
+
+    assert await routed["send"](offered) == [cancelled_reply]
+    assert await _deck_names(routed["session_factory"]) == []
+    assert await routed["get_state"]() is None
 
 
 # --- DeckStates.naming (🗂 Колоды → ➕) ---------------------------------------------
