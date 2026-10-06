@@ -23,7 +23,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     Message,
 )
-from openai import OpenAI
+from openai import APIError, OpenAI
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -452,9 +452,18 @@ async def learn_listen(
         return
     logger.debug("event=learn.listen card_id=%s", card_id)
     client = OpenAI(api_key=settings.openai_api_key)
-    audio = synthesize_speech(
-        client, settings.openai_tts_model, note.example_fi, speed=settings.openai_tts_speed
-    )
+    try:
+        audio = synthesize_speech(
+            client, settings.openai_tts_model, note.example_fi, speed=settings.openai_tts_speed
+        )
+    except APIError:
+        # Without an answer the button would spin until Telegram times out.
+        # The card stays on screen - tapping again or just rating both work.
+        logger.exception("event=learn.listen_error card_id=%s", card_id)
+        await callback.answer(
+            "Не получилось озвучить - попробуй ещё раз чуть позже.", show_alert=True
+        )
+        return
     await callback.message.answer_audio(BufferedInputFile(audio, filename="example.mp3"))
     await callback.answer()
 

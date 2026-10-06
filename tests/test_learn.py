@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import fsrs
+import openai
 import pytest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
@@ -501,6 +502,31 @@ async def test_learn_listen_sends_synthesized_audio_of_the_example_sentence(
     audio = callback.message.answer_audio.call_args.args[0]
     assert audio.data == b"fake-mp3-bytes"
     callback.answer.assert_awaited_once()
+
+
+async def test_learn_listen_reports_a_tts_failure_instead_of_leaving_the_button_hanging(
+    session_factory, monkeypatch
+):
+    async with session_factory() as session:
+        session.add(User(id=1))
+        session.add(make_note())
+        await session.flush()
+        session.add(make_card("card-A", "note-1", 1, due=NOW))
+        await session.commit()
+
+    def failing_tts(client, model, text, speed):
+        raise openai.APIConnectionError(request=SimpleNamespace())
+
+    monkeypatch.setattr("kielikaveri.bot.learn.synthesize_speech", failing_tts)
+    callback = make_callback("learn:listen:card-A")
+    settings = make_settings(openai_api_key="sk-test", openai_tts_model="tts-1")
+
+    await learn_listen(callback, session_factory, settings, make_state())
+
+    callback.message.answer_audio.assert_not_awaited()
+    callback.answer.assert_awaited_once_with(
+        "Не получилось озвучить - попробуй ещё раз чуть позже.", show_alert=True
+    )
 
 
 async def test_learn_listen_without_an_openai_key_answers_gracefully(session_factory):
