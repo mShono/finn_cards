@@ -158,9 +158,8 @@ async def test_chat_reports_a_tripped_breaker_honestly(session_factory, monkeypa
 
     await chat_message(message, make_state(), session_factory, make_settings(), make_breaker())
 
-    assert (
-        "предохранитель" in message.answer.call_args.args[0].lower()
-        or "баг" in message.answer.call_args.args[0]
+    message.answer.assert_awaited_once_with(
+        "Слишком много обращений к OpenAI подряд - похоже на баг, я остановилась. Попробуй позже."
     )
 
 
