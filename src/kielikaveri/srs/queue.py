@@ -221,7 +221,7 @@ async def build_session_queue(
     global across decks on purpose - it's a "don't overload the learner today"
     cap, not a per-deck one.
     `card_types` narrows candidates to the side the learner chose to see
-    (see bot/learn.py's LEARN_SIDES); None means every type.
+    (see bot/learn.py's LearnSide.card_types); None means every type.
     """
     new_today = await count_new_cards_today(session, user_id, now, boundary_hour)
     new_budget = max(0, daily_new_limit - new_today)
