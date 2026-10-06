@@ -166,16 +166,27 @@ def test_canonical_key_keeps_a_proper_noun_capitalised():
     assert canonical_key("Helsingissä", "substantiivi") == ("Helsinki", "substantiivi")
 
 
-def test_canonical_key_is_not_case_insensitive_for_an_ambiguous_lemma():
-    # Pins a known pre-existing gap, not a contract worth keeping: when the FST
-    # offers several lemmas, `if lemma in lemmas` can only match a lowercase
-    # input, so a capitalised one falls through to lemmas[0] - a *different*
-    # word. This is the mechanism behind the duplicate `seurojentalo` pair
-    # found in production 11.09.2026. The unique index deliberately does not
-    # paper over it: it compares what canonical_key() produced, so fixing the
-    # case asymmetry means fixing it here, in the one canonicalisation.
+def test_canonical_key_is_case_insensitive_for_an_ambiguous_lemma():
+    # The FST offers several lemmas for both spellings (seuratalo,
+    # seurojentalo, and Seura for the capitalized one). The capitalized one
+    # used to fall through to lemmas[0] - seuratalo, a *different* word: the
+    # duplicate `seurojentalo` pair found in production 11.09.2026. Fixed
+    # here, in the one canonicalisation the unique index relies on.
     assert canonical_key("seurojentalo", "substantiivi") == ("seurojentalo", "substantiivi")
-    assert canonical_key("Seurojentalo", "substantiivi") == ("seuratalo", "substantiivi")
+    assert canonical_key("Seurojentalo", "substantiivi") == ("seurojentalo", "substantiivi")
+
+
+def test_canonical_key_prefers_an_exact_case_proper_noun():
+    # The FST knows both kivi and Kivi (a surname, a place). A capitalized
+    # lemma that is itself a lemma is taken as is - same as before the
+    # case-insensitive match existed - rather than guessed to be the common
+    # word.
+    assert canonical_key("Kivi", "substantiivi") == ("Kivi", "substantiivi")
+    assert canonical_key("kivi", "substantiivi") == ("kivi", "substantiivi")
+
+
+def test_canonical_key_leaves_a_word_the_fst_does_not_know_unchanged():
+    assert canonical_key("Xyzquu", "substantiivi") == ("Xyzquu", "substantiivi")
 
 
 # --- strict schema wrapper -------------------------------------------------------
@@ -589,6 +600,27 @@ async def test_resolve_note_lemma_still_lemmatizes_an_inflected_llm_lemma():
     )
 
     assert resolved == ResolvedLemma("työ", in_dictionary=True)
+
+
+async def test_resolve_note_lemma_matches_a_capitalized_llm_lemma_case_insensitively():
+    # A sentence-initial word the LLM copied with its capital: the FST's own
+    # (lowercase) spelling of that very lemma, not the first lemma on its list.
+    client = MagicMock()
+    client.responses.create = AsyncMock()
+
+    resolved, _usage = await resolve_note_lemma(
+        client,
+        make_breaker(),
+        "gpt-5.6-terra",
+        "Seurojentalo",
+        "substantiivi",
+        "Seurojentalo",
+        "Seurojentalo on kylän keskellä.",
+        NOW,
+    )
+
+    assert resolved == ResolvedLemma("seurojentalo", in_dictionary=True)
+    client.responses.create.assert_not_called()
 
 
 async def test_resolve_note_lemma_flags_a_word_the_fst_does_not_know_at_all():

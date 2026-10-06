@@ -780,10 +780,40 @@ async def resolve_note_lemma(
 
 
 def _dictionary_lemma(word: str) -> str | None:
-    """`word` itself if the FST knows it as a lemma, else the first lemma it inflects, else None."""
+    """The FST's lemma for `word`, spelled the FST's way - or None if it can't analyze it.
+
+    In order:
+
+    * `word` is itself a lemma, same case - `word` ("Helsinki", "hakea");
+    * it is a lemma up to case - the FST's spelling of it. The FST analyzes a
+      capitalized common word fine ("Seurojentalo" -> seuratalo, seurojentalo,
+      Seura), but `word in lemmas` alone missed the case-shifted match and
+      fell through to lemmas[0] - a *different* word (seuratalo). That is the
+      duplicate `seurojentalo` pair found in production 11.09.2026. Several
+      such matches - the first in the FST's (deterministic) reading order.
+      Not seen in practice: a lowercase `word` gets no proper noun readings,
+      so it matches exactly or not at all; a capitalized one's only other
+      spelling of itself is the lowercase common word; and the FST doesn't
+      analyze upper case ("SEUROJENTALO") at all;
+    * otherwise `word` is an inflected form - the first lemma it inflects
+      ("Töitä" -> työ, "Helsingissä" -> Helsinki).
+
+    An exact-case match wins over a case-shifted one, so a capitalized word
+    that is also a proper noun stays the proper noun ("Kivi", "Turku" - the
+    FST knows both kivi/turku and Kivi/Turku). Without context the two can't
+    be told apart; this keeps every key the exact-match rule produced before.
+
+    `word` is never lowercased before lemmatize(): the FST gives no proper
+    noun readings for a lowercase string ("helsinki" -> nothing), and every
+    lemma returned comes from the FST, never from `word` folded by hand.
+    """
     lemmas = lemmatize(word)
     if word in lemmas:
         return word
+    folded = word.casefold()
+    case_matches = [lemma for lemma in lemmas if lemma.casefold() == folded]
+    if case_matches:
+        return case_matches[0]
     return lemmas[0] if lemmas else None
 
 
