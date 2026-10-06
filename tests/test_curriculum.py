@@ -930,3 +930,38 @@ async def test_forms_of_the_older_word_are_asked_before_forms_of_the_newer_one(s
         ("talo", "genetiivi"),
         ("talo", "partitiivi"),
     ]
+
+
+def test_a_verb_climbs_core_then_extended_then_later_not_form_task_order():
+    # Verbs are data in the same FORM_TASKS table, but their dict order puts
+    # two `later` forms (konditionaali_1s, imperatiivi_2s) *before* the
+    # `extended` ones - so the ladder has to come from the level, never from
+    # FORM_ORDER alone. Also the only place extended -> later is pinned.
+    recognition = _recognition_card("r", stability=9.0)
+    core = ["preesens_1s", "preesens_3s", "imperfekti_3s"]
+    extended = ["nut_partisiippi", "passiivi"]
+    later = ["konditionaali_1s", "imperatiivi_2s"]
+    assert [FORM_TASKS[n].level for n in core + extended + later] == (
+        [CurriculumLevel.core] * 3 + [CurriculumLevel.extended] * 2 + [CurriculumLevel.later] * 2
+    )
+    forms = {card.form: card for card in _form_cards(*core, *extended, *later)}
+    cards = [recognition, *forms.values()]
+    known = {"r": SUCCESSFUL_ANSWERS_TO_UNLOCK}
+
+    def open_and_know(names: list[str]) -> None:
+        for name in names:
+            forms[name].status = CardStatus.introduced
+            known[name] = SUCCESSFUL_ANSWERS_TO_UNLOCK
+
+    assert [c.form for c in eligible_forms(cards, known)] == core
+
+    open_and_know(core)
+    assert [c.form for c in eligible_forms(cards, known)] == extended
+
+    # One extended form open and recalled only once: `later` stays shut.
+    open_and_know(extended)
+    known["passiivi"] = SUCCESSFUL_ANSWERS_TO_UNLOCK - 1
+    assert eligible_forms(cards, known) == []
+
+    known["passiivi"] = SUCCESSFUL_ANSWERS_TO_UNLOCK
+    assert [c.form for c in eligible_forms(cards, known)] == later
