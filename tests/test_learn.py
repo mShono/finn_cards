@@ -474,9 +474,12 @@ async def test_learn_reveal_shows_the_back_and_a_rating_keyboard_for_that_card(s
 # --- learn_listen -------------------------------------------------------------
 
 
-async def test_learn_listen_sends_synthesized_audio_of_the_example_sentence(
-    session_factory, monkeypatch
-):
+def _fake_response(status_code: int) -> SimpleNamespace:
+    # Just what openai.APIStatusError reads from a response.
+    return SimpleNamespace(status_code=status_code, request=SimpleNamespace(), headers={})
+
+
+async def _seed_listen_card(session_factory) -> None:
     async with session_factory() as session:
         session.add(User(id=1))
         session.add(make_note())
@@ -484,38 +487,90 @@ async def test_learn_listen_sends_synthesized_audio_of_the_example_sentence(
         session.add(make_card("card-A", "note-1", 1, due=NOW))
         await session.commit()
 
+
+async def test_learn_listen_sends_synthesized_audio_of_the_example_sentence(
+    session_factory, monkeypatch
+):
+    await _seed_listen_card(session_factory)
     calls = []
-    monkeypatch.setattr(
-        "kielikaveri.bot.learn.synthesize_speech",
-        lambda client, model, text, speed: calls.append((model, text, speed)) or b"fake-mp3-bytes",
-    )
+
+    async def fake_tts(client, model, text, speed):
+        calls.append((client.timeout, model, text, speed))
+        return b"fake-mp3-bytes"
+
+    monkeypatch.setattr("kielikaveri.bot.learn.synthesize_speech", fake_tts)
     callback = make_callback("learn:listen:card-A")
     settings = make_settings(
-        openai_api_key="sk-test", openai_tts_model="tts-1", openai_tts_speed=0.7
+        openai_api_key="sk-test",
+        openai_tts_model="tts-1",
+        openai_tts_speed=0.7,
+        openai_tts_timeout_seconds=12.0,
     )
 
     await learn_listen(callback, session_factory, settings, make_state())
 
-    # The example sentence, not the lemma - and at the configured speed.
-    assert calls == [("tts-1", "Haen töitä.", 0.7)]
+    # The example sentence, not the lemma - at the configured speed, on a
+    # client with the TTS timeout rather than the much longer ingest one.
+    assert calls == [(12.0, "tts-1", "Haen töitä.", 0.7)]
     callback.message.answer_audio.assert_awaited_once()
     audio = callback.message.answer_audio.call_args.args[0]
     assert audio.data == b"fake-mp3-bytes"
-    callback.answer.assert_awaited_once()
+    callback.answer.assert_awaited_once_with()
 
 
-async def test_learn_listen_reports_a_tts_failure_instead_of_leaving_the_button_hanging(
-    session_factory, monkeypatch
+async def test_learn_listen_answers_the_tap_before_waiting_on_tts(session_factory, monkeypatch):
+    # Telegram accepts an answer to a tap only for a short while. If the
+    # handler waited for OpenAI first, a slow TTS would leave the button
+    # spinning however the error is handled afterwards.
+    await _seed_listen_card(session_factory)
+    callback = make_callback("learn:listen:card-A")
+    answered_before_tts = []
+
+    async def fake_tts(client, model, text, speed):
+        answered_before_tts.append(callback.answer.await_count == 1)
+        return b"fake-mp3-bytes"
+
+    monkeypatch.setattr("kielikaveri.bot.learn.synthesize_speech", fake_tts)
+    settings = make_settings(openai_api_key="sk-test", openai_tts_model="tts-1")
+
+    await learn_listen(callback, session_factory, settings, make_state())
+
+    assert answered_before_tts == [True]
+
+
+@pytest.mark.parametrize(
+    ("error", "text"),
+    [
+        (
+            openai.APIConnectionError(request=SimpleNamespace()),
+            "Не получилось озвучить - попробуй ещё раз чуть позже.",
+        ),
+        (
+            openai.RateLimitError(
+                "rate limited",
+                response=_fake_response(429),
+                body=None,
+            ),
+            "Не получилось озвучить - попробуй ещё раз чуть позже.",
+        ),
+        (
+            openai.AuthenticationError(
+                "bad key",
+                response=_fake_response(401),
+                body=None,
+            ),
+            "Озвучка настроена неверно - подробности в логах.",
+        ),
+    ],
+    ids=["connection", "rate-limit", "bad-key"],
+)
+async def test_learn_listen_reports_a_tts_failure_as_a_message(
+    session_factory, monkeypatch, error, text
 ):
-    async with session_factory() as session:
-        session.add(User(id=1))
-        session.add(make_note())
-        await session.flush()
-        session.add(make_card("card-A", "note-1", 1, due=NOW))
-        await session.commit()
+    await _seed_listen_card(session_factory)
 
-    def failing_tts(client, model, text, speed):
-        raise openai.APIConnectionError(request=SimpleNamespace())
+    async def failing_tts(client, model, text, speed):
+        raise error
 
     monkeypatch.setattr("kielikaveri.bot.learn.synthesize_speech", failing_tts)
     callback = make_callback("learn:listen:card-A")
@@ -524,9 +579,8 @@ async def test_learn_listen_reports_a_tts_failure_instead_of_leaving_the_button_
     await learn_listen(callback, session_factory, settings, make_state())
 
     callback.message.answer_audio.assert_not_awaited()
-    callback.answer.assert_awaited_once_with(
-        "Не получилось озвучить - попробуй ещё раз чуть позже.", show_alert=True
-    )
+    callback.answer.assert_awaited_once_with()
+    callback.message.answer.assert_awaited_once_with(text)
 
 
 async def test_learn_listen_without_an_openai_key_answers_gracefully(session_factory):
