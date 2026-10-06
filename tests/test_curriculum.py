@@ -11,6 +11,7 @@ from kielikaveri.db.models import (
     CardState,
     CardStatus,
     CardType,
+    Deck,
     Note,
     NoteKind,
     Review,
@@ -21,8 +22,9 @@ from kielikaveri.srs.curriculum import (
     SUCCESSFUL_ANSWERS_TO_UNLOCK,
     eligible_forms,
     introduce_due_forms,
+    successful_answer_counts,
 )
-from kielikaveri.srs.graduation import sync_user_card_types
+from kielikaveri.srs.graduation import cards_by_note, sync_user_card_types
 from kielikaveri.srs.queue import build_session_queue, card_counters, overdue_count
 from kielikaveri.srs.scheduler import Rating, apply_review
 
@@ -930,3 +932,108 @@ async def test_forms_of_the_older_word_are_asked_before_forms_of_the_newer_one(s
         ("talo", "genetiivi"),
         ("talo", "partitiivi"),
     ]
+
+
+# --- 11: one learner's progress is theirs alone --------------------------------
+
+
+async def seed_two_learners(session_factory) -> None:
+    """User 1 and user 2, each with one noun in a deck of their own."""
+    async with session_factory() as session:
+        for user_id in (1, 2):
+            session.add(User(id=user_id))
+            session.add(Deck(id=f"deck-{user_id}", user_id=user_id, name="x"))
+            note = make_noun(f"u{user_id}", f"sana{user_id}", user_id=user_id)
+            note.deck_id = f"deck-{user_id}"
+            session.add(note)
+        await session.flush()
+        for user_id in (1, 2):
+            await sync_user_card_types(session, user_id, NOW)
+        await session.commit()
+
+
+async def test_another_learners_opened_forms_do_not_spend_this_learners_budget(
+    session_factory,
+):
+    # daily_new_forms is a per-learner pace. If the count of today's
+    # introductions took in everybody's cards, one busy learner would shut
+    # grammar off for the rest of the bot.
+    await seed_two_learners(session_factory)
+    await learn_word(session_factory, "u1")
+    await learn_word(session_factory, "u2")
+    async with session_factory() as session:
+        theirs = await introduce_due_forms(session, 2, NOW, daily_new_forms=3, boundary_hour=4)
+        await session.commit()
+    assert len(theirs) == 3  # user 2 has spent a full budget today
+
+    async with session_factory() as session:
+        mine = await introduce_due_forms(session, 1, NOW, daily_new_forms=3, boundary_hour=4)
+        await session.commit()
+
+    assert len(mine) == 3
+    assert {c.note_id for c in mine} == {"u1"}
+
+
+async def test_successful_answers_count_only_the_learners_own_reviews(session_factory):
+    await seed_two_learners(session_factory)
+    await learn_word(session_factory, "u1")
+    await learn_word(session_factory, "u2")
+    recognition_1 = (await cards_of(session_factory, "u1", type=CardType.recognition))[0]
+
+    async with session_factory() as session:
+        successes = await successful_answer_counts(session, 1)
+
+    assert successes == {recognition_1.id: SUCCESSFUL_ANSWERS_TO_UNLOCK}
+
+
+async def test_another_learners_known_word_opens_nothing_for_this_learner(session_factory):
+    # User 2 knows their word, user 1 knows nothing yet: a run for user 1 -
+    # with or without a deck, even one naming user 2's deck - must neither
+    # return nor touch user 2's form cards.
+    await seed_two_learners(session_factory)
+    await learn_word(session_factory, "u2")
+
+    async with session_factory() as session:
+        grouped = await cards_by_note(session, 1)
+        everywhere = await introduce_due_forms(session, 1, NOW, daily_new_forms=99, boundary_hour=4)
+        in_their_deck = await introduce_due_forms(
+            session, 1, NOW, daily_new_forms=99, boundary_hour=4, deck_id="deck-2"
+        )
+        await session.commit()
+
+    assert set(grouped) == {"u1"}
+    assert everywhere == []
+    assert in_their_deck == []
+    untouched = await cards_of(session_factory, "u2", type=CardType.inflection)
+    assert untouched
+    assert all(c.status == CardStatus.not_introduced for c in untouched)
+
+
+async def test_forms_opened_in_one_deck_spend_the_budget_of_every_deck(session_factory):
+    # The form budget is the learner's daily pace, not a per-deck quota:
+    # switching decks on the same day must not open a second day's worth.
+    async with session_factory() as session:
+        session.add(User(id=1))
+        for name in ("a", "b"):
+            session.add(Deck(id=f"deck-{name}", user_id=1, name=name))
+            note = make_noun(f"n-{name}", f"sana{name}")
+            note.deck_id = f"deck-{name}"
+            session.add(note)
+        await session.flush()
+        await sync_user_card_types(session, 1, NOW)
+        await session.commit()
+    await learn_word(session_factory, "n-a")
+    await learn_word(session_factory, "n-b")
+
+    async with session_factory() as session:
+        first = await introduce_due_forms(
+            session, 1, NOW, daily_new_forms=3, boundary_hour=4, deck_id="deck-a"
+        )
+        await session.commit()
+        second = await introduce_due_forms(
+            session, 1, NOW, daily_new_forms=3, boundary_hour=4, deck_id="deck-b"
+        )
+        await session.commit()
+
+    assert len(first) == 3
+    assert second == []
