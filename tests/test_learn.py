@@ -28,6 +28,7 @@ from kielikaveri.bot.learn import (
     learn_reveal,
     learn_side_choice,
     learn_start,
+    learn_tap_while_starting,
     render_card,
 )
 from kielikaveri.config import Settings
@@ -846,7 +847,7 @@ async def test_learn_side_choice_russian_shows_the_russian_front(session_factory
     assert message.answer.call_args.args[0] == "🇷🇺 искать"
 
 
-async def test_learn_side_choice_russian_with_nothing_due_explains_why(session_factory):
+async def test_learn_side_choice_russian_without_production_cards_explains_why(session_factory):
     # Production cards open only after recognition settles - early on a
     # Russian session is empty, and that is not a bug.
     async with session_factory() as session:
@@ -861,7 +862,162 @@ async def test_learn_side_choice_russian_with_nothing_due_explains_why(session_f
     await _learn(state, session_factory, make_settings(), message, "ru")
 
     assert await state.get_state() is None
-    assert "Русская сторона открывается" in message.answer.call_args.args[0]
+    assert message.answer.call_args.args[0] == (
+        "На этой стороне сейчас нечего повторять.\n"
+        "Русская сторона открывается для слова, когда его финская уже хорошо запомнилась."
+    )
+
+
+async def test_learn_side_choice_russian_not_due_yet_gives_no_opening_hint(session_factory):
+    # Production cards exist, just none is due - the hint would be wrong.
+    async with session_factory() as session:
+        session.add(User(id=1))
+        session.add(make_note())
+        await session.flush()
+        session.add(make_card("rec", "note-1", 1, due=NOW - timedelta(days=1)))
+        session.add(
+            make_card(
+                "prod",
+                "note-1",
+                1,
+                due=datetime.now(UTC) + timedelta(days=3),
+                reps=1,
+                card_type=CardType.production,
+            )
+        )
+        await session.commit()
+    message = make_message()
+
+    await _learn(make_state(), session_factory, make_settings(), message, "ru")
+
+    assert message.answer.call_args.args[0] == "На этой стороне сейчас нечего повторять."
+
+
+async def test_learn_side_choice_finnish_with_nothing_due_does_not_claim_all_is_done(
+    session_factory,
+):
+    # Only the Russian side has work today - "всё выучено" would send the
+    # learner away from it.
+    async with session_factory() as session:
+        session.add(User(id=1))
+        session.add(make_note())
+        await session.flush()
+        session.add(
+            make_card(
+                "rec",
+                "note-1",
+                1,
+                due=datetime.now(UTC) + timedelta(days=3),
+                reps=1,
+            )
+        )
+        session.add(
+            make_card(
+                "prod",
+                "note-1",
+                1,
+                due=NOW - timedelta(days=1),
+                reps=1,
+                card_type=CardType.production,
+            )
+        )
+        await session.commit()
+    message = make_message()
+
+    await _learn(make_state(), session_factory, make_settings(), message, "fi")
+
+    assert message.answer.call_args.args[0] == "На этой стороне сейчас нечего повторять."
+
+
+@pytest.mark.parametrize("side, opens", [("ru", False), ("fi", True), ("mix", True)])
+async def test_learn_side_choice_opens_forms_only_for_a_side_that_shows_them(
+    session_factory, side, opens
+):
+    # A Russian session never shows a form - opening forms there would spend
+    # the day's daily_new_forms budget on cards nobody sees.
+    now = datetime.now(UTC)
+    async with session_factory() as session:
+        session.add(User(id=1))
+        deck = await create_deck(session, 1, "Общая")
+        await session.flush()
+        session.add(_noun_with_forms("note-a", "talo", deck.id, now - timedelta(days=20)))
+        await session.flush()
+        session.add(
+            Card(
+                id="rec",
+                note_id="note-a",
+                user_id=1,
+                type=CardType.recognition,
+                due=now - timedelta(days=1),
+                reps=2,
+            )
+        )
+        for days in (3, 2):
+            session.add(
+                Review(
+                    card_id="rec",
+                    user_id=1,
+                    rating=Rating.Good.value,
+                    reviewed_at=now - timedelta(days=days),
+                )
+            )
+        await session.commit()
+
+    await _learn(
+        make_state(), session_factory, make_settings(daily_new_forms=2), make_message(), side
+    )
+
+    async with session_factory() as session:
+        forms = (await session.scalars(select(Card).where(Card.type == CardType.inflection))).all()
+    assert forms  # the cards exist either way - only opening them is held back
+    opened = [c for c in forms if c.status == CardStatus.introduced]
+    assert (len(opened) == 2) is opens
+    assert all(c.introduced_at is None for c in forms if c.status != CardStatus.introduced)
+
+
+async def test_learn_side_choice_claims_the_start_before_doing_any_work(session_factory):
+    # The state leaves side_choice before the first await that yields, so a
+    # second tap can't match it while this one is still syncing cards.
+    seen: list = []
+    state = make_state()
+    await state.set_state(LearnStates.side_choice)
+    await state.update_data(deck_id=None)
+    callback = make_callback("learn:side:fi")
+
+    async def record_state(*args, **kwargs):
+        seen.append(await state.get_state())
+
+    callback.answer = AsyncMock(side_effect=record_state)
+
+    await learn_side_choice(callback, state, session_factory, make_settings())
+
+    assert seen == [LearnStates.starting]
+
+
+async def test_learn_deck_choice_claims_the_side_question_before_answering(session_factory):
+    seen: list = []
+    state = make_state()
+    await state.set_state(LearnStates.deck_choice)
+    callback = make_callback(f"learn:deck:{DECK_ALL_TOKEN}")
+
+    async def record_state(*args, **kwargs):
+        seen.append(await state.get_state())
+
+    callback.answer = AsyncMock(side_effect=record_state)
+
+    await learn_deck_choice(callback, state)
+
+    assert seen == [LearnStates.side_choice]
+    callback.message.answer.assert_awaited_once()
+
+
+async def test_a_tap_while_the_session_starts_is_answered_quietly():
+    callback = make_callback("learn:side:ru")
+
+    await learn_tap_while_starting(callback)
+
+    callback.answer.assert_awaited_once_with()
+    callback.message.answer.assert_not_awaited()
 
 
 async def test_learn_side_choice_debt_counts_only_that_side(session_factory):
@@ -975,7 +1131,7 @@ async def test_learn_debt_choice_defer_postpones_the_tail_then_starts_a_session(
     await _seed_five_overdue_cards(session_factory, now)
     state = make_state()
     await state.set_state(LearnStates.debt_choice)
-    await state.update_data(debt_now=now.isoformat())
+    await state.update_data(debt_now=now.isoformat(), side="mix")
     settings = make_settings(session_max_cards=2, debt_postpone_days=7)
     callback = make_callback("learn:debt:defer")
 
@@ -998,7 +1154,7 @@ async def test_learn_debt_choice_batch_starts_a_session_without_deferring_anythi
     await _seed_five_overdue_cards(session_factory, now)
     state = make_state()
     await state.set_state(LearnStates.debt_choice)
-    await state.update_data(debt_now=now.isoformat())
+    await state.update_data(debt_now=now.isoformat(), side="mix")
     settings = make_settings(session_max_cards=2)
     callback = make_callback("learn:debt:batch")
 

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime
+from enum import StrEnum
 
 from aiogram import F, Router
 from aiogram.filters import Command
@@ -46,22 +47,41 @@ DECK_ALL_TOKEN = "all"
 DELETED_CARD_TEXT = "Это слово удалено."
 SIDE_PROMPT = "Что показывать на карточке?"
 
-# Which card types a session shows, by the side the learner asked to see.
-# A side is a filter, not a flip: recognition and production are separate
-# cards with FSRS schedules of their own, so showing a recognition card
-# Russian-first would record a production answer into recognition's history.
-# Inflection cards ask a form of a Finnish lemma, so they go with Finnish.
-# None - no filter, every type mixed as before the question existed.
-LEARN_SIDES: dict[str, tuple[CardType, ...] | None] = {
-    "fi": (CardType.recognition, CardType.inflection),
-    "ru": (CardType.production,),
-    "mix": None,
-}
+
+class LearnSide(StrEnum):
+    """Which side of the cards a session shows.
+
+    A side is a filter, not a flip: recognition and production are separate
+    cards with FSRS schedules of their own, so showing a recognition card
+    Russian-first would record a production answer into recognition's
+    history. Inflection cards ask a form of a Finnish lemma, so they go with
+    Finnish.
+    """
+
+    fi = "fi"
+    ru = "ru"
+    mix = "mix"
+
+    @property
+    def card_types(self) -> tuple[CardType, ...] | None:
+        """The card types this side shows; None - every type, unfiltered."""
+        if self is LearnSide.fi:
+            return (CardType.recognition, CardType.inflection)
+        if self is LearnSide.ru:
+            return (CardType.production,)
+        return None
+
+    @property
+    def shows_forms(self) -> bool:
+        return self.card_types is None or CardType.inflection in self.card_types
 
 
 class LearnStates(StatesGroup):
     deck_choice = State()
     side_choice = State()
+    # Between a side tap and the session (or debt prompt) it leads to - the
+    # mark learn_side_choice claims so a second tap starts nothing.
+    starting = State()
     debt_choice = State()
     reviewing = State()
 
@@ -120,10 +140,14 @@ def _side_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="🇫🇮 Финский", callback_data="learn:side:fi"),
-                InlineKeyboardButton(text="🇷🇺 Русский", callback_data="learn:side:ru"),
+                InlineKeyboardButton(text="🇫🇮 Финский", callback_data=f"learn:side:{LearnSide.fi}"),
+                InlineKeyboardButton(text="🇷🇺 Русский", callback_data=f"learn:side:{LearnSide.ru}"),
             ],
-            [InlineKeyboardButton(text="🔀 Вперемешку", callback_data="learn:side:mix")],
+            [
+                InlineKeyboardButton(
+                    text="🔀 Вперемешку", callback_data=f"learn:side:{LearnSide.mix}"
+                )
+            ],
         ]
     )
 
@@ -149,7 +173,7 @@ async def _start_session(
     user_id: int,
     now: datetime,
     deck_id: str | None,
-    side: str,
+    side: LearnSide,
 ) -> None:
     async with session_factory() as session:
         queue = await build_session_queue(
@@ -160,20 +184,18 @@ async def _start_session(
             daily_new_limit=settings.daily_new_limit,
             boundary_hour=settings.day_boundary_hour,
             deck_id=deck_id,
-            card_types=LEARN_SIDES[side],
+            card_types=side.card_types,
+        )
+        no_production = (
+            side is LearnSide.ru
+            and not queue
+            and not await _has_production(session, user_id, deck_id)
         )
 
     if not queue:
         logger.info("event=learn.session_empty deck_id=%s side=%s", deck_id, side)
         await state.clear()
-        text = "Нечего повторять - все карточки выучены на сегодня."
-        if side == "ru":
-            # Production cards open only once the Finnish side is known well
-            # (graduation.py) - an empty Russian session is normal early on.
-            text += (
-                "\nРусская сторона открывается для слова, когда его финская уже хорошо запомнилась."
-            )
-        await answer_to.answer(text)
+        await answer_to.answer(_empty_session_text(side, no_production))
         return
 
     logger.info("event=learn.session_start deck_id=%s side=%s queue=%d", deck_id, side, len(queue))
@@ -185,6 +207,25 @@ async def _start_session(
         session_max_minutes=settings.session_max_minutes,
     )
     await _show_next_card(answer_to, state, session_factory)
+
+
+async def _has_production(session: AsyncSession, user_id: int, deck_id: str | None) -> bool:
+    stmt = select(Card.id).where(Card.user_id == user_id, Card.type == CardType.production)
+    if deck_id is not None:
+        stmt = stmt.join(Note, Card.note_id == Note.id).where(Note.deck_id == deck_id)
+    return await session.scalar(stmt.limit(1)) is not None
+
+
+def _empty_session_text(side: LearnSide, no_production: bool) -> str:
+    if side is LearnSide.mix:
+        return "Нечего повторять - все карточки выучены на сегодня."
+    # Only this side is done - the other may still have cards waiting.
+    text = "На этой стороне сейчас нечего повторять."
+    if no_production:
+        # Production cards open only once the Finnish side is known well
+        # (graduation.py) - until the first one does, Russian is empty.
+        text += "\nРусская сторона открывается для слова, когда его финская уже хорошо запомнилась."
+    return text
 
 
 async def _drop_deleted_head(session: AsyncSession, queue: list[str]) -> list[str]:
@@ -255,6 +296,14 @@ async def _show_next_card(
     await answer_to.answer(front, reply_markup=_reveal_keyboard(card_id))
 
 
+async def _claim_state(state: FSMContext, expected: State, claimed: State) -> bool:
+    """Move from `expected` to `claimed`; False if another update already left `expected`."""
+    if await state.get_state() != expected.state:
+        return False
+    await state.set_state(claimed)
+    return True
+
+
 async def _ask_side(answer_to: Message, state: FSMContext, deck_id: str | None) -> None:
     await state.set_state(LearnStates.side_choice)
     await state.update_data(deck_id=deck_id)
@@ -269,20 +318,23 @@ async def _proceed_past_side_choice(
     user_id: int,
     now: datetime,
     deck_id: str | None,
-    side: str,
+    side: LearnSide,
 ) -> None:
     async with session_factory() as session:
         await sync_user_card_types(session, user_id, now)
         # Cards first, then the curriculum decides which of the new forms
-        # the learner actually meets today - see srs/curriculum.py.
-        await introduce_due_forms(
-            session,
-            user_id,
-            now,
-            daily_new_forms=settings.daily_new_forms,
-            boundary_hour=settings.day_boundary_hour,
-            deck_id=deck_id,
-        )
+        # the learner actually meets today - see srs/curriculum.py. Not for
+        # a session that shows no forms: opening them there would spend the
+        # day's form budget on cards nobody sees.
+        if side.shows_forms:
+            await introduce_due_forms(
+                session,
+                user_id,
+                now,
+                daily_new_forms=settings.daily_new_forms,
+                boundary_hour=settings.day_boundary_hour,
+                deck_id=deck_id,
+            )
         await session.commit()
         overdue = await overdue_count(
             session,
@@ -290,7 +342,7 @@ async def _proceed_past_side_choice(
             now,
             deck_id=deck_id,
             reviewed_only=True,
-            card_types=LEARN_SIDES[side],
+            card_types=side.card_types,
         )
 
     if overdue > settings.debt_threshold:
@@ -341,8 +393,14 @@ async def learn_deck_choice(callback: CallbackQuery, state: FSMContext) -> None:
     deck_id = None if raw_deck_id == DECK_ALL_TOKEN else raw_deck_id
 
     logger.debug("event=learn.deck_choice deck_id=%s", deck_id)
+    # Claimed before the first await that yields, so a double tap asks the
+    # side only once - see learn_side_choice.
+    if not await _claim_state(state, LearnStates.deck_choice, LearnStates.side_choice):
+        await callback.answer()
+        return
+    await state.update_data(deck_id=deck_id)
     await callback.answer()
-    await _ask_side(callback.message, state, deck_id)
+    await callback.message.answer(SIDE_PROMPT, reply_markup=_side_keyboard())
 
 
 @router.callback_query(F.data.startswith("learn:side:"), LearnStates.side_choice)
@@ -352,9 +410,21 @@ async def learn_side_choice(
     session_factory: async_sessionmaker[AsyncSession],
     settings: Settings,
 ) -> None:
-    side = callback.data.split(":", 2)[2]
-    if side not in LEARN_SIDES:
+    raw_side = callback.data.split(":", 2)[2]
+    if raw_side not in LearnSide:
         await callback.answer()
+        return
+    side = LearnSide(raw_side)
+    # Claim the start before anything that yields - the same reason as
+    # learn_rate's early pop. Updates run as concurrent tasks, and the card
+    # sync and curriculum below take a while: a second tap would start a
+    # second session, both syncs racing to create the same cards. The state
+    # filter alone doesn't stop it - aiogram reads the state before running
+    # the filters, which yield, so both taps pass it. Hence the re-check
+    # here; with MemoryStorage neither call yields, so check-and-claim is
+    # atomic.
+    if not await _claim_state(state, LearnStates.side_choice, LearnStates.starting):
+        await learn_tap_while_starting(callback)
         return
     deck_id = (await state.get_data()).get("deck_id")
 
@@ -384,7 +454,7 @@ async def learn_debt_choice(
     data = await state.get_data()
     now = datetime.fromisoformat(data["debt_now"])
     deck_id = data.get("deck_id")
-    side = data.get("side", "mix")
+    side = LearnSide(data["side"])
 
     if action == "defer":
         async with session_factory() as session:
@@ -395,7 +465,7 @@ async def learn_debt_choice(
                 keep_n=settings.session_max_cards,
                 postpone_days=settings.debt_postpone_days,
                 deck_id=deck_id,
-                card_types=LEARN_SIDES[side],
+                card_types=side.card_types,
             )
             await session.commit()
         logger.info("event=learn.debt_choice action=defer postponed=%d", postponed)
@@ -548,6 +618,14 @@ def _tts_error_text(error: APIError) -> str:
     ):
         return "Озвучка настроена неверно - подробности в логах."
     return "Не получилось озвучить - попробуй ещё раз чуть позже."
+
+
+@router.callback_query(F.data.startswith("learn:"), LearnStates.starting)
+async def learn_tap_while_starting(callback: CallbackQuery) -> None:
+    # A second tap on the side buttons while the first one's session is
+    # still being built - that session is coming, nothing is stale.
+    logger.debug("event=learn.tap_while_starting")
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("learn:"))

@@ -1,6 +1,7 @@
 """Commands and menu buttons sent while a handler waits for free-text input,
 routed through bot/main.py's real Dispatcher (see InputEscapeMiddleware)."""
 
+import asyncio
 import re
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
@@ -88,6 +89,7 @@ async def routed(tmp_path, monkeypatch):
         "get_state": get_state,
         "get_data": get_data,
         "set_state": set_state,
+        "sent": telegram.sent,
     }
     await dp.storage.set_state(key, None)
     await dp.storage.set_data(key, {})
@@ -333,6 +335,43 @@ async def _start_review(routed) -> None:
     assert await routed["get_state"]() == LearnStates.side_choice.state
     await routed["tap"]("learn:side:mix")
     assert await routed["get_state"]() == LearnStates.reviewing.state
+
+
+async def test_double_tap_on_the_side_buttons_starts_one_session(routed):
+    # Two taps that both land before the first one has finished: aiogram
+    # handles updates as concurrent tasks, and the side handler awaits the
+    # database before it gets to change the state.
+    await _add_note(routed["session_factory"])
+    await routed["send"]("/learn")
+    assert await routed["get_state"]() == LearnStates.side_choice.state
+    since = len(routed["sent"])
+
+    await asyncio.gather(routed["tap"]("learn:side:fi"), routed["tap"]("learn:side:ru"))
+
+    texts = [m.text for m in routed["sent"][since:] if isinstance(m, SendMessage)]
+    # One session started - its first card, and nothing from a second start.
+    assert texts == ["🇫🇮 hakea"]
+    assert await routed["get_state"]() == LearnStates.reviewing.state
+    async with routed["session_factory"]() as session:
+        cards = (await session.scalars(select(Card))).all()
+    assert [c.type for c in cards] == [CardType.recognition]  # created once
+
+
+async def test_double_tap_on_a_deck_button_asks_the_side_once(routed):
+    note = await _add_note(routed["session_factory"])
+    async with routed["session_factory"]() as session:
+        session.add(Deck(user_id=1, name="Из книги"))
+        await session.commit()
+    await routed["send"]("/learn")
+    assert await routed["get_state"]() == LearnStates.deck_choice.state
+    since = len(routed["sent"])
+
+    tap = f"learn:deck:{note.deck_id}"
+    await asyncio.gather(routed["tap"](tap), routed["tap"](tap))
+
+    texts = [m.text for m in routed["sent"][since:] if isinstance(m, SendMessage)]
+    assert texts == [SIDE_PROMPT]
+    assert await routed["get_state"]() == LearnStates.side_choice.state
 
 
 async def test_old_edit_menu_cancel_leaves_a_review_session_alone(routed):
