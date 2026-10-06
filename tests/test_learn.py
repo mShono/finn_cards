@@ -96,7 +96,7 @@ def make_callback(data: str) -> SimpleNamespace:
         data=data,
         from_user=SimpleNamespace(id=1),
         answer=AsyncMock(),
-        message=SimpleNamespace(answer=AsyncMock(), answer_audio=AsyncMock()),
+        message=SimpleNamespace(answer=AsyncMock(), reply=AsyncMock(), reply_audio=AsyncMock()),
     )
 
 
@@ -512,8 +512,8 @@ async def test_learn_listen_sends_synthesized_audio_of_the_example_sentence(
     # The example sentence, not the lemma - at the configured speed, on a
     # client with the TTS timeout rather than the much longer ingest one.
     assert calls == [(12.0, "tts-1", "Haen töitä.", 0.7)]
-    callback.message.answer_audio.assert_awaited_once()
-    audio = callback.message.answer_audio.call_args.args[0]
+    callback.message.reply_audio.assert_awaited_once()
+    audio = callback.message.reply_audio.call_args.args[0]
     assert audio.data == b"fake-mp3-bytes"
     callback.answer.assert_awaited_once_with()
 
@@ -578,9 +578,9 @@ async def test_learn_listen_reports_a_tts_failure_as_a_message(
 
     await learn_listen(callback, session_factory, settings, make_state())
 
-    callback.message.answer_audio.assert_not_awaited()
+    callback.message.reply_audio.assert_not_awaited()
     callback.answer.assert_awaited_once_with()
-    callback.message.answer.assert_awaited_once_with(text)
+    callback.message.reply.assert_awaited_once_with(text)
 
 
 async def test_learn_listen_without_an_openai_key_answers_gracefully(session_factory):
@@ -599,7 +599,7 @@ async def test_learn_listen_without_an_openai_key_answers_gracefully(session_fac
     callback.answer.assert_awaited_once_with(
         "Озвучка недоступна - не настроен OpenAI.", show_alert=True
     )
-    callback.message.answer_audio.assert_not_awaited()
+    callback.message.reply_audio.assert_not_awaited()
 
 
 # --- learn_start: debt-threshold branching ----------------------------------
@@ -1317,7 +1317,7 @@ async def test_listen_on_a_deleted_head_card_synthesizes_nothing(session_factory
     await learn_listen(callback, session_factory, settings, state)
 
     tts.assert_not_called()
-    callback.message.answer_audio.assert_not_awaited()
+    callback.message.reply_audio.assert_not_awaited()
     assert _shown_card_id(callback.message.answer) == "card-A"
 
 

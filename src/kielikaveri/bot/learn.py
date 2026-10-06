@@ -464,9 +464,11 @@ async def learn_listen(
             )
     except APIError as error:
         logger.exception("event=learn.listen_error card_id=%s", card_id)
-        await callback.message.answer(_tts_error_text(error))
+        await callback.message.reply(_tts_error_text(error))
         return
-    await callback.message.answer_audio(BufferedInputFile(audio, filename="example.mp3"))
+    # A reply, not a plain message: the user may rate the card while TTS is
+    # still running, and the audio must not look like the next card's.
+    await callback.message.reply_audio(BufferedInputFile(audio, filename="example.mp3"))
 
 
 def _tts_error_text(error: APIError) -> str:
