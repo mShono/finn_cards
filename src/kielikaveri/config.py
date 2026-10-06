@@ -19,6 +19,8 @@ class Settings(BaseSettings):
     openai_tts_model: str = "tts-1"
     # tts-1 at 1.0 reads short sentences too fast to follow at B2 level.
     openai_tts_speed: float = 0.8
+    # A button the user is waiting on - past this, failing fast beats waiting.
+    openai_tts_timeout_seconds: float = 15.0
     openai_timeout_seconds: float = 60.0
 
     # Plan 3.8 point 3: the in-process circuit breaker. More calls than this

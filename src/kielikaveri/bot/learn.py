@@ -23,7 +23,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     Message,
 )
-from openai import OpenAI
+from openai import APIError, APIStatusError
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -35,7 +35,7 @@ from kielikaveri.srs.curriculum import introduce_due_forms
 from kielikaveri.srs.graduation import ensure_card_types, sync_user_card_types
 from kielikaveri.srs.queue import build_session_queue, defer_overdue_tail, overdue_count
 from kielikaveri.srs.scheduler import RATING_LABELS, Rating, apply_review
-from kielikaveri.tts import synthesize_speech
+from kielikaveri.tts import make_tts_client, synthesize_speech
 
 logger = logging.getLogger(__name__)
 
@@ -451,12 +451,35 @@ async def learn_listen(
         await _skip_deleted_card(callback, state, session_factory, card_id)
         return
     logger.debug("event=learn.listen card_id=%s", card_id)
-    client = OpenAI(api_key=settings.openai_api_key)
-    audio = synthesize_speech(
-        client, settings.openai_tts_model, note.example_fi, speed=settings.openai_tts_speed
-    )
-    await callback.message.answer_audio(BufferedInputFile(audio, filename="example.mp3"))
+    # Answer the tap before calling OpenAI: Telegram only accepts an answer
+    # for a short while, and a slow TTS must not leave the button spinning.
+    # Anything that goes wrong after this is reported as a plain message.
     await callback.answer()
+    try:
+        async with make_tts_client(
+            settings.openai_api_key, settings.openai_tts_timeout_seconds
+        ) as client:
+            audio = await synthesize_speech(
+                client, settings.openai_tts_model, note.example_fi, speed=settings.openai_tts_speed
+            )
+    except APIError as error:
+        logger.exception("event=learn.listen_error card_id=%s", card_id)
+        await callback.message.reply(_tts_error_text(error))
+        return
+    # A reply, not a plain message: the user may rate the card while TTS is
+    # still running, and the audio must not look like the next card's.
+    await callback.message.reply_audio(BufferedInputFile(audio, filename="example.mp3"))
+
+
+def _tts_error_text(error: APIError) -> str:
+    # A 4xx other than 429 is a bad key or model name - retrying never helps.
+    if (
+        isinstance(error, APIStatusError)
+        and error.status_code != 429
+        and 400 <= error.status_code < 500
+    ):
+        return "Озвучка настроена неверно - подробности в логах."
+    return "Не получилось озвучить - попробуй ещё раз чуть позже."
 
 
 @router.callback_query(F.data.startswith("learn:"))
