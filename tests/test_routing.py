@@ -10,8 +10,7 @@ import pytest
 from aiogram import Bot
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.methods import SendMessage
-from sqlalchemy import select
-from test_add import (
+from bot_helpers import (
     WORD_CANDIDATE,
     RecordingSession,
     make_breaker,
@@ -20,6 +19,7 @@ from test_add import (
     tg_callback_update,
     tg_text_update,
 )
+from sqlalchemy import select
 
 from kielikaveri.bot.add import (
     ADD_PROMPT,
