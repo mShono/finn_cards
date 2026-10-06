@@ -17,6 +17,7 @@ from finn_cards.morphology import NOMINAL_FORMS
 from kielikaveri.bot.add import delete_confirm
 from kielikaveri.bot.learn import (
     DECK_ALL_TOKEN,
+    SIDE_PROMPT,
     LearnStates,
     Rating,
     _show_next_card,
@@ -25,7 +26,9 @@ from kielikaveri.bot.learn import (
     learn_listen,
     learn_rate,
     learn_reveal,
+    learn_side_choice,
     learn_start,
+    learn_tap_while_starting,
     render_card,
 )
 from kielikaveri.config import Settings
@@ -85,10 +88,15 @@ def make_note(note_id: str = "note-1", user_id: int = 1, deck_id: str | None = N
     )
 
 
-def make_card(card_id: str, note_id: str, user_id: int, due: datetime, reps: int = 0) -> Card:
-    return Card(
-        id=card_id, note_id=note_id, user_id=user_id, type=CardType.recognition, due=due, reps=reps
-    )
+def make_card(
+    card_id: str,
+    note_id: str,
+    user_id: int,
+    due: datetime,
+    reps: int = 0,
+    card_type: CardType = CardType.recognition,
+) -> Card:
+    return Card(id=card_id, note_id=note_id, user_id=user_id, type=card_type, due=due, reps=reps)
 
 
 def make_callback(data: str) -> SimpleNamespace:
@@ -104,6 +112,21 @@ def make_message() -> SimpleNamespace:
     return SimpleNamespace(from_user=SimpleNamespace(id=1), answer=AsyncMock())
 
 
+async def _pick_side(state, session_factory, settings, message, side: str = "mix"):
+    """Answer the side question the way a tap does, replying through `message`."""
+    callback = make_callback(f"learn:side:{side}")
+    callback.message = message
+    await learn_side_choice(callback, state, session_factory, settings)
+    return callback
+
+
+async def _learn(state, session_factory, settings, message, side: str = "mix") -> None:
+    """/learn with a single deck: the command, then the side question."""
+    await learn_start(message, state, session_factory, settings)
+    assert await state.get_state() == LearnStates.side_choice
+    await _pick_side(state, session_factory, settings, message, side)
+
+
 async def _drain_session(
     state, session_factory, settings, message, max_taps: int = 50
 ) -> list[str]:
@@ -114,7 +137,7 @@ async def _drain_session(
     build_session_queue and every card is advanced by the real learn_rate,
     so the card cap under test is the one production applies.
     """
-    await learn_start(message, state, session_factory, settings)
+    await _learn(state, session_factory, settings, message)
     shown: list[str] = []
     for _ in range(max_taps):
         markup = message.answer.call_args.kwargs.get("reply_markup")
@@ -620,10 +643,10 @@ async def test_learn_start_offers_debt_choice_when_overdue_exceeds_threshold(ses
     settings = make_settings(debt_threshold=2)
     message = make_message()
 
-    await learn_start(message, state, session_factory, settings)
+    await _learn(state, session_factory, settings, message)
 
     assert await state.get_state() == LearnStates.debt_choice
-    message.answer.assert_awaited_once()
+    assert message.answer.await_count == 2  # the side question, then the debt prompt
     assert "Просрочено 3" in message.answer.call_args.args[0]
 
 
@@ -641,10 +664,10 @@ async def test_learn_start_goes_straight_to_reviewing_when_under_the_debt_thresh
     settings = make_settings(debt_threshold=100)
     message = make_message()
 
-    await learn_start(message, state, session_factory, settings)
+    await _learn(state, session_factory, settings, message)
 
     assert await state.get_state() == LearnStates.reviewing
-    message.answer.assert_awaited_once()
+    assert message.answer.await_count == 2  # the side question, then the card
     assert "hakea" in message.answer.call_args.args[0]  # the card's front, not a debt prompt
 
 
@@ -666,7 +689,7 @@ async def test_learn_start_does_not_count_never_reviewed_cards_as_debt(session_f
     settings = make_settings(debt_threshold=2)
     message = make_message()
 
-    await learn_start(message, state, session_factory, settings)
+    await _learn(state, session_factory, settings, message)
 
     assert await state.get_state() == LearnStates.reviewing
     messages = [call.args[0] for call in message.answer.call_args_list]
@@ -691,7 +714,12 @@ async def test_learn_start_skips_the_picker_with_a_single_deck(session_factory):
 
     await learn_start(message, state, session_factory, make_settings())
 
-    # Straight into a session - no deck question asked.
+    # Straight to the side question - no deck question asked.
+    assert await state.get_state() == LearnStates.side_choice
+    assert message.answer.call_args.args[0] == SIDE_PROMPT
+    assert (await state.get_data())["deck_id"] is None
+
+    await _pick_side(state, session_factory, make_settings(), message)
     assert await state.get_state() == LearnStates.reviewing
     assert "hakea" in message.answer.call_args.args[0]
 
@@ -735,7 +763,10 @@ async def test_learn_deck_choice_only_queues_cards_from_the_chosen_deck(session_
     await state.set_state(LearnStates.deck_choice)
     callback = make_callback(f"learn:deck:{deck_b.id}")
 
-    await learn_deck_choice(callback, state, session_factory, make_settings())
+    await learn_deck_choice(callback, state)
+    assert await state.get_state() == LearnStates.side_choice
+    assert callback.message.answer.call_args.args[0] == SIDE_PROMPT
+    await _pick_side(state, session_factory, make_settings(), callback.message)
 
     data = await state.get_data()
     assert data["queue"] == ["card-b"]
@@ -758,10 +789,354 @@ async def test_learn_deck_choice_all_queues_cards_from_every_deck(session_factor
     await state.set_state(LearnStates.deck_choice)
     callback = make_callback(f"learn:deck:{DECK_ALL_TOKEN}")
 
-    await learn_deck_choice(callback, state, session_factory, make_settings())
+    await learn_deck_choice(callback, state)
+    await _pick_side(state, session_factory, make_settings(), callback.message)
 
     data = await state.get_data()
     assert set(data["queue"]) == {"card-a", "card-b"}
+
+
+# --- learn_side_choice: which side of the cards a session shows -------------
+
+
+async def _seed_both_sides(session_factory, now: datetime, reps: int = 0) -> None:
+    """One due card of every type for one note."""
+    async with session_factory() as session:
+        session.add(User(id=1))
+        session.add(make_note())
+        await session.flush()
+        for card_type in CardType:
+            session.add(
+                make_card(
+                    card_type.value,
+                    "note-1",
+                    1,
+                    due=now - timedelta(days=1),
+                    reps=reps,
+                    card_type=card_type,
+                )
+            )
+        await session.commit()
+
+
+@pytest.mark.parametrize(
+    "side, expected",
+    [
+        ("fi", {"recognition", "inflection"}),
+        ("ru", {"production"}),
+        ("mix", {"recognition", "production", "inflection"}),
+    ],
+)
+async def test_learn_side_choice_queues_only_cards_of_that_side(session_factory, side, expected):
+    await _seed_both_sides(session_factory, datetime.now(UTC))
+    state = make_state()
+    message = make_message()
+
+    await _learn(state, session_factory, make_settings(), message, side)
+
+    assert await state.get_state() == LearnStates.reviewing
+    assert set((await state.get_data())["queue"]) == expected
+
+
+async def test_learn_side_choice_russian_shows_the_russian_front(session_factory):
+    await _seed_both_sides(session_factory, datetime.now(UTC))
+    message = make_message()
+
+    await _learn(make_state(), session_factory, make_settings(), message, "ru")
+
+    assert message.answer.call_args.args[0] == "🇷🇺 искать"
+
+
+async def test_learn_side_choice_russian_without_production_cards_explains_why(session_factory):
+    # Production cards open only after recognition settles - early on a
+    # Russian session is empty, and that is not a bug.
+    async with session_factory() as session:
+        session.add(User(id=1))
+        session.add(make_note())
+        await session.flush()
+        session.add(make_card("rec", "note-1", 1, due=NOW - timedelta(days=1)))
+        await session.commit()
+    state = make_state()
+    message = make_message()
+
+    await _learn(state, session_factory, make_settings(), message, "ru")
+
+    assert await state.get_state() is None
+    assert message.answer.call_args.args[0] == (
+        "На этой стороне сейчас нечего повторять.\n"
+        "Русская сторона открывается для слова, когда его финская уже хорошо запомнилась."
+    )
+
+
+async def test_learn_side_choice_russian_not_due_yet_gives_no_opening_hint(session_factory):
+    # Production cards exist, just none is due - the hint would be wrong.
+    async with session_factory() as session:
+        session.add(User(id=1))
+        session.add(make_note())
+        await session.flush()
+        session.add(make_card("rec", "note-1", 1, due=NOW - timedelta(days=1)))
+        session.add(
+            make_card(
+                "prod",
+                "note-1",
+                1,
+                due=datetime.now(UTC) + timedelta(days=3),
+                reps=1,
+                card_type=CardType.production,
+            )
+        )
+        await session.commit()
+    message = make_message()
+
+    await _learn(make_state(), session_factory, make_settings(), message, "ru")
+
+    assert message.answer.call_args.args[0] == "На этой стороне сейчас нечего повторять."
+
+
+async def test_learn_side_choice_finnish_with_nothing_due_does_not_claim_all_is_done(
+    session_factory,
+):
+    # Only the Russian side has work today - "всё выучено" would send the
+    # learner away from it.
+    async with session_factory() as session:
+        session.add(User(id=1))
+        session.add(make_note())
+        await session.flush()
+        session.add(
+            make_card(
+                "rec",
+                "note-1",
+                1,
+                due=datetime.now(UTC) + timedelta(days=3),
+                reps=1,
+            )
+        )
+        session.add(
+            make_card(
+                "prod",
+                "note-1",
+                1,
+                due=NOW - timedelta(days=1),
+                reps=1,
+                card_type=CardType.production,
+            )
+        )
+        await session.commit()
+    message = make_message()
+
+    await _learn(make_state(), session_factory, make_settings(), message, "fi")
+
+    assert message.answer.call_args.args[0] == "На этой стороне сейчас нечего повторять."
+
+
+@pytest.mark.parametrize("side, opens", [("ru", False), ("fi", True), ("mix", True)])
+async def test_learn_side_choice_opens_forms_only_for_a_side_that_shows_them(
+    session_factory, side, opens
+):
+    # A Russian session never shows a form - opening forms there would spend
+    # the day's daily_new_forms budget on cards nobody sees.
+    now = datetime.now(UTC)
+    async with session_factory() as session:
+        session.add(User(id=1))
+        deck = await create_deck(session, 1, "Общая")
+        await session.flush()
+        session.add(_noun_with_forms("note-a", "talo", deck.id, now - timedelta(days=20)))
+        await session.flush()
+        session.add(
+            Card(
+                id="rec",
+                note_id="note-a",
+                user_id=1,
+                type=CardType.recognition,
+                due=now - timedelta(days=1),
+                reps=2,
+            )
+        )
+        for days in (3, 2):
+            session.add(
+                Review(
+                    card_id="rec",
+                    user_id=1,
+                    rating=Rating.Good.value,
+                    reviewed_at=now - timedelta(days=days),
+                )
+            )
+        await session.commit()
+
+    await _learn(
+        make_state(), session_factory, make_settings(daily_new_forms=2), make_message(), side
+    )
+
+    async with session_factory() as session:
+        forms = (await session.scalars(select(Card).where(Card.type == CardType.inflection))).all()
+    assert forms  # the cards exist either way - only opening them is held back
+    opened = [c for c in forms if c.status == CardStatus.introduced]
+    assert (len(opened) == 2) is opens
+    assert all(c.introduced_at is None for c in forms if c.status != CardStatus.introduced)
+
+
+async def test_learn_side_choice_claims_the_start_before_doing_any_work(session_factory):
+    # The state leaves side_choice before the first await that yields, so a
+    # second tap can't match it while this one is still syncing cards.
+    seen: list = []
+    state = make_state()
+    await state.set_state(LearnStates.side_choice)
+    await state.update_data(deck_id=None)
+    callback = make_callback("learn:side:fi")
+
+    async def record_state(*args, **kwargs):
+        seen.append(await state.get_state())
+
+    callback.answer = AsyncMock(side_effect=record_state)
+
+    await learn_side_choice(callback, state, session_factory, make_settings())
+
+    assert seen == [LearnStates.starting]
+
+
+async def test_learn_deck_choice_claims_the_side_question_before_answering(session_factory):
+    seen: list = []
+    state = make_state()
+    await state.set_state(LearnStates.deck_choice)
+    callback = make_callback(f"learn:deck:{DECK_ALL_TOKEN}")
+
+    async def record_state(*args, **kwargs):
+        seen.append(await state.get_state())
+
+    callback.answer = AsyncMock(side_effect=record_state)
+
+    await learn_deck_choice(callback, state)
+
+    assert seen == [LearnStates.side_choice]
+    callback.message.answer.assert_awaited_once()
+
+
+async def test_learn_side_choice_that_fails_leaves_no_state_behind(session_factory, monkeypatch):
+    # Stuck in `starting`, every learn button would be answered silently and
+    # text would get the mid-session hint with no session to go with it.
+    async def fail(*args, **kwargs):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr("kielikaveri.bot.learn.sync_user_card_types", fail)
+    state = make_state()
+    await state.set_state(LearnStates.side_choice)
+    await state.update_data(deck_id=None)
+
+    with pytest.raises(RuntimeError):
+        await learn_side_choice(
+            make_callback("learn:side:fi"), state, session_factory, make_settings()
+        )
+
+    assert await state.get_state() is None
+
+
+async def test_learn_debt_choice_that_fails_leaves_no_state_behind(session_factory, monkeypatch):
+    async def fail(*args, **kwargs):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr("kielikaveri.bot.learn.defer_overdue_tail", fail)
+    state = make_state()
+    await state.set_state(LearnStates.debt_choice)
+    await state.update_data(debt_now=datetime.now(UTC).isoformat(), deck_id=None, side="mix")
+
+    with pytest.raises(RuntimeError):
+        await learn_debt_choice(
+            make_callback("learn:debt:defer"), state, session_factory, make_settings()
+        )
+
+    assert await state.get_state() is None
+
+
+async def test_a_tap_while_the_session_starts_is_answered_quietly():
+    callback = make_callback("learn:side:ru")
+
+    await learn_tap_while_starting(callback)
+
+    callback.answer.assert_awaited_once_with()
+    callback.message.answer.assert_not_awaited()
+
+
+async def test_learn_side_choice_debt_counts_only_that_side(session_factory):
+    now = datetime.now(UTC)
+    async with session_factory() as session:
+        session.add(User(id=1))
+        session.add(make_note())
+        await session.flush()
+        for i in range(3):
+            session.add(make_card(f"rec-{i}", "note-1", 1, due=now - timedelta(days=1), reps=1))
+        session.add(
+            make_card(
+                "prod",
+                "note-1",
+                1,
+                due=now - timedelta(days=1),
+                reps=1,
+                card_type=CardType.production,
+            )
+        )
+        await session.commit()
+    settings = make_settings(debt_threshold=2)
+
+    # Three Finnish-side reviews owed - over the threshold.
+    state, message = make_state(), make_message()
+    await _learn(state, session_factory, settings, message, "fi")
+    assert await state.get_state() == LearnStates.debt_choice
+    assert "Просрочено 3 карточек" in message.answer.call_args.args[0]
+
+    # One Russian-side review owed - no debt prompt, straight to it.
+    state, message = make_state(), make_message()
+    await _learn(state, session_factory, settings, message, "ru")
+    assert await state.get_state() == LearnStates.reviewing
+    assert (await state.get_data())["queue"] == ["prod"]
+
+
+async def test_learn_debt_defer_keeps_the_chosen_side(session_factory):
+    now = datetime.now(UTC)
+    async with session_factory() as session:
+        session.add(User(id=1))
+        session.add(make_note())
+        await session.flush()
+        for i in range(5):
+            session.add(
+                make_card(f"rec-{i}", "note-1", 1, due=now - timedelta(days=10 - i), reps=1)
+            )
+            session.add(
+                make_card(
+                    f"prod-{i}",
+                    "note-1",
+                    1,
+                    due=now - timedelta(days=5 - i),
+                    reps=1,
+                    card_type=CardType.production,
+                )
+            )
+        await session.commit()
+    settings = make_settings(debt_threshold=3, session_max_cards=2, debt_postpone_days=7)
+    state, message = make_state(), make_message()
+    await _learn(state, session_factory, settings, message, "ru")
+    assert await state.get_state() == LearnStates.debt_choice
+
+    # The side travels to the defer handler through FSM data only.
+    defer = make_callback("learn:debt:defer")
+    await learn_debt_choice(defer, state, session_factory, settings)
+
+    async with session_factory() as session:
+        due_of = {c.id: c.due for c in (await session.scalars(select(Card))).all()}
+    assert all(due_of[f"rec-{i}"] <= now for i in range(5))  # Finnish side untouched
+    assert [i for i in range(5) if due_of[f"prod-{i}"] > now] == [2, 3, 4]
+    assert (await state.get_data())["queue"] == ["prod-0", "prod-1"]
+
+
+async def test_learn_side_choice_ignores_an_unknown_side(session_factory):
+    state = make_state()
+    await state.set_state(LearnStates.side_choice)
+    await state.update_data(deck_id=None)
+    callback = make_callback("learn:side:xx")
+
+    await learn_side_choice(callback, state, session_factory, make_settings())
+
+    assert await state.get_state() == LearnStates.side_choice
+    callback.message.answer.assert_not_awaited()
 
 
 # --- learn_debt_choice -------------------------------------------------------
@@ -792,7 +1167,7 @@ async def test_learn_debt_choice_defer_postpones_the_tail_then_starts_a_session(
     await _seed_five_overdue_cards(session_factory, now)
     state = make_state()
     await state.set_state(LearnStates.debt_choice)
-    await state.update_data(debt_now=now.isoformat())
+    await state.update_data(debt_now=now.isoformat(), side="mix")
     settings = make_settings(session_max_cards=2, debt_postpone_days=7)
     callback = make_callback("learn:debt:defer")
 
@@ -815,7 +1190,7 @@ async def test_learn_debt_choice_batch_starts_a_session_without_deferring_anythi
     await _seed_five_overdue_cards(session_factory, now)
     state = make_state()
     await state.set_state(LearnStates.debt_choice)
-    await state.update_data(debt_now=now.isoformat())
+    await state.update_data(debt_now=now.isoformat(), side="mix")
     settings = make_settings(session_max_cards=2)
     callback = make_callback("learn:debt:batch")
 
@@ -857,7 +1232,8 @@ async def _choose_deck(session_factory, settings, deck_id: str):
     state = make_state()
     await state.set_state(LearnStates.deck_choice)
     callback = make_callback(f"learn:deck:{deck_id}")
-    await learn_deck_choice(callback, state, session_factory, settings)
+    await learn_deck_choice(callback, state)
+    await _pick_side(state, session_factory, settings, callback.message)
     return state, callback
 
 
@@ -995,7 +1371,7 @@ async def test_learn_start_single_deck_logs_session_start(session_factory, caplo
     message = make_message()
 
     with caplog.at_level(logging.INFO, logger="kielikaveri.bot.learn"):
-        await learn_start(message, state, session_factory, make_settings())
+        await _learn(state, session_factory, make_settings(), message)
 
     events = [log_fields(r.message) for r in caplog.records]
     start = next(f for f in events if f.get("event") == "learn.session_start")
@@ -1011,7 +1387,7 @@ async def test_learn_start_with_no_due_cards_logs_session_empty(session_factory,
     message = make_message()
 
     with caplog.at_level(logging.INFO, logger="kielikaveri.bot.learn"):
-        await learn_start(message, state, session_factory, make_settings())
+        await _learn(state, session_factory, make_settings(), message)
 
     events = [log_fields(r.message) for r in caplog.records]
     assert any(f.get("event") == "learn.session_empty" for f in events)
@@ -1027,7 +1403,7 @@ async def test_show_next_card_logs_session_end_with_reason_and_counts(session_fa
     message = make_message()
     settings = make_settings(session_max_cards=2, session_max_minutes=10, daily_new_limit=10)
 
-    await learn_start(message, state, session_factory, settings)
+    await _learn(state, session_factory, settings, message)
     first_card = message.answer.call_args.kwargs["reply_markup"].inline_keyboard[0][0]
     card_id = first_card.callback_data.split(":", 2)[2]
     rate = make_callback(f"learn:rate:{card_id}:3")

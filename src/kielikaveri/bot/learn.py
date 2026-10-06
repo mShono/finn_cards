@@ -1,6 +1,7 @@
 """The /learn command: FSRS-scheduled review sessions.
 
-Flow: show front -> "Показать ответ" reveals back + rating buttons -> rating
+Flow: pick a deck (when there is more than one), pick which side to be shown
+-> show front -> "Показать ответ" reveals back + rating buttons -> rating
 applies the review via srs.scheduler and advances to the next card, until the
 session hits its time limit or the queue - already capped at session_max_cards
 by build_session_queue - runs dry. No LLM, no network -
@@ -10,7 +11,10 @@ this must keep working when OpenAI is unreachable (see plan 3.10).
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from enum import StrEnum
 
 from aiogram import F, Router
 from aiogram.filters import Command
@@ -43,10 +47,43 @@ router = Router(name="learn")
 
 DECK_ALL_TOKEN = "all"
 DELETED_CARD_TEXT = "Это слово удалено."
+SIDE_PROMPT = "Что показывать на карточке?"
+
+
+class LearnSide(StrEnum):
+    """Which side of the cards a session shows.
+
+    A side is a filter, not a flip: recognition and production are separate
+    cards with FSRS schedules of their own, so showing a recognition card
+    Russian-first would record a production answer into recognition's
+    history. Inflection cards ask a form of a Finnish lemma, so they go with
+    Finnish.
+    """
+
+    fi = "fi"
+    ru = "ru"
+    mix = "mix"
+
+    @property
+    def card_types(self) -> tuple[CardType, ...] | None:
+        """The card types this side shows; None - every type, unfiltered."""
+        if self is LearnSide.fi:
+            return (CardType.recognition, CardType.inflection)
+        if self is LearnSide.ru:
+            return (CardType.production,)
+        return None
+
+    @property
+    def shows_forms(self) -> bool:
+        return self.card_types is None or CardType.inflection in self.card_types
 
 
 class LearnStates(StatesGroup):
     deck_choice = State()
+    side_choice = State()
+    # Between a side or debt tap and the session (or debt prompt) it leads
+    # to - the mark those handlers claim so a second tap starts nothing.
+    starting = State()
     debt_choice = State()
     reviewing = State()
 
@@ -101,6 +138,22 @@ def _deck_choice_keyboard(decks: list[Deck]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def _side_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🇫🇮 Финский", callback_data=f"learn:side:{LearnSide.fi}"),
+                InlineKeyboardButton(text="🇷🇺 Русский", callback_data=f"learn:side:{LearnSide.ru}"),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔀 Вперемешку", callback_data=f"learn:side:{LearnSide.mix}"
+                )
+            ],
+        ]
+    )
+
+
 def _debt_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -122,6 +175,7 @@ async def _start_session(
     user_id: int,
     now: datetime,
     deck_id: str | None,
+    side: LearnSide,
 ) -> None:
     async with session_factory() as session:
         queue = await build_session_queue(
@@ -132,15 +186,21 @@ async def _start_session(
             daily_new_limit=settings.daily_new_limit,
             boundary_hour=settings.day_boundary_hour,
             deck_id=deck_id,
+            card_types=side.card_types,
+        )
+        no_production = (
+            side is LearnSide.ru
+            and not queue
+            and not await _has_production(session, user_id, deck_id)
         )
 
     if not queue:
-        logger.info("event=learn.session_empty deck_id=%s", deck_id)
+        logger.info("event=learn.session_empty deck_id=%s side=%s", deck_id, side)
         await state.clear()
-        await answer_to.answer("Нечего повторять - все карточки выучены на сегодня.")
+        await answer_to.answer(_empty_session_text(side, no_production))
         return
 
-    logger.info("event=learn.session_start deck_id=%s queue=%d", deck_id, len(queue))
+    logger.info("event=learn.session_start deck_id=%s side=%s queue=%d", deck_id, side, len(queue))
     await state.set_state(LearnStates.reviewing)
     await state.update_data(
         queue=queue,
@@ -149,6 +209,25 @@ async def _start_session(
         session_max_minutes=settings.session_max_minutes,
     )
     await _show_next_card(answer_to, state, session_factory)
+
+
+async def _has_production(session: AsyncSession, user_id: int, deck_id: str | None) -> bool:
+    stmt = select(Card.id).where(Card.user_id == user_id, Card.type == CardType.production)
+    if deck_id is not None:
+        stmt = stmt.join(Note, Card.note_id == Note.id).where(Note.deck_id == deck_id)
+    return await session.scalar(stmt.limit(1)) is not None
+
+
+def _empty_session_text(side: LearnSide, no_production: bool) -> str:
+    if side is LearnSide.mix:
+        return "Нечего повторять - все карточки выучены на сегодня."
+    # Only this side is done - the other may still have cards waiting.
+    text = "На этой стороне сейчас нечего повторять."
+    if no_production:
+        # Production cards open only once the Finnish side is known well
+        # (graduation.py) - until the first one does, Russian is empty.
+        text += "\nРусская сторона открывается для слова, когда его финская уже хорошо запомнилась."
+    return text
 
 
 async def _drop_deleted_head(session: AsyncSession, queue: list[str]) -> list[str]:
@@ -219,7 +298,36 @@ async def _show_next_card(
     await answer_to.answer(front, reply_markup=_reveal_keyboard(card_id))
 
 
-async def _proceed_past_deck_choice(
+async def _claim_state(state: FSMContext, expected: State, claimed: State) -> bool:
+    """Move from `expected` to `claimed`; False if another update already left `expected`."""
+    if await state.get_state() != expected.state:
+        return False
+    await state.set_state(claimed)
+    return True
+
+
+@asynccontextmanager
+async def _clear_on_error(state: FSMContext) -> AsyncIterator[None]:
+    """Drop the claimed state if starting the session fails.
+
+    Left in `starting`, every learn button would be answered silently and
+    any text would get the mid-session hint, with no session to go with
+    it. Cleared, a stale button says to start over via /learn.
+    """
+    try:
+        yield
+    except Exception:
+        await state.clear()
+        raise
+
+
+async def _ask_side(answer_to: Message, state: FSMContext, deck_id: str | None) -> None:
+    await state.set_state(LearnStates.side_choice)
+    await state.update_data(deck_id=deck_id)
+    await answer_to.answer(SIDE_PROMPT, reply_markup=_side_keyboard())
+
+
+async def _proceed_past_side_choice(
     answer_to: Message,
     state: FSMContext,
     session_factory: async_sessionmaker[AsyncSession],
@@ -227,31 +335,43 @@ async def _proceed_past_deck_choice(
     user_id: int,
     now: datetime,
     deck_id: str | None,
+    side: LearnSide,
 ) -> None:
     async with session_factory() as session:
         await sync_user_card_types(session, user_id, now)
         # Cards first, then the curriculum decides which of the new forms
-        # the learner actually meets today - see srs/curriculum.py.
-        await introduce_due_forms(
+        # the learner actually meets today - see srs/curriculum.py. Not for
+        # a session that shows no forms: opening them there would spend the
+        # day's form budget on cards nobody sees.
+        if side.shows_forms:
+            await introduce_due_forms(
+                session,
+                user_id,
+                now,
+                daily_new_forms=settings.daily_new_forms,
+                boundary_hour=settings.day_boundary_hour,
+                deck_id=deck_id,
+            )
+        await session.commit()
+        overdue = await overdue_count(
             session,
             user_id,
             now,
-            daily_new_forms=settings.daily_new_forms,
-            boundary_hour=settings.day_boundary_hour,
             deck_id=deck_id,
+            reviewed_only=True,
+            card_types=side.card_types,
         )
-        await session.commit()
-        overdue = await overdue_count(session, user_id, now, deck_id=deck_id, reviewed_only=True)
 
     if overdue > settings.debt_threshold:
         logger.info(
-            "event=learn.debt_prompt deck_id=%s overdue=%d threshold=%d",
+            "event=learn.debt_prompt deck_id=%s side=%s overdue=%d threshold=%d",
             deck_id,
+            side,
             overdue,
             settings.debt_threshold,
         )
         await state.set_state(LearnStates.debt_choice)
-        await state.update_data(debt_now=now.isoformat(), deck_id=deck_id)
+        await state.update_data(debt_now=now.isoformat(), deck_id=deck_id, side=side)
         await answer_to.answer(
             f"Просрочено {overdue} карточек - это много за одну сессию.\n"
             f"Разгребать как обычно (по {settings.session_max_cards} за раз) "
@@ -260,7 +380,7 @@ async def _proceed_past_deck_choice(
         )
         return
 
-    await _start_session(answer_to, state, session_factory, settings, user_id, now, deck_id)
+    await _start_session(answer_to, state, session_factory, settings, user_id, now, deck_id, side)
 
 
 @router.message(Command("learn"))
@@ -271,18 +391,13 @@ async def learn_start(
     session_factory: async_sessionmaker[AsyncSession],
     settings: Settings,
 ) -> None:
-    user_id = message.from_user.id
-    now = datetime.now(UTC)
-
     async with session_factory() as session:
-        decks = await list_decks(session, user_id)
+        decks = await list_decks(session, message.from_user.id)
 
     logger.debug("event=learn.start decks=%d", len(decks))
     if len(decks) <= 1:
-        # Nothing to actually choose between - skip straight to the session.
-        await _proceed_past_deck_choice(
-            message, state, session_factory, settings, user_id, now, deck_id=None
-        )
+        # No deck to choose between - straight to the side question.
+        await _ask_side(message, state, deck_id=None)
         return
 
     await state.set_state(LearnStates.deck_choice)
@@ -290,22 +405,59 @@ async def learn_start(
 
 
 @router.callback_query(F.data.startswith("learn:deck:"), LearnStates.deck_choice)
-async def learn_deck_choice(
+async def learn_deck_choice(callback: CallbackQuery, state: FSMContext) -> None:
+    raw_deck_id = callback.data.split(":", 2)[2]
+    deck_id = None if raw_deck_id == DECK_ALL_TOKEN else raw_deck_id
+
+    logger.debug("event=learn.deck_choice deck_id=%s", deck_id)
+    # Claimed before the first await that yields, so a double tap asks the
+    # side only once - see learn_side_choice.
+    if not await _claim_state(state, LearnStates.deck_choice, LearnStates.side_choice):
+        await callback.answer()
+        return
+    await state.update_data(deck_id=deck_id)
+    await callback.answer()
+    await callback.message.answer(SIDE_PROMPT, reply_markup=_side_keyboard())
+
+
+@router.callback_query(F.data.startswith("learn:side:"), LearnStates.side_choice)
+async def learn_side_choice(
     callback: CallbackQuery,
     state: FSMContext,
     session_factory: async_sessionmaker[AsyncSession],
     settings: Settings,
 ) -> None:
-    raw_deck_id = callback.data.split(":", 2)[2]
-    deck_id = None if raw_deck_id == DECK_ALL_TOKEN else raw_deck_id
-    user_id = callback.from_user.id
-    now = datetime.now(UTC)
+    raw_side = callback.data.split(":", 2)[2]
+    if raw_side not in LearnSide:
+        await callback.answer()
+        return
+    side = LearnSide(raw_side)
+    # Claim the start before anything that yields - the same reason as
+    # learn_rate's early pop. Updates run as concurrent tasks, and the card
+    # sync and curriculum below take a while: a second tap would start a
+    # second session, both syncs racing to create the same cards. The state
+    # filter alone doesn't stop it - aiogram reads the state before running
+    # the filters, which yield, so both taps pass it. Hence the re-check
+    # here; with MemoryStorage neither call yields, so check-and-claim is
+    # atomic.
+    if not await _claim_state(state, LearnStates.side_choice, LearnStates.starting):
+        await learn_tap_while_starting(callback)
+        return
+    deck_id = (await state.get_data()).get("deck_id")
 
-    logger.debug("event=learn.deck_choice deck_id=%s", deck_id)
-    await callback.answer()
-    await _proceed_past_deck_choice(
-        callback.message, state, session_factory, settings, user_id, now, deck_id
-    )
+    logger.debug("event=learn.side_choice deck_id=%s side=%s", deck_id, side)
+    async with _clear_on_error(state):
+        await callback.answer()
+        await _proceed_past_side_choice(
+            callback.message,
+            state,
+            session_factory,
+            settings,
+            callback.from_user.id,
+            datetime.now(UTC),
+            deck_id,
+            side,
+        )
 
 
 @router.callback_query(F.data.startswith("learn:debt:"), LearnStates.debt_choice)
@@ -315,32 +467,42 @@ async def learn_debt_choice(
     session_factory: async_sessionmaker[AsyncSession],
     settings: Settings,
 ) -> None:
+    # Two taps - say "Отложить" and "как обычно" - would otherwise defer
+    # the tail and start two sessions; see learn_side_choice.
+    if not await _claim_state(state, LearnStates.debt_choice, LearnStates.starting):
+        await learn_tap_while_starting(callback)
+        return
     action = callback.data.split(":")[2]
     user_id = callback.from_user.id
     data = await state.get_data()
     now = datetime.fromisoformat(data["debt_now"])
     deck_id = data.get("deck_id")
+    side = LearnSide(data["side"])
 
-    if action == "defer":
-        async with session_factory() as session:
-            postponed = await defer_overdue_tail(
-                session,
-                user_id,
-                now,
-                keep_n=settings.session_max_cards,
-                postpone_days=settings.debt_postpone_days,
-                deck_id=deck_id,
+    async with _clear_on_error(state):
+        if action == "defer":
+            async with session_factory() as session:
+                postponed = await defer_overdue_tail(
+                    session,
+                    user_id,
+                    now,
+                    keep_n=settings.session_max_cards,
+                    postpone_days=settings.debt_postpone_days,
+                    deck_id=deck_id,
+                    card_types=side.card_types,
+                )
+                await session.commit()
+            logger.info("event=learn.debt_choice action=defer postponed=%d", postponed)
+            await callback.message.answer(
+                f"Отложено {postponed} карточек на {settings.debt_postpone_days} дн."
             )
-            await session.commit()
-        logger.info("event=learn.debt_choice action=defer postponed=%d", postponed)
-        await callback.message.answer(
-            f"Отложено {postponed} карточек на {settings.debt_postpone_days} дн."
-        )
-    else:
-        logger.debug("event=learn.debt_choice action=%s", action)
+        else:
+            logger.debug("event=learn.debt_choice action=%s", action)
 
-    await callback.answer()
-    await _start_session(callback.message, state, session_factory, settings, user_id, now, deck_id)
+        await callback.answer()
+        await _start_session(
+            callback.message, state, session_factory, settings, user_id, now, deck_id, side
+        )
 
 
 @router.callback_query(F.data.startswith("learn:reveal:"), LearnStates.reviewing)
@@ -482,9 +644,18 @@ def _tts_error_text(error: APIError) -> str:
     return "Не получилось озвучить - попробуй ещё раз чуть позже."
 
 
+@router.callback_query(F.data.startswith("learn:"), LearnStates.starting)
+async def learn_tap_while_starting(callback: CallbackQuery) -> None:
+    # A second tap on the side or debt buttons while the first one's
+    # session is still being built - that session is coming, nothing is
+    # stale.
+    logger.debug("event=learn.tap_while_starting")
+    await callback.answer()
+
+
 @router.callback_query(F.data.startswith("learn:"))
 async def learn_stray_callback(callback: CallbackQuery) -> None:
-    # Reaches here only when reveal/rate/debt fired outside their expected
+    # Reaches here only when deck/side/reveal/rate/debt fired outside their expected
     # state - e.g. a button from a session already ended by the time-limit.
     logger.debug("event=learn.stray_callback")
     await callback.answer(

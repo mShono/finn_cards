@@ -5,6 +5,7 @@ limit and the debt (backlog) threshold. DB-facing, no Telegram here.
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -79,6 +80,7 @@ async def due_cards(
     deck_id: str | None = None,
     reviewed_only: bool = False,
     new_only: bool = False,
+    card_types: Sequence[CardType] | None = None,
 ) -> list[Card]:
     # Note is joined unconditionally, not just to filter by deck: the
     # ordering below needs its columns, and a card always has a note.
@@ -93,6 +95,8 @@ async def due_cards(
         stmt = stmt.where(Card.reps == 0)
     if deck_id is not None:
         stmt = stmt.where(Note.deck_id == deck_id)
+    if card_types is not None:
+        stmt = stmt.where(Card.type.in_(card_types))
     result = await session.scalars(stmt.order_by(*_due_order()).limit(limit))
     return list(result.all())
 
@@ -103,6 +107,7 @@ async def overdue_count(
     now: datetime,
     deck_id: str | None = None,
     reviewed_only: bool = False,
+    card_types: Sequence[CardType] | None = None,
 ) -> int:
     """How many of the user's cards are due.
 
@@ -112,6 +117,7 @@ async def overdue_count(
     opens an inflection card per form, counting those as debt would fire
     the backlog prompt on day one. The deck screen leaves it off: there
     "к повторению" does mean everything due, new cards included.
+    `card_types` narrows the count to the side /learn was asked to show.
     """
     stmt = (
         select(func.count())
@@ -122,6 +128,8 @@ async def overdue_count(
         stmt = stmt.where(Card.reps > 0)
     if deck_id is not None:
         stmt = stmt.join(Note, Card.note_id == Note.id).where(Note.deck_id == deck_id)
+    if card_types is not None:
+        stmt = stmt.where(Card.type.in_(card_types))
     return await session.scalar(stmt)
 
 
@@ -188,6 +196,7 @@ async def build_session_queue(
     daily_new_limit: int,
     boundary_hour: int,
     deck_id: str | None = None,
+    card_types: Sequence[CardType] | None = None,
 ) -> list[str]:
     """Card ids for one /learn session, in the order the learner meets them.
 
@@ -211,6 +220,8 @@ async def build_session_queue(
     `deck_id` narrows candidates to one deck; the daily new-card budget stays
     global across decks on purpose - it's a "don't overload the learner today"
     cap, not a per-deck one.
+    `card_types` narrows candidates to the side the learner chose to see
+    (see bot/learn.py's LEARN_SIDES); None means every type.
     """
     new_today = await count_new_cards_today(session, user_id, now, boundary_hour)
     new_budget = max(0, daily_new_limit - new_today)
@@ -220,13 +231,25 @@ async def build_session_queue(
     # fill every slot, so due reviews were never fetched at all. Neither
     # fetch needs more rows than it could ever put into the queue.
     reviews = await due_cards(
-        session, user_id, now, limit=session_max_cards, deck_id=deck_id, reviewed_only=True
+        session,
+        user_id,
+        now,
+        limit=session_max_cards,
+        deck_id=deck_id,
+        reviewed_only=True,
+        card_types=card_types,
     )
     new_limit = min(new_budget, session_max_cards)
     new_cards: list[Card] = []
     if new_limit > 0:
         new_cards = await due_cards(
-            session, user_id, now, limit=new_limit, deck_id=deck_id, new_only=True
+            session,
+            user_id,
+            now,
+            limit=new_limit,
+            deck_id=deck_id,
+            new_only=True,
+            card_types=card_types,
         )
 
     # Merge with the very same _due_order() in SQL rather than re-sorting in
@@ -260,6 +283,7 @@ async def defer_overdue_tail(
     keep_n: int,
     postpone_days: int,
     deck_id: str | None = None,
+    card_types: Sequence[CardType] | None = None,
 ) -> int:
     """Push every overdue card past the first `keep_n` (oldest-due) forward
     by `postpone_days`. Returns how many cards were postponed.
@@ -268,7 +292,15 @@ async def defer_overdue_tail(
     showed - postponing a never-seen card would delay work that was never
     late in the first place.
     """
-    cards = await due_cards(session, user_id, now, limit=None, deck_id=deck_id, reviewed_only=True)
+    cards = await due_cards(
+        session,
+        user_id,
+        now,
+        limit=None,
+        deck_id=deck_id,
+        reviewed_only=True,
+        card_types=card_types,
+    )
     tail = cards[keep_n:]
     for card in tail:
         card.due = now + timedelta(days=postpone_days)

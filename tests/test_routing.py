@@ -1,6 +1,7 @@
 """Commands and menu buttons sent while a handler waits for free-text input,
 routed through bot/main.py's real Dispatcher (see InputEscapeMiddleware)."""
 
+import asyncio
 import re
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
@@ -30,7 +31,7 @@ from kielikaveri.bot.add import (
 )
 from kielikaveri.bot.decks import DeckStates
 from kielikaveri.bot.edit import EditStates
-from kielikaveri.bot.learn import LearnStates
+from kielikaveri.bot.learn import SIDE_PROMPT, LearnStates
 from kielikaveri.db.decks import get_or_create_default_deck
 from kielikaveri.db.engine import create_all, make_engine, make_session_factory
 from kielikaveri.db.models import Card, CardType, Deck, Note, NoteKind
@@ -88,6 +89,7 @@ async def routed(tmp_path, monkeypatch):
         "get_state": get_state,
         "get_data": get_data,
         "set_state": set_state,
+        "sent": telegram.sent,
     }
     await dp.storage.set_state(key, None)
     await dp.storage.set_data(key, {})
@@ -330,6 +332,74 @@ async def _start_review(routed) -> None:
         )
         await session.commit()
     await routed["send"]("/learn")
+    assert await routed["get_state"]() == LearnStates.side_choice.state
+    await routed["tap"]("learn:side:mix")
+    assert await routed["get_state"]() == LearnStates.reviewing.state
+
+
+async def test_double_tap_on_the_side_buttons_starts_one_session(routed):
+    # Two taps that both land before the first one has finished: aiogram
+    # handles updates as concurrent tasks, and the side handler awaits the
+    # database before it gets to change the state.
+    await _add_note(routed["session_factory"])
+    await routed["send"]("/learn")
+    assert await routed["get_state"]() == LearnStates.side_choice.state
+    since = len(routed["sent"])
+
+    await asyncio.gather(routed["tap"]("learn:side:fi"), routed["tap"]("learn:side:ru"))
+
+    texts = [m.text for m in routed["sent"][since:] if isinstance(m, SendMessage)]
+    # One session started - its first card, and nothing from a second start.
+    assert texts == ["🇫🇮 hakea"]
+    assert await routed["get_state"]() == LearnStates.reviewing.state
+    async with routed["session_factory"]() as session:
+        cards = (await session.scalars(select(Card))).all()
+    assert [c.type for c in cards] == [CardType.recognition]  # created once
+
+
+async def test_double_tap_on_a_deck_button_asks_the_side_once(routed):
+    note = await _add_note(routed["session_factory"])
+    async with routed["session_factory"]() as session:
+        session.add(Deck(user_id=1, name="Из книги"))
+        await session.commit()
+    await routed["send"]("/learn")
+    assert await routed["get_state"]() == LearnStates.deck_choice.state
+    since = len(routed["sent"])
+
+    tap = f"learn:deck:{note.deck_id}"
+    await asyncio.gather(routed["tap"](tap), routed["tap"](tap))
+
+    texts = [m.text for m in routed["sent"][since:] if isinstance(m, SendMessage)]
+    assert texts == [SIDE_PROMPT]
+    assert await routed["get_state"]() == LearnStates.side_choice.state
+
+
+async def test_double_tap_on_the_debt_buttons_starts_one_session(routed):
+    note = await _add_note(routed["session_factory"])
+    now = datetime.now(UTC)
+    async with routed["session_factory"]() as session:
+        for i in range(3):
+            session.add(
+                Card(
+                    id=f"c{i}",
+                    note_id=note.id,
+                    user_id=1,
+                    type=CardType.recognition,
+                    due=now - timedelta(days=10 - i),
+                    reps=1,
+                )
+            )
+        await session.commit()
+    await routed["set_state"](
+        LearnStates.debt_choice, {"debt_now": now.isoformat(), "deck_id": None, "side": "mix"}
+    )
+    since = len(routed["sent"])
+
+    await asyncio.gather(routed["tap"]("learn:debt:defer"), routed["tap"]("learn:debt:batch"))
+
+    texts = [m.text for m in routed["sent"][since:] if isinstance(m, SendMessage)]
+    # Only the first tap ran: one defer report, one card front.
+    assert texts == ["Отложено 0 карточек на 7 дн.", "🇫🇮 hakea"]
     assert await routed["get_state"]() == LearnStates.reviewing.state
 
 
@@ -351,25 +421,34 @@ async def test_edit_menu_cancel_still_drops_an_edit_in_progress(routed):
     assert await routed["get_state"]() is None
 
 
-@pytest.mark.parametrize(
-    "text, expected_reply",
-    [
-        ("🗂 Колоды", "Твои колоды"),
-        ("📚 Учить", "🇫🇮 hakea"),
-    ],
-)
-async def test_menu_button_during_review_keeps_the_session(routed, text, expected_reply):
+async def test_decks_button_during_review_keeps_the_session(routed):
     await _start_review(routed)
 
-    replies = await routed["send"](text)
+    replies = await routed["send"]("🗂 Колоды")
 
-    assert replies[0].startswith(expected_reply)
+    assert replies[0].startswith("Твои колоды")
     assert await routed["get_state"]() == LearnStates.reviewing.state
+
+
+async def test_learn_button_during_review_starts_over_with_the_side_question(routed):
+    await _start_review(routed)
+
+    replies = await routed["send"]("📚 Учить")
+
+    assert replies == [SIDE_PROMPT]
+    assert await routed["get_state"]() == LearnStates.side_choice.state
+    assert await routed["tap"]("learn:side:mix") == ["🇫🇮 hakea"]
 
 
 @pytest.mark.parametrize("text", ["💬 Добавить", "/add"])
 @pytest.mark.parametrize(
-    "state", [LearnStates.deck_choice, LearnStates.debt_choice, LearnStates.reviewing]
+    "state",
+    [
+        LearnStates.deck_choice,
+        LearnStates.side_choice,
+        LearnStates.debt_choice,
+        LearnStates.reviewing,
+    ],
 )
 async def test_add_during_learn_ends_the_session(routed, state, text):
     await routed["set_state"](state, {"queue": ["c1"], "reviewed_count": 0})
@@ -411,6 +490,7 @@ async def test_add_button_outside_learn_only_prompts(routed):
     "state, data",
     [
         (LearnStates.deck_choice, {}),
+        (LearnStates.side_choice, {"deck_id": None}),
         (LearnStates.debt_choice, {"debt_now": "2026-09-25T10:00:00+00:00", "deck_id": None}),
         (
             LearnStates.reviewing,
