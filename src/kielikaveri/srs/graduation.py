@@ -5,9 +5,10 @@ recognition opens immediately, production once recognition's interval
 are FST-verified - and there it is one card per form, not one per note, so
 each form carries its own FSRS schedule.
 
-Opening a dozen inflection cards at once does not flood a session:
-build_session_queue admits at most `daily_new_limit` never-reviewed cards
-per study day, so the forms are introduced a few at a time.
+Creating a dozen inflection cards at once does not flood a session: they
+are created `not_introduced`, and srs/curriculum.py opens them a few per
+study day (`daily_new_forms`). build_session_queue's `daily_new_limit` is
+only the defensive cap on never-reviewed cards of every type on top of that.
 """
 
 from __future__ import annotations
