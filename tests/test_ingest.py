@@ -12,6 +12,7 @@ from kielikaveri.db.models import Note, NoteKind
 from kielikaveri.ingest import (
     ResolvedLemma,
     TokenUsage,
+    _capitalized_mid_sentence,
     _chat_schema,
     _load_note_schema,
     _log_llm_request,
@@ -176,13 +177,20 @@ def test_canonical_key_is_case_insensitive_for_an_ambiguous_lemma():
     assert canonical_key("Seurojentalo", "substantiivi") == ("seurojentalo", "substantiivi")
 
 
-def test_canonical_key_prefers_an_exact_case_proper_noun():
-    # The FST knows both kivi and Kivi (a surname, a place). A capitalized
-    # lemma that is itself a lemma is taken as is - same as before the
-    # case-insensitive match existed - rather than guessed to be the common
-    # word.
-    assert canonical_key("Kivi", "substantiivi") == ("Kivi", "substantiivi")
-    assert canonical_key("kivi", "substantiivi") == ("kivi", "substantiivi")
+def test_canonical_key_takes_a_typed_capital_as_meant():
+    # Context-free (/edit, where the student types the lemma): the FST knows
+    # both kesä and Kesä (a proper noun), and a capital the student typed is
+    # deliberate. /add settles this from the sentence instead - see the
+    # resolve_note_lemma tests - and either lemma it chooses is stable here.
+    assert canonical_key("Kesä", "substantiivi") == ("Kesä", "substantiivi")
+    assert canonical_key("kesä", "substantiivi") == ("kesä", "substantiivi")
+
+
+def test_canonical_key_lemmatizes_an_inflected_form_by_its_pos():
+    # "tulin" is a form of both tulla (verb) and tuli (noun) - the FST lists
+    # tulla first, which is only right for a verb.
+    assert canonical_key("tulin", "substantiivi") == ("tuli", "substantiivi")
+    assert canonical_key("tulin", "verbi") == ("tulla", "verbi")
 
 
 def test_canonical_key_leaves_a_word_the_fst_does_not_know_unchanged():
@@ -621,6 +629,125 @@ async def test_resolve_note_lemma_matches_a_capitalized_llm_lemma_case_insensiti
 
     assert resolved == ResolvedLemma("seurojentalo", in_dictionary=True)
     client.responses.create.assert_not_called()
+
+
+async def test_resolve_note_lemma_asks_about_a_sentence_initial_capital():
+    # "Kesä" is both the common noun and a proper noun to the FST, and a
+    # capital at the start of a sentence says nothing - the LLM picks, from
+    # exactly those two. Taking the proper noun silently here would key the
+    # card apart from an existing "kesä" (the seurojentalo duplicate again).
+    client = MagicMock()
+    client.responses.create = AsyncMock(return_value=fake_response({"lemma": "kesä"}))
+
+    resolved, usage = await resolve_note_lemma(
+        client,
+        make_breaker(),
+        "gpt-5.6-terra",
+        "Kesä",
+        "substantiivi",
+        "Kesä",
+        "Kesä on lyhyt.",
+        NOW,
+    )
+
+    schema = client.responses.create.call_args.kwargs["text"]["format"]["schema"]
+    assert schema["properties"]["lemma"]["enum"] == ["Kesä", "kesä"]
+    assert resolved == ResolvedLemma("kesä", in_dictionary=True)
+    assert usage is not None
+
+
+async def test_resolve_note_lemma_takes_the_common_word_for_a_lowercase_surface():
+    # The LLM capitalized the lemma, the text didn't: the FST gives no proper
+    # noun reading for "kesällä", so that settles it without a call.
+    client = MagicMock()
+    client.responses.create = AsyncMock()
+
+    resolved, _usage = await resolve_note_lemma(
+        client,
+        make_breaker(),
+        "gpt-5.6-terra",
+        "Kesä",
+        "substantiivi",
+        "kesällä",
+        "Satoi paljon kesällä.",
+        NOW,
+    )
+
+    assert resolved == ResolvedLemma("kesä", in_dictionary=True)
+    client.responses.create.assert_not_called()
+
+
+async def test_resolve_note_lemma_takes_the_proper_noun_for_a_mid_sentence_capital():
+    client = MagicMock()
+    client.responses.create = AsyncMock()
+
+    resolved, _usage = await resolve_note_lemma(
+        client,
+        make_breaker(),
+        "gpt-5.6-terra",
+        "Lahti",
+        "substantiivi",
+        "Lahdessa",
+        "Asun Lahdessa.",
+        NOW,
+    )
+
+    assert resolved == ResolvedLemma("Lahti", in_dictionary=True)
+    client.responses.create.assert_not_called()
+
+
+async def test_resolve_note_lemma_does_not_take_the_fsts_first_lemma_of_an_inflected_llm_lemma():
+    # "tulin" is a form of tulla (verb, listed first) and tuli (noun); the
+    # LLM's pos says which reading this is.
+    client = MagicMock()
+    client.responses.create = AsyncMock()
+
+    resolved, _usage = await resolve_note_lemma(
+        client, make_breaker(), "gpt-5.6-terra", "tulin", "substantiivi", None, None, NOW
+    )
+
+    assert resolved == ResolvedLemma("tuli", in_dictionary=True)
+    client.responses.create.assert_not_called()
+
+
+async def test_resolve_note_lemma_asks_about_an_inflected_llm_lemma_from_the_surface():
+    # "tulet" is a form of tulla, tuli and tule. pos rules out the verb; the
+    # two nouns are left to the sentence - the LLM only picks among them.
+    client = MagicMock()
+    client.responses.create = AsyncMock(return_value=fake_response({"lemma": "tuli"}))
+
+    resolved, _usage = await resolve_note_lemma(
+        client,
+        make_breaker(),
+        "gpt-5.6-terra",
+        "tulet",
+        "substantiivi",
+        "tulet",
+        "Kaikki tulet sammuivat.",
+        NOW,
+    )
+
+    schema = client.responses.create.call_args.kwargs["text"]["format"]["schema"]
+    assert schema["properties"]["lemma"]["enum"] == ["tule", "tuli"]
+    assert resolved == ResolvedLemma("tuli", in_dictionary=True)
+
+
+@pytest.mark.parametrize(
+    ("surface", "context", "expected"),
+    [
+        ("Lahdessa", "Asun Lahdessa.", True),
+        ("Kesä", "Kesä on lyhyt.", False),
+        ("Kesä", "Satoi. Kesä on lyhyt.", False),
+        ("Kesä", '"Kesä on lyhyt", hän sanoi.', False),
+        ("Kesä", "Hän sanoi: Kesä on lyhyt.", False),
+        ("Turku", "Turku on kaunis, ja Turku on vanha.", True),
+        ("Kesä", "Kesäkuu on lyhyt.", False),
+        ("kesä", "Pitkä kesä.", False),
+        ("Kesä", None, False),
+    ],
+)
+def test_capitalized_mid_sentence(surface, context, expected):
+    assert _capitalized_mid_sentence(surface, context) is expected
 
 
 async def test_resolve_note_lemma_flags_a_word_the_fst_does_not_know_at_all():
