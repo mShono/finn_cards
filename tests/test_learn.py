@@ -483,15 +483,20 @@ async def test_learn_listen_sends_synthesized_audio_of_the_example_sentence(
         session.add(make_card("card-A", "note-1", 1, due=NOW))
         await session.commit()
 
+    calls = []
     monkeypatch.setattr(
         "kielikaveri.bot.learn.synthesize_speech",
-        lambda client, model, text, speed: b"fake-mp3-bytes",
+        lambda client, model, text, speed: calls.append((model, text, speed)) or b"fake-mp3-bytes",
     )
     callback = make_callback("learn:listen:card-A")
-    settings = make_settings(openai_api_key="sk-test", openai_tts_model="tts-1")
+    settings = make_settings(
+        openai_api_key="sk-test", openai_tts_model="tts-1", openai_tts_speed=0.7
+    )
 
     await learn_listen(callback, session_factory, settings, make_state())
 
+    # The example sentence, not the lemma - and at the configured speed.
+    assert calls == [("tts-1", "Haen töitä.", 0.7)]
     callback.message.answer_audio.assert_awaited_once()
     audio = callback.message.answer_audio.call_args.args[0]
     assert audio.data == b"fake-mp3-bytes"

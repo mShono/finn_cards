@@ -536,6 +536,34 @@ async def test_the_form_budget_is_spent_once_per_study_day(session_factory):
     assert len(third) == 2
 
 
+async def test_an_opened_form_is_due_from_the_moment_it_opens_not_from_its_creation(
+    session_factory,
+):
+    # Form cards are created at sync time and can sit unopened for days. If
+    # opening kept that old `due`, the form would look days overdue and its
+    # creation moment, not the syllabus order, would decide where it queues.
+    await seed_three_nouns(session_factory)
+    await learn_word(session_factory, "n0")
+    opened_at = NOW + timedelta(days=3)
+
+    async with session_factory() as session:
+        introduced = await introduce_due_forms(
+            session, 1, opened_at, daily_new_forms=3, boundary_hour=4
+        )
+        await session.commit()
+
+    opened = await cards_of(
+        session_factory, "n0", status=CardStatus.introduced, type=CardType.inflection
+    )
+    assert {c.id for c in opened} == {c.id for c in introduced}
+    assert len(opened) == 3
+    assert all(c.due == opened_at for c in opened)
+    # The others keep their creation-time due - the gap the test relies on.
+    still_closed = await cards_of(session_factory, "n0", status=CardStatus.not_introduced)
+    assert still_closed
+    assert all(c.due == NOW for c in still_closed)
+
+
 async def test_extended_forms_wait_until_the_core_ones_are_known(session_factory):
     await seed_three_nouns(session_factory)
     await learn_word(session_factory, "n0")
