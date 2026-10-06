@@ -11,6 +11,8 @@ this must keep working when OpenAI is unreachable (see plan 3.10).
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from enum import StrEnum
 
@@ -79,8 +81,8 @@ class LearnSide(StrEnum):
 class LearnStates(StatesGroup):
     deck_choice = State()
     side_choice = State()
-    # Between a side tap and the session (or debt prompt) it leads to - the
-    # mark learn_side_choice claims so a second tap starts nothing.
+    # Between a side or debt tap and the session (or debt prompt) it leads
+    # to - the mark those handlers claim so a second tap starts nothing.
     starting = State()
     debt_choice = State()
     reviewing = State()
@@ -304,6 +306,21 @@ async def _claim_state(state: FSMContext, expected: State, claimed: State) -> bo
     return True
 
 
+@asynccontextmanager
+async def _clear_on_error(state: FSMContext) -> AsyncIterator[None]:
+    """Drop the claimed state if starting the session fails.
+
+    Left in `starting`, every learn button would be answered silently and
+    any text would get the mid-session hint, with no session to go with
+    it. Cleared, a stale button says to start over via /learn.
+    """
+    try:
+        yield
+    except Exception:
+        await state.clear()
+        raise
+
+
 async def _ask_side(answer_to: Message, state: FSMContext, deck_id: str | None) -> None:
     await state.set_state(LearnStates.side_choice)
     await state.update_data(deck_id=deck_id)
@@ -429,17 +446,18 @@ async def learn_side_choice(
     deck_id = (await state.get_data()).get("deck_id")
 
     logger.debug("event=learn.side_choice deck_id=%s side=%s", deck_id, side)
-    await callback.answer()
-    await _proceed_past_side_choice(
-        callback.message,
-        state,
-        session_factory,
-        settings,
-        callback.from_user.id,
-        datetime.now(UTC),
-        deck_id,
-        side,
-    )
+    async with _clear_on_error(state):
+        await callback.answer()
+        await _proceed_past_side_choice(
+            callback.message,
+            state,
+            session_factory,
+            settings,
+            callback.from_user.id,
+            datetime.now(UTC),
+            deck_id,
+            side,
+        )
 
 
 @router.callback_query(F.data.startswith("learn:debt:"), LearnStates.debt_choice)
@@ -449,6 +467,11 @@ async def learn_debt_choice(
     session_factory: async_sessionmaker[AsyncSession],
     settings: Settings,
 ) -> None:
+    # Two taps - say "Отложить" and "как обычно" - would otherwise defer
+    # the tail and start two sessions; see learn_side_choice.
+    if not await _claim_state(state, LearnStates.debt_choice, LearnStates.starting):
+        await learn_tap_while_starting(callback)
+        return
     action = callback.data.split(":")[2]
     user_id = callback.from_user.id
     data = await state.get_data()
@@ -456,29 +479,30 @@ async def learn_debt_choice(
     deck_id = data.get("deck_id")
     side = LearnSide(data["side"])
 
-    if action == "defer":
-        async with session_factory() as session:
-            postponed = await defer_overdue_tail(
-                session,
-                user_id,
-                now,
-                keep_n=settings.session_max_cards,
-                postpone_days=settings.debt_postpone_days,
-                deck_id=deck_id,
-                card_types=side.card_types,
+    async with _clear_on_error(state):
+        if action == "defer":
+            async with session_factory() as session:
+                postponed = await defer_overdue_tail(
+                    session,
+                    user_id,
+                    now,
+                    keep_n=settings.session_max_cards,
+                    postpone_days=settings.debt_postpone_days,
+                    deck_id=deck_id,
+                    card_types=side.card_types,
+                )
+                await session.commit()
+            logger.info("event=learn.debt_choice action=defer postponed=%d", postponed)
+            await callback.message.answer(
+                f"Отложено {postponed} карточек на {settings.debt_postpone_days} дн."
             )
-            await session.commit()
-        logger.info("event=learn.debt_choice action=defer postponed=%d", postponed)
-        await callback.message.answer(
-            f"Отложено {postponed} карточек на {settings.debt_postpone_days} дн."
-        )
-    else:
-        logger.debug("event=learn.debt_choice action=%s", action)
+        else:
+            logger.debug("event=learn.debt_choice action=%s", action)
 
-    await callback.answer()
-    await _start_session(
-        callback.message, state, session_factory, settings, user_id, now, deck_id, side
-    )
+        await callback.answer()
+        await _start_session(
+            callback.message, state, session_factory, settings, user_id, now, deck_id, side
+        )
 
 
 @router.callback_query(F.data.startswith("learn:reveal:"), LearnStates.reviewing)
@@ -622,8 +646,9 @@ def _tts_error_text(error: APIError) -> str:
 
 @router.callback_query(F.data.startswith("learn:"), LearnStates.starting)
 async def learn_tap_while_starting(callback: CallbackQuery) -> None:
-    # A second tap on the side buttons while the first one's session is
-    # still being built - that session is coming, nothing is stale.
+    # A second tap on the side or debt buttons while the first one's
+    # session is still being built - that session is coming, nothing is
+    # stale.
     logger.debug("event=learn.tap_while_starting")
     await callback.answer()
 

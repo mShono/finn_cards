@@ -374,6 +374,35 @@ async def test_double_tap_on_a_deck_button_asks_the_side_once(routed):
     assert await routed["get_state"]() == LearnStates.side_choice.state
 
 
+async def test_double_tap_on_the_debt_buttons_starts_one_session(routed):
+    note = await _add_note(routed["session_factory"])
+    now = datetime.now(UTC)
+    async with routed["session_factory"]() as session:
+        for i in range(3):
+            session.add(
+                Card(
+                    id=f"c{i}",
+                    note_id=note.id,
+                    user_id=1,
+                    type=CardType.recognition,
+                    due=now - timedelta(days=10 - i),
+                    reps=1,
+                )
+            )
+        await session.commit()
+    await routed["set_state"](
+        LearnStates.debt_choice, {"debt_now": now.isoformat(), "deck_id": None, "side": "mix"}
+    )
+    since = len(routed["sent"])
+
+    await asyncio.gather(routed["tap"]("learn:debt:defer"), routed["tap"]("learn:debt:batch"))
+
+    texts = [m.text for m in routed["sent"][since:] if isinstance(m, SendMessage)]
+    # Only the first tap ran: one defer report, one card front.
+    assert texts == ["Отложено 0 карточек на 7 дн.", "🇫🇮 hakea"]
+    assert await routed["get_state"]() == LearnStates.reviewing.state
+
+
 async def test_old_edit_menu_cancel_leaves_a_review_session_alone(routed):
     await _start_review(routed)
 

@@ -1011,6 +1011,42 @@ async def test_learn_deck_choice_claims_the_side_question_before_answering(sessi
     callback.message.answer.assert_awaited_once()
 
 
+async def test_learn_side_choice_that_fails_leaves_no_state_behind(session_factory, monkeypatch):
+    # Stuck in `starting`, every learn button would be answered silently and
+    # text would get the mid-session hint with no session to go with it.
+    async def fail(*args, **kwargs):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr("kielikaveri.bot.learn.sync_user_card_types", fail)
+    state = make_state()
+    await state.set_state(LearnStates.side_choice)
+    await state.update_data(deck_id=None)
+
+    with pytest.raises(RuntimeError):
+        await learn_side_choice(
+            make_callback("learn:side:fi"), state, session_factory, make_settings()
+        )
+
+    assert await state.get_state() is None
+
+
+async def test_learn_debt_choice_that_fails_leaves_no_state_behind(session_factory, monkeypatch):
+    async def fail(*args, **kwargs):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr("kielikaveri.bot.learn.defer_overdue_tail", fail)
+    state = make_state()
+    await state.set_state(LearnStates.debt_choice)
+    await state.update_data(debt_now=datetime.now(UTC).isoformat(), deck_id=None, side="mix")
+
+    with pytest.raises(RuntimeError):
+        await learn_debt_choice(
+            make_callback("learn:debt:defer"), state, session_factory, make_settings()
+        )
+
+    assert await state.get_state() is None
+
+
 async def test_a_tap_while_the_session_starts_is_answered_quietly():
     callback = make_callback("learn:side:ru")
 
