@@ -415,7 +415,7 @@ def _hold_card_sync(monkeypatch, holds: int = 1) -> list[tuple[asyncio.Event, as
         gate = next(calls, None)
         if gate is not None:
             gate[0].set()
-            await gate[1].wait()
+            await asyncio.wait_for(gate[1].wait(), 5)
         return await real(*args, **kwargs)
 
     monkeypatch.setattr("kielikaveri.bot.learn.sync_user_card_types", held)
@@ -431,7 +431,7 @@ async def test_add_while_the_session_starts_keeps_it_stopped(routed, monkeypatch
     since = len(routed["sent"])
 
     async def add_meanwhile():
-        await entered.wait()
+        await asyncio.wait_for(entered.wait(), 5)
         await routed["send"]("/add")
         release.set()
 
@@ -449,7 +449,7 @@ async def test_learn_while_the_session_starts_lets_it_start(routed, monkeypatch)
     since = len(routed["sent"])
 
     async def learn_meanwhile():
-        await entered.wait()
+        await asyncio.wait_for(entered.wait(), 5)
         await routed["send"]("/learn")
         release.set()
 
@@ -470,11 +470,11 @@ async def test_an_old_start_leaves_a_newer_one_alone(routed, monkeypatch):
     since = len(routed["sent"])
 
     old_tap = asyncio.ensure_future(routed["tap"]("learn:side:fi"))
-    await old_in.wait()
+    await asyncio.wait_for(old_in.wait(), 5)
     await routed["send"]("/add")
     await routed["send"]("/learn")
     new_tap = asyncio.ensure_future(routed["tap"]("learn:side:mix"))
-    await new_in.wait()
+    await asyncio.wait_for(new_in.wait(), 5)
     old_go.set()
     await old_tap  # the old start runs to its end first
     new_go.set()

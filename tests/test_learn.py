@@ -1080,6 +1080,60 @@ async def test_learn_debt_choice_with_broken_data_leaves_no_state_behind(session
     callback.answer.assert_awaited_once_with()
 
 
+async def test_a_session_whose_first_card_fails_to_show_leaves_no_state_behind(session_factory):
+    # In `reviewing` with nothing on screen, the session could not go on.
+    await _seed_due_cards(session_factory, 1, datetime.now(UTC))
+    state = make_state()
+    await state.set_state(LearnStates.side_choice)
+    await state.update_data(deck_id=None)
+    message = make_message()
+    message.answer = AsyncMock(side_effect=RuntimeError("Telegram is down"))
+
+    with pytest.raises(RuntimeError):
+        await _pick_side(state, session_factory, make_settings(), message)
+
+    assert await state.get_state() is None
+
+
+async def test_a_debt_prompt_that_fails_to_send_leaves_no_state_behind(session_factory):
+    async with session_factory() as session:
+        session.add(User(id=1))
+        session.add(make_note())
+        await session.flush()
+        for i in range(3):
+            session.add(make_card(f"card-{i}", "note-1", 1, due=NOW - timedelta(days=1), reps=1))
+        await session.commit()
+    state = make_state()
+    await state.set_state(LearnStates.side_choice)
+    await state.update_data(deck_id=None)
+    message = make_message()
+    message.answer = AsyncMock(side_effect=RuntimeError("Telegram is down"))
+
+    with pytest.raises(RuntimeError):
+        await _pick_side(state, session_factory, make_settings(debt_threshold=2), message)
+
+    assert await state.get_state() is None
+
+
+async def test_a_session_after_the_debt_choice_whose_first_card_fails_leaves_no_state_behind(
+    session_factory,
+):
+    # The debt tap claims the start with a token of its own.
+    await _seed_due_cards(session_factory, 1, datetime.now(UTC))
+    state = make_state()
+    await state.set_state(LearnStates.debt_choice)
+    await state.update_data(
+        debt_now=datetime.now(UTC).isoformat(), deck_id=None, side="mix", start_token="old"
+    )
+    callback = make_callback("learn:debt:batch")
+    callback.message.answer = AsyncMock(side_effect=RuntimeError("Telegram is down"))
+
+    with pytest.raises(RuntimeError):
+        await learn_debt_choice(callback, state, session_factory, make_settings())
+
+    assert await state.get_state() is None
+
+
 async def test_a_failing_start_leaves_a_newer_state_alone(session_factory, monkeypatch):
     # While the first tap synced cards, /add ended it and /learn asked the
     # side again; the old attempt's failure must not wipe that question.

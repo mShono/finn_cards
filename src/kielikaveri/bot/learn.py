@@ -86,6 +86,8 @@ class LearnStates(StatesGroup):
     # Between a side or debt tap and the session (or debt prompt) it leads
     # to - the mark those handlers claim so a second tap starts nothing.
     # Data: start_token - which attempt holds the claim, see _claim_start.
+    # The token stays in the data of the state the attempt moves on to,
+    # see _clear_on_error.
     starting = State()
     debt_choice = State()
     reviewing = State()
@@ -325,11 +327,13 @@ async def _claim_start(state: FSMContext, expected: State) -> str | None:
     return token
 
 
+async def _set_by(state: FSMContext, token: str) -> bool:
+    """Whether the current state was set by the start attempt `token`."""
+    return (await state.get_data()).get("start_token") == token
+
+
 async def _holds_start(state: FSMContext, token: str) -> bool:
-    return (
-        await state.get_state() == LearnStates.starting.state
-        and (await state.get_data()).get("start_token") == token
-    )
+    return await state.get_state() == LearnStates.starting.state and await _set_by(state, token)
 
 
 async def _leave_starting(
@@ -350,7 +354,7 @@ async def _leave_starting(
         await state.clear()
     else:
         await state.set_state(new_state)
-        await state.set_data(data or {})
+        await state.set_data({**(data or {}), "start_token": token})
     return True
 
 
@@ -360,14 +364,16 @@ async def _clear_on_error(state: FSMContext, token: str) -> AsyncIterator[None]:
 
     Left in `starting`, every learn button would be answered silently and
     any text would get the mid-session hint, with no session to go with
-    it. Cleared, a stale button says to start over via /learn. Only while
-    this attempt still holds it - a newer state is not this failure's to
-    wipe.
+    it. Cleared, a stale button says to start over via /learn. The same
+    goes for the state the attempt moved on to: a session whose first card
+    failed to show, or a debt choice whose prompt never arrived, has nothing
+    on screen to go on with. Only a state this attempt set - a newer one is
+    not this failure's to wipe.
     """
     try:
         yield
     except Exception:
-        if await _holds_start(state, token):
+        if await _set_by(state, token):
             await state.clear()
         raise
 
