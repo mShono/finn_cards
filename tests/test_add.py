@@ -1218,15 +1218,20 @@ async def test_chat_saves_a_made_up_lemma_under_the_fsts_lemma(session_factory, 
     assert "⚠️" not in report
 
 
-async def test_chat_dedups_against_the_fsts_lemma(session_factory, monkeypatch):
+async def test_chat_dedups_against_the_fsts_lemma(session_factory, monkeypatch, caplog):
     patch_check_and_suggest(monkeypatch, "Добавляю.", [RIENTAA_CANDIDATE])
 
-    await _add_via_chat(session_factory)
-    second = await _add_via_chat(session_factory)
+    with caplog.at_level(logging.INFO, logger="kielikaveri.bot.add"):
+        await _add_via_chat(session_factory)
+        second = await _add_via_chat(session_factory)
 
     async with session_factory() as session:
         assert len((await session.scalars(select(Note))).all()) == 1
     assert "не дублирую: rientää" in second.message.answer.call_args.args[0]
+    # Caught by the lookup before the insert, not by the unique index's
+    # race branch - which words its report the same way.
+    events = [log_fields(r.message).get("event") for r in caplog.records]
+    assert "add.duplicate_race" not in events
 
 
 async def test_chat_flags_a_word_the_fst_does_not_know(session_factory, monkeypatch):
@@ -1345,6 +1350,7 @@ async def test_add_saves_an_inflected_form_under_the_fsts_lemma(session_factory,
     assert note.meta["forms_source"] == "fst+llm"  # the plural genitive tie-break
     assert note.meta["principal_forms"]["partitiivi"] == "työtä"
     assert note.meta["principal_forms"]["monikon_partitiivi"] == "töitä"
+    assert note.meta["principal_forms"]["monikon_genetiivi"] == "töiden"  # the fake's pick
     assert "surface_fi" not in note.meta
     report = callback.message.answer.call_args.args[0]
     assert "🇫🇮 työ → работа" in report
@@ -1353,13 +1359,23 @@ async def test_add_saves_an_inflected_form_under_the_fsts_lemma(session_factory,
     create.assert_awaited_once()  # the form tie-break, nothing else
 
 
-async def test_add_dedups_an_inflected_form_against_the_fsts_lemma(session_factory, monkeypatch):
+async def test_add_dedups_an_inflected_form_against_the_fsts_lemma(
+    session_factory, monkeypatch, caplog
+):
     patch_check_and_suggest(monkeypatch, "Добавляю.", [TOITA_CANDIDATE])
-    patch_form_choice_only(monkeypatch)
+    create = patch_form_choice_only(monkeypatch)
 
-    await _add_via_command(session_factory, "Haen töitä.")
-    second, _deck_id = await _add_via_command(session_factory, "Haen töitä.")
+    with caplog.at_level(logging.INFO, logger="kielikaveri.bot.add"):
+        await _add_via_command(session_factory, "Haen töitä.")
+        second, _deck_id = await _add_via_command(session_factory, "Haen töitä.")
 
     async with session_factory() as session:
         assert [note.lemma for note in (await session.scalars(select(Note))).all()] == ["työ"]
     assert "не дублирую: työ." in second.message.answer.call_args.args[0]
+    # Caught by the lookup before the insert, not by the unique index's
+    # race branch - which words its report the same way: the second turn
+    # never got as far as the forms (the first turn's tie-break is the only
+    # call) and never hit the index.
+    create.assert_awaited_once()
+    events = [log_fields(r.message).get("event") for r in caplog.records]
+    assert "add.duplicate_race" not in events
