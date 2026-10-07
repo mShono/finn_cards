@@ -726,32 +726,28 @@ async def resolve_note_lemma(
     """The lemma a candidate is saved under - the FST's, whenever it has one.
 
     The LLM sometimes makes a lemma up ("riensiä" for the text's "riensi",
-    whose real lemma is "rientää") or answers with an inflected form. The
-    FST can't analyze a made-up string, but it can analyze the word as the
-    text spells it (`surface`, see _chat_schema()). The options are always
-    FST lemmas:
+    whose real lemma is "rientää"), answers with an inflected form, or with
+    the lemma of another word spelled like the text's form ("tuli" the noun
+    for "Hän tuli kotiin.", whose verb is tulla). The FST can't analyze a
+    made-up string, but it can analyze the word as the text spells it
+    (`surface`, see _chat_schema()). The options are always FST lemmas:
 
-    * `lemma` is itself an FST lemma, up to case - that lemma in the FST's
-      spelling ("Seurojentalo" -> seurojentalo). Usually exactly one; a
-      capitalized word can also be a proper noun, though ("Kesä" -> kesä,
-      Kesä), and then both stay options;
-    * it isn't (made up, or inflected) - lemmatize(surface), else - no
-      `surface` (candidates cached before the field existed) or the FST
-      can't analyze it - lemmatize(lemma). An inflected `lemma` doesn't
-      short-circuit to the FST's first lemma: "tulin" is a form of both
-      tulla and tuli, and the sentence decides, not the FST's order.
-
-    Several options are narrowed down by what the text says, never guessed:
-
-    * to those `surface` is a form of - a lowercase surface gets no proper
-      noun readings from the FST, so "Kesä" for the text's "kesällä" is
-      kesä;
-    * to those whose part of speech matches the LLM's `pos` (it describes
-      the same reading in the same sentence);
-    * to the capitalized ones when `surface` is capitalized mid-sentence
-      (_capitalized_mid_sentence) - Finnish capitalizes nothing else there.
-      A sentence-initial capital says nothing: "Kesä on lyhyt." is summer,
-      "Turku on kaunis." is the city;
+    * `lemma` itself, up to case and in the FST's spelling ("Seurojentalo"
+      -> seurojentalo) - if it is a lemma of `surface` too and of the LLM's
+      `pos` (it describes the same reading in the same sentence). Usually
+      one; a capitalized word can also be a proper noun, though ("Kesä" ->
+      kesä, Kesä - a lowercase surface gets no proper noun reading, so
+      "kesällä" leaves just kesä);
+    * otherwise lemmatize(surface) - or lemmatize(lemma), with no `surface`
+      (candidates cached before the field existed) or one the FST can't
+      analyze - narrowed to `pos`. "tuli" + verbi gives tulla, "Usko" +
+      verbi gives uskoa, never the FST's first lemma or a wrong-pos one;
+    * no reading of `pos` at all - the pos is what's wrong: `lemma` if the
+      FST has it (resolve_note_pos() fixes the pos), else all of them;
+    * `surface` capitalized mid-sentence (_capitalized_mid_sentence) - its
+      proper noun lemmas of `pos`, if any: Finnish capitalizes nothing else
+      there. A sentence-initial capital says nothing: "Kesä on lyhyt." is
+      summer, "Turku on kaunis." is the city;
     * one left - take it, otherwise the LLM picks from an enum of them
       (choose_lemma()).
 
@@ -764,23 +760,31 @@ async def resolve_note_lemma(
         return ResolvedLemma(lemma, in_dictionary=True), None
 
     lemma_options = lemmatize(lemma)
-    options = _case_matches(lemma, lemma_options)
-    if len(options) == 1:
-        return ResolvedLemma(options[0], in_dictionary=True), None
     surface_options = lemmatize(surface) if surface else []
-    if not options:
-        options = surface_options or lemma_options
-    if not options:
+    if not lemma_options and not surface_options:
         logger.info("event=resolve_note_lemma.unknown lemma=%s surface=%s", lemma, surface)
         return ResolvedLemma(lemma, in_dictionary=False), None
 
+    case_matches = _case_matches(lemma, lemma_options)
+    if surface_options:
+        case_matches = [option for option in case_matches if option in surface_options]
+    options = [option for option in case_matches if _pos_fits(option, pos)]
+    if not options:
+        # `lemma` is not a lemma of this reading: made up, inflected, or the
+        # lemma of another word that shares the spelling ("tuli" the noun for
+        # the verb form "tuli" of tulla). The text's word decides.
+        candidates = surface_options or lemma_options
+        options = [option for option in candidates if _pos_fits(option, pos)]
+        # No reading of that part of speech at all - the LLM's pos is what's
+        # wrong, not its lemma (resolve_note_pos() corrects it later). Keep
+        # its lemma if the FST has one, otherwise every candidate - never a
+        # wrong-pos subset that leaves the right lemma out of the enum.
+        options = options or case_matches or candidates
+
     usage = None
-    if len(options) > 1:
-        options = [option for option in options if option in surface_options] or options
-    if len(options) > 1:
-        options = [option for option in options if pos in pos_set_for_lemma(option)] or options
-    if len(options) > 1 and _capitalized_mid_sentence(surface, context):
-        options = [option for option in options if option[:1].isupper()] or options
+    if _capitalized_mid_sentence(surface, context):
+        proper = [o for o in surface_options if o[:1].isupper() and _pos_fits(o, pos)]
+        options = proper or options
     if len(options) == 1:
         chosen = options[0]
     else:
@@ -798,19 +802,28 @@ async def resolve_note_lemma(
             )
             return ResolvedLemma(lemma, in_dictionary=False), usage
 
-    logger.info(
-        "event=resolve_note_lemma.corrected llm_lemma=%s surface=%s lemma=%s",
-        lemma,
-        surface,
-        chosen,
-    )
+    if chosen != lemma:
+        logger.info(
+            "event=resolve_note_lemma.corrected llm_lemma=%s surface=%s lemma=%s",
+            lemma,
+            surface,
+            chosen,
+        )
     return ResolvedLemma(chosen, in_dictionary=True), usage
 
 
-# Where a sentence ends - a capital right after one of these says nothing.
-# ":" too: Finnish quotes direct speech after a colon with a capital.
-_SENTENCE_END = ".!?…:"
-_OPENING_PUNCTUATION = " \t\n\"'«»“”„()[]-–—"
+# What may stand right before a capital for it to count as mid-sentence
+# (besides a letter or a digit): anything else - a newline, a quote, a
+# bracket, a dash, a list marker, an emoji, ":" before direct speech - may
+# just as well start a sentence, a heading or a list item.
+_MID_SENTENCE_BEFORE = ",;"
+_SENTENCE_END = ".!?…"
+
+
+def _pos_fits(lemma: str, pos: str) -> bool:
+    """Whether the FST allows `pos` for `lemma` - True if it names no part of speech at all."""
+    allowed = pos_set_for_lemma(lemma)
+    return not allowed or pos in allowed
 
 
 def _case_matches(word: str, lemmas: list[str]) -> list[str]:
@@ -828,16 +841,28 @@ def _case_matches(word: str, lemmas: list[str]) -> list[str]:
 
 
 def _capitalized_mid_sentence(surface: str | None, context: str | None) -> bool:
-    """Whether the text capitalizes `surface` somewhere other than a sentence start.
+    """Whether the text capitalizes `surface` where only a proper noun would be.
 
-    Only an occurrence spelled exactly like `surface` counts; not found (or
-    no context) is False - nothing is known then.
+    Errs towards False ("don't know" - the caller then asks the LLM),
+    because True skips that call and a wrong True saves the proper noun
+    instead of the common word - a silent duplicate of an existing card.
+    So an occurrence spelled exactly like `surface` counts only when, on
+    its own line, a letter, a digit, "," or ";" comes right before it
+    (spaces aside), and a sentence-ending mark comes after it - a line with
+    none is a heading or a list item, where Title Case is common.
     """
     if not surface or not context or not surface[:1].isupper():
         return False
     for match in re.finditer(rf"(?<!\w){re.escape(surface)}(?!\w)", context):
-        before = context[: match.start()].rstrip(_OPENING_PUNCTUATION)
-        if before and before[-1] not in _SENTENCE_END:
+        line_start = context.rfind("\n", 0, match.start()) + 1
+        line_end = context.find("\n", match.end())
+        before = context[line_start : match.start()].rstrip(" \t")
+        after = context[match.end() : len(context) if line_end == -1 else line_end]
+        if (
+            before
+            and (before[-1].isalnum() or before[-1] in _MID_SENTENCE_BEFORE)
+            and any(mark in after for mark in _SENTENCE_END)
+        ):
             return True
     return False
 
