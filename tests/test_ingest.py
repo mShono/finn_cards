@@ -17,6 +17,7 @@ from kielikaveri.ingest import (
     _load_note_schema,
     _log_llm_request,
     _log_llm_response,
+    _of_pos,
     build_full_note,
     canonical_key,
     check_and_suggest,
@@ -799,6 +800,40 @@ async def test_resolve_note_lemma_follows_a_mid_sentence_capital_over_a_lowercas
 
     assert resolved == ResolvedLemma("Lahti", in_dictionary=True)
     client.responses.create.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("lemma", "surface", "context", "expected"),
+    [
+        ("Helsinki", "Helsingissä", "Asun Helsingissä.", "Helsinki"),
+        ("Turku", "Turussa", "Asun Turussa.", "Turku"),
+        ("Pori", "Porissa", "Asun Porissa.", "Pori"),
+    ],
+)
+async def test_resolve_note_lemma_keeps_a_proper_noun_lemma_for_a_mid_sentence_capital(
+    lemma, surface, context, expected
+):
+    # The surface's other capitalized lemmas are junk splits (Helsing, Turu,
+    # Turunen, Po, Porissa) - the LLM's own lemma, already confirmed by the
+    # FST, is the answer without a call.
+    client = MagicMock()
+    client.responses.create = AsyncMock()
+
+    resolved, _usage = await resolve_note_lemma(
+        client, make_breaker(), "gpt-5.6-terra", lemma, "substantiivi", surface, context, NOW
+    )
+
+    assert resolved == ResolvedLemma(expected, in_dictionary=True)
+    client.responses.create.assert_not_called()
+
+
+def test_of_pos_admits_a_lemma_without_a_known_pos_only_as_a_last_resort(monkeypatch):
+    pos_sets = {"talo": {"substantiivi"}, "Seura": set(), "juosta": {"verbi"}}
+    monkeypatch.setattr("kielikaveri.ingest.pos_set_for_lemma", pos_sets.__getitem__)
+
+    assert _of_pos(["Seura", "talo", "juosta"], "substantiivi") == ["talo"]
+    assert _of_pos(["Seura", "juosta"], "substantiivi") == ["Seura"]
+    assert _of_pos(["juosta"], "substantiivi") == []
 
 
 async def test_resolve_note_lemma_asks_when_a_capital_may_start_a_line():

@@ -768,13 +768,13 @@ async def resolve_note_lemma(
     case_matches = _case_matches(lemma, lemma_options)
     if surface_options:
         case_matches = [option for option in case_matches if option in surface_options]
-    options = [option for option in case_matches if _pos_fits(option, pos)]
+    options = _of_pos(case_matches, pos)
     if not options:
         # `lemma` is not a lemma of this reading: made up, inflected, or the
         # lemma of another word that shares the spelling ("tuli" the noun for
         # the verb form "tuli" of tulla). The text's word decides.
         candidates = surface_options or lemma_options
-        options = [option for option in candidates if _pos_fits(option, pos)]
+        options = _of_pos(candidates, pos)
         # No reading of that part of speech at all - the LLM's pos is what's
         # wrong, not its lemma (resolve_note_pos() corrects it later). Keep
         # its lemma if the FST has one, otherwise every candidate - never a
@@ -783,7 +783,13 @@ async def resolve_note_lemma(
 
     usage = None
     if _capitalized_mid_sentence(surface, context):
-        proper = [o for o in surface_options if o[:1].isupper() and _pos_fits(o, pos)]
+        # The capitalized options already found first ("Helsinki" for
+        # "Asun Helsingissä." stays the answer, not one of the surface's
+        # junk splits like Helsing); the surface's only for a lowercase LLM
+        # lemma ("lahti" -> Lahti).
+        proper = [o for o in options if o[:1].isupper()] or _of_pos(
+            [o for o in surface_options if o[:1].isupper()], pos
+        )
         options = proper or options
     if len(options) == 1:
         chosen = options[0]
@@ -820,10 +826,14 @@ _MID_SENTENCE_BEFORE = ",;"
 _SENTENCE_END = ".!?…"
 
 
-def _pos_fits(lemma: str, pos: str) -> bool:
-    """Whether the FST allows `pos` for `lemma` - True if it names no part of speech at all."""
-    allowed = pos_set_for_lemma(lemma)
-    return not allowed or pos in allowed
+def _of_pos(lemmas: list[str], pos: str) -> list[str]:
+    """The lemmas the FST allows `pos` for - or, only if there are none, those
+    it names no part of speech for at all (it can't say, so can't rule out).
+    """
+    allowed = {lemma: pos_set_for_lemma(lemma) for lemma in lemmas}
+    return [lemma for lemma in lemmas if pos in allowed[lemma]] or [
+        lemma for lemma in lemmas if not allowed[lemma]
+    ]
 
 
 def _case_matches(word: str, lemmas: list[str]) -> list[str]:
