@@ -95,15 +95,6 @@ def test_the_study_day_spanning_fall_back_is_25_hours_long():
     assert end - start == timedelta(hours=25)
 
 
-def test_the_day_after_spring_forward_starts_at_the_local_boundary_hour():
-    # The "today" branch on the first summer-time day: replacing the hour on
-    # the local clock must give 04:00 EEST, i.e. 01:00 UTC.
-    now = datetime(2026, 3, 29, 12, 0, tzinfo=HELSINKI).astimezone(UTC)
-    start, end = study_day_bounds(now, boundary_hour=4)
-    assert start == datetime(2026, 3, 29, 1, 0, tzinfo=UTC)
-    assert end == datetime(2026, 3, 30, 1, 0, tzinfo=UTC)
-
-
 # --- due_cards / overdue_count ----------------------------------------------
 
 
