@@ -1714,6 +1714,53 @@ async def test_reveal_of_a_deleted_card_from_an_old_message_leaves_the_session_a
     assert (await state.get_data())["queue"] == ["card-A", "card-C"]
 
 
+# --- another user's card id in forged callback_data ---------------------------
+
+
+async def _seed_two_users(session_factory) -> None:
+    """User 1 with card-A (hakea), user 2 with card-X (naapuri)."""
+    async with session_factory() as session:
+        session.add_all([User(id=1), User(id=2)])
+        session.add(make_note("note-1"))
+        foreign = make_note("note-2", user_id=2)
+        foreign.lemma = "naapuri"
+        foreign.translation_ru = "сосед"
+        foreign.example_fi = "Naapuri tuli."
+        session.add(foreign)
+        await session.flush()
+        session.add(make_card("card-A", "note-1", 1, due=NOW))
+        session.add(make_card("card-X", "note-2", 2, due=NOW))
+        await session.commit()
+
+
+async def test_reveal_of_another_users_card_shows_nothing(session_factory):
+    await _seed_two_users(session_factory)
+    state = await _start_mid_session(["card-A"])
+    callback = make_callback("learn:reveal:card-X")
+
+    await learn_reveal(callback, session_factory, state)
+
+    callback.answer.assert_awaited_once_with("Это слово удалено.")
+    callback.message.answer.assert_not_awaited()
+    assert (await state.get_data())["queue"] == ["card-A"]
+
+
+async def test_listen_on_another_users_card_synthesizes_nothing(session_factory, monkeypatch):
+    await _seed_two_users(session_factory)
+    state = await _start_mid_session(["card-A"])
+    tts = AsyncMock()
+    monkeypatch.setattr("kielikaveri.bot.learn.synthesize_speech", tts)
+    callback = make_callback("learn:listen:card-X")
+    settings = make_settings(openai_api_key="sk-test", openai_tts_model="tts-1")
+
+    await learn_listen(callback, session_factory, settings, state)
+
+    tts.assert_not_called()
+    callback.message.reply_audio.assert_not_awaited()
+    callback.answer.assert_awaited_once_with("Это слово удалено.")
+    callback.message.answer.assert_not_awaited()
+
+
 async def test_session_ends_when_every_remaining_card_was_deleted(session_factory):
     await _seed_two_words(session_factory)
     state = await _start_mid_session(["card-B"])

@@ -211,6 +211,35 @@ async def test_decks_open_puts_each_note_on_an_edit_button_with_its_translation(
     callback.answer.assert_awaited_once()
 
 
+async def test_decks_open_ignores_another_users_note_in_the_deck(session_factory):
+    # Shouldn't exist (add_deck_choice checks the deck's owner), but the
+    # screen mustn't rely on that alone - deck_id is no proof of whose note.
+    async with session_factory() as session:
+        deck = await create_deck(session, 1, "Общая")
+        await session.flush()
+        for note_id, user_id, lemma in (("own", 1, "hakea"), ("foreign", 2, "naapuri")):
+            session.add(
+                Note(
+                    id=note_id,
+                    user_id=user_id,
+                    lemma=lemma,
+                    translation_ru="x",
+                    example_fi="x",
+                    example_ru="y",
+                    kind=NoteKind.word,
+                    deck_id=deck.id,
+                    meta={},
+                )
+            )
+        await session.commit()
+
+    callback = make_callback(f"decks:open:{deck.id}")
+    await decks_open(callback, session_factory)
+
+    assert "слов: 1" in callback.message.answer.call_args.args[0]
+    assert [b.callback_data for b in _note_buttons(callback)] == ["noteedit:own"]
+
+
 async def test_deck_screens_count_only_their_own_deck_cards(session_factory):
     # decks_open and decks_list read the clock themselves - due dates are
     # relative to the real now.

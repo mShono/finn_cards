@@ -474,6 +474,18 @@ async def add_deck_choice(
 
     candidates: list[dict] = data.get("candidates", [])
     user_id = callback.from_user.id
+    # batch_id above only proves the picker is this chat's current one - the
+    # deck id is whatever the callback_data says, and a forged one would land
+    # this user's words in someone else's deck (or a nonexistent one). Same
+    # ownership check as decks_open/noteedit/delnote; state stays, so a real
+    # button from the same picker still works.
+    async with session_factory() as session:
+        deck = await session.get(Deck, deck_id)
+    if deck is None or deck.user_id != user_id:
+        logger.debug("event=add.deck_not_found deck_id=%s", deck_id)
+        await callback.answer("Не нашла колоду.", show_alert=True)
+        return
+
     await state.clear()
     await callback.answer()
 

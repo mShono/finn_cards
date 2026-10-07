@@ -146,7 +146,9 @@ async def decks_open(
 
         total = (
             await session.scalar(
-                select(func.count()).select_from(Note).where(Note.deck_id == deck_id)
+                select(func.count())
+                .select_from(Note)
+                .where(Note.deck_id == deck_id, Note.user_id == user_id)
             )
             or 0
         )
@@ -158,7 +160,7 @@ async def decks_open(
                     # Newest first: a freshly added word is the one you most
                     # often come back to fix.
                     select(Note)
-                    .where(Note.deck_id == deck_id)
+                    .where(Note.deck_id == deck_id, Note.user_id == user_id)
                     .order_by(Note.created_at.desc())
                     .offset(page * NOTES_PER_PAGE)
                     .limit(NOTES_PER_PAGE)

@@ -128,6 +128,70 @@ async def test_count_new_cards_today_counts_first_reviews_in_the_window(session_
     assert count == 1
 
 
+# --- another user's cards never count ----------------------------------------
+# Each of these filters by user_id itself - one test per function, so dropping
+# any single filter fails exactly its own test.
+
+CROSS_NOW = datetime(2026, 8, 24, 10, 0, tzinfo=UTC)
+
+
+async def _seed_two_users(session_factory) -> None:
+    """User 1: one overdue reviewed card. User 2: two overdue reviewed cards
+    (each first reviewed today) and one unopened form."""
+    overdue = CROSS_NOW - timedelta(days=1)
+    async with session_factory() as session:
+        session.add_all([User(id=1), User(id=2)])
+        session.add_all([make_note("note-1", 1), make_note("note-2", 2)])
+        await session.flush()
+        session.add(make_card("card-1", "note-1", 1, due=overdue, reps=1))
+        session.add(make_card("card-2", "note-2", 2, due=overdue, reps=1))
+        session.add(make_card("card-3", "note-2", 2, due=overdue, reps=1))
+        unopened = make_card("card-4", "note-2", 2, due=overdue)
+        unopened.status = CardStatus.not_introduced
+        session.add(unopened)
+        await session.flush()
+        session.add(Review(card_id="card-2", user_id=2, rating=3, reviewed_at=CROSS_NOW))
+        session.add(Review(card_id="card-3", user_id=2, rating=3, reviewed_at=CROSS_NOW))
+        await session.commit()
+
+
+async def test_overdue_count_ignores_another_users_cards(session_factory):
+    await _seed_two_users(session_factory)
+    async with session_factory() as session:
+        assert await overdue_count(session, 1, CROSS_NOW, reviewed_only=True) == 1
+
+
+async def test_count_new_cards_today_ignores_another_users_reviews(session_factory):
+    await _seed_two_users(session_factory)
+    async with session_factory() as session:
+        assert await count_new_cards_today(session, 1, CROSS_NOW, boundary_hour=4) == 0
+
+
+async def test_card_counters_ignore_another_users_cards(session_factory):
+    await _seed_two_users(session_factory)
+    async with session_factory() as session:
+        counters = await card_counters(session, 1, CROSS_NOW)
+
+    assert counters == CardCounters(total=1, introduced=1, due=1, overdue=1, not_introduced=0)
+
+
+async def test_defer_overdue_tail_leaves_another_users_cards_alone(session_factory):
+    await _seed_two_users(session_factory)
+    async with session_factory() as session:
+        postponed = await defer_overdue_tail(session, 1, CROSS_NOW, keep_n=0, postpone_days=7)
+        await session.commit()
+    async with session_factory() as session:
+        dues = {card.id: card.due for card in (await session.scalars(select(Card))).all()}
+
+    assert postponed == 1
+    assert dues["card-1"].replace(tzinfo=UTC) == CROSS_NOW + timedelta(days=7)
+    assert all(
+        due.replace(tzinfo=UTC) == CROSS_NOW - timedelta(days=1)
+        for card_id, due in dues.items()
+        if card_id != "card-1"
+    )
+
+
 # --- build_session_queue -----------------------------------------------------
 
 

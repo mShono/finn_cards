@@ -590,6 +590,28 @@ async def test_add_deck_choice_rejects_a_stale_batch(session_factory):
         assert (await session.scalars(select(Note))).all() == []
 
 
+@pytest.mark.parametrize("owner", [2, None], ids=["another-users-deck", "no-such-deck"])
+async def test_add_deck_choice_rejects_a_deck_that_isnt_the_users(session_factory, owner):
+    deck_id = "no-such-deck"
+    if owner is not None:
+        async with session_factory() as session:
+            deck_id = (await create_deck(session, owner, "Чужая")).id
+            await session.commit()
+    state = make_state()
+    await state.set_state(AddStates.choosing_deck)
+    await state.update_data(batch_id="batch-1", candidates=[WORD_CANDIDATE])
+    callback = make_callback(f"adddeck:batch-1:{deck_id}")
+
+    await add_deck_choice(callback, state, session_factory, make_settings(), make_breaker())
+
+    callback.answer.assert_awaited_once_with("Не нашла колоду.", show_alert=True)
+    callback.message.answer.assert_not_awaited()
+    async with session_factory() as session:
+        assert (await session.scalars(select(Note))).all() == []
+    # The picker stays live - a genuine deck button from it still works.
+    assert await state.get_state() == AddStates.choosing_deck
+
+
 async def test_add_deck_choice_stray_callback_is_rejected_outside_the_state():
     callback = make_callback("adddeck:batch-1:deck-x")
 
