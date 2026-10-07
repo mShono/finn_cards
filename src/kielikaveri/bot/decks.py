@@ -98,7 +98,9 @@ async def _decks_list_text_and_keyboard(
         lines = []
         for deck in decks:
             notes_count = await session.scalar(
-                select(func.count()).select_from(Note).where(Note.deck_id == deck.id)
+                select(func.count())
+                .select_from(Note)
+                .where(Note.deck_id == deck.id, Note.user_id == user_id)
             )
             counters = await card_counters(session, user_id, now, deck_id=deck.id)
             lines.append(f"• {deck.name} - слов: {notes_count}, к повторению: {counters.due}")

@@ -608,8 +608,38 @@ async def test_add_deck_choice_rejects_a_deck_that_isnt_the_users(session_factor
     callback.message.answer.assert_not_awaited()
     async with session_factory() as session:
         assert (await session.scalars(select(Note))).all() == []
-    # The picker stays live - a genuine deck button from it still works.
-    assert await state.get_state() == AddStates.choosing_deck
+    # Claimed before the check (see the double-tap test), not restored.
+    assert await state.get_state() is None
+
+
+async def test_add_deck_choice_concurrent_double_tap_saves_only_once(session_factory, monkeypatch):
+    # Two callback_query updates for one genuine double-tap on a deck button.
+    # The state must be claimed before the handler's first real yield (any DB
+    # read) - otherwise both taps pass the batch check and run the whole
+    # pipeline twice. Proven with asyncio.gather() on real aiosqlite.
+    patch_resolve_note_forms(monkeypatch)
+    async with session_factory() as session:
+        deck = await create_deck(session, 1, "Общая")
+        await session.commit()
+    state = make_state()
+    await state.set_state(AddStates.choosing_deck)
+    await state.update_data(batch_id="batch-1", candidates=[WORD_CANDIDATE])
+    callback_1 = make_callback(f"adddeck:batch-1:{deck.id}")
+    callback_2 = make_callback(f"adddeck:batch-1:{deck.id}")
+
+    await asyncio.gather(
+        add_deck_choice(callback_1, state, session_factory, make_settings(), make_breaker()),
+        add_deck_choice(callback_2, state, session_factory, make_settings(), make_breaker()),
+    )
+
+    async with session_factory() as session:
+        assert len((await session.scalars(select(Note))).all()) == 1
+    winners = [c for c in (callback_1, callback_2) if c.message.answer.call_args_list]
+    assert len(winners) == 1
+    loser = callback_2 if winners[0] is callback_1 else callback_1
+    loser.answer.assert_awaited_once_with(
+        "Эта подборка уже неактуальна - пришли текст ещё раз.", show_alert=True
+    )
 
 
 async def test_add_deck_choice_stray_callback_is_rejected_outside_the_state():
