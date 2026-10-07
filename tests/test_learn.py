@@ -385,7 +385,7 @@ async def test_a_rating_that_lifts_recognition_past_the_threshold_opens_producti
         await session.flush()
         card = make_card("card-A", "note-1", 1, due=now, reps=3)
         card.state = CardState.review
-        card.stability = 10.0
+        card.stability = 2.0  # below the threshold until this rating lifts it
         card.difficulty = 5.0
         session.add(card)
         await session.flush()
