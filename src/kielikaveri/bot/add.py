@@ -216,7 +216,9 @@ async def delete_confirm(
         count = 0
         if deck_id is not None:
             count = await session.scalar(
-                select(func.count()).select_from(Note).where(Note.deck_id == deck_id)
+                select(func.count())
+                .select_from(Note)
+                .where(Note.deck_id == deck_id, Note.user_id == callback.from_user.id)
             )
 
     await callback.answer()
@@ -474,7 +476,23 @@ async def add_deck_choice(
 
     candidates: list[dict] = data.get("candidates", [])
     user_id = callback.from_user.id
+    # Cleared before anything that yields: with MemoryStorage get_data ->
+    # check -> clear is atomic, so a double tap's second update finds no
+    # batch and takes the stale exit above instead of a second full run.
     await state.clear()
+
+    # batch_id above only proves the picker is this chat's current one - the
+    # deck id is whatever the callback_data says, and a forged one would land
+    # this user's words in someone else's deck (or a nonexistent one). Same
+    # ownership check as decks_open/noteedit/delnote. The batch is gone by
+    # now; only forged callback_data gets here, so no restoring it.
+    async with session_factory() as session:
+        deck = await session.get(Deck, deck_id)
+    if deck is None or deck.user_id != user_id:
+        logger.debug("event=add.deck_not_found deck_id=%s", deck_id)
+        await callback.answer("Не нашла колоду.", show_alert=True)
+        return
+
     await callback.answer()
 
     # Saving + card generation takes seconds - acknowledge the tap first so
@@ -693,7 +711,9 @@ async def _save_candidates_and_report(
     if saved:
         async with session_factory() as session:
             count = await session.scalar(
-                select(func.count()).select_from(Note).where(Note.deck_id == deck_id)
+                select(func.count())
+                .select_from(Note)
+                .where(Note.deck_id == deck_id, Note.user_id == user_id)
             )
         lines.append(f"\nКолода «{deck_name}»: теперь {count} слов.")
     if duplicate_lemmas:

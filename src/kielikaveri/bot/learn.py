@@ -586,6 +586,10 @@ async def learn_reveal(
     logger.debug("event=learn.reveal card_id=%s", card_id)
     async with session_factory() as session:
         card = await session.get(Card, card_id)
+        # Another user's card id (forged callback_data) reads as missing -
+        # never render its back side.
+        if card is not None and card.user_id != callback.from_user.id:
+            card = None
         if card is not None:
             note = await session.get(Note, card.note_id)
             _front, back = render_card(card, note)
@@ -678,6 +682,10 @@ async def learn_listen(
     card_id = callback.data.split(":", 2)[2]
     async with session_factory() as session:
         card = await session.get(Card, card_id)
+        # Another user's card reads as missing, as in learn_reveal - no TTS
+        # of their example on our OpenAI bill.
+        if card is not None and card.user_id != callback.from_user.id:
+            card = None
         note = await session.get(Note, card.note_id) if card is not None else None
 
     if card is None:
