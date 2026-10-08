@@ -11,6 +11,7 @@ this must keep working when OpenAI is unreachable (see plan 3.10).
 from __future__ import annotations
 
 import logging
+import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -48,6 +49,7 @@ router = Router(name="learn")
 DECK_ALL_TOKEN = "all"
 DELETED_CARD_TEXT = "Это слово удалено."
 SIDE_PROMPT = "Что показывать на карточке?"
+STARTING_TEXT = "Повторение уже запускается - секунду."
 
 
 class LearnSide(StrEnum):
@@ -83,6 +85,9 @@ class LearnStates(StatesGroup):
     side_choice = State()
     # Between a side or debt tap and the session (or debt prompt) it leads
     # to - the mark those handlers claim so a second tap starts nothing.
+    # Data: start_token - which attempt holds the claim, see _claim_start.
+    # The token stays in the data of the state the attempt moves on to,
+    # see _clear_on_error.
     starting = State()
     debt_choice = State()
     reviewing = State()
@@ -176,6 +181,7 @@ async def _start_session(
     now: datetime,
     deck_id: str | None,
     side: LearnSide,
+    token: str,
 ) -> None:
     async with session_factory() as session:
         queue = await build_session_queue(
@@ -195,19 +201,22 @@ async def _start_session(
         )
 
     if not queue:
+        if not await _leave_starting(state, token, None):
+            return
         logger.info("event=learn.session_empty deck_id=%s side=%s", deck_id, side)
-        await state.clear()
         await answer_to.answer(_empty_session_text(side, no_production))
         return
 
+    session_data = {
+        "queue": queue,
+        "session_started_at": now.isoformat(),
+        "reviewed_count": 0,
+        "session_max_minutes": settings.session_max_minutes,
+        "side": side,
+    }
+    if not await _leave_starting(state, token, LearnStates.reviewing, session_data):
+        return
     logger.info("event=learn.session_start deck_id=%s side=%s queue=%d", deck_id, side, len(queue))
-    await state.set_state(LearnStates.reviewing)
-    await state.update_data(
-        queue=queue,
-        session_started_at=now.isoformat(),
-        reviewed_count=0,
-        session_max_minutes=settings.session_max_minutes,
-    )
     await _show_next_card(answer_to, state, session_factory)
 
 
@@ -281,11 +290,13 @@ async def _show_next_card(
         )
         await state.clear()
         text = f"Сессия окончена: {reviewed_count} карточек пройдено"
-        text += (
-            f", осталось {remaining} - /learn чтобы продолжить."
-            if remaining
-            else " - всё на сегодня!"
-        )
+        if remaining:
+            text += f", осталось {remaining} - /learn чтобы продолжить."
+        elif data.get("side", LearnSide.mix) == LearnSide.mix:
+            text += " - всё на сегодня!"
+        else:
+            # Only this side is done - see _empty_session_text.
+            text += " - на этой стороне всё на сегодня!"
         await answer_to.answer(text)
         return
 
@@ -306,18 +317,64 @@ async def _claim_state(state: FSMContext, expected: State, claimed: State) -> bo
     return True
 
 
+async def _claim_start(state: FSMContext, expected: State) -> str | None:
+    """Move from `expected` to `starting`; the token of this start attempt,
+    or None if another update already left `expected`."""
+    if not await _claim_state(state, expected, LearnStates.starting):
+        return None
+    token = secrets.token_hex(8)
+    await state.update_data(start_token=token)
+    return token
+
+
+async def _set_by(state: FSMContext, token: str) -> bool:
+    """Whether the current state was set by the start attempt `token`."""
+    return (await state.get_data()).get("start_token") == token
+
+
+async def _holds_start(state: FSMContext, token: str) -> bool:
+    return await state.get_state() == LearnStates.starting.state and await _set_by(state, token)
+
+
+async def _leave_starting(
+    state: FSMContext, token: str, new_state: State | None, data: dict | None = None
+) -> bool:
+    """Move the start attempt `token` on to `new_state` (None - clear).
+
+    False, changing nothing, if the attempt no longer holds `starting`:
+    while it synced cards, /add or /start may have ended it, or /learn and
+    a new tap may have begun another. Showing its session then would bring
+    back one the user stopped, or run two at once. Checked and set with
+    nothing yielding in between - the same reasoning as _claim_state.
+    """
+    if not await _holds_start(state, token):
+        logger.info("event=learn.start_superseded")
+        return False
+    if new_state is None:
+        await state.clear()
+    else:
+        await state.set_state(new_state)
+        await state.set_data({**(data or {}), "start_token": token})
+    return True
+
+
 @asynccontextmanager
-async def _clear_on_error(state: FSMContext) -> AsyncIterator[None]:
+async def _clear_on_error(state: FSMContext, token: str) -> AsyncIterator[None]:
     """Drop the claimed state if starting the session fails.
 
     Left in `starting`, every learn button would be answered silently and
     any text would get the mid-session hint, with no session to go with
-    it. Cleared, a stale button says to start over via /learn.
+    it. Cleared, a stale button says to start over via /learn. The same
+    goes for the state the attempt moved on to: a session whose first card
+    failed to show, or a debt choice whose prompt never arrived, has nothing
+    on screen to go on with. Only a state this attempt set - a newer one is
+    not this failure's to wipe.
     """
     try:
         yield
     except Exception:
-        await state.clear()
+        if await _set_by(state, token):
+            await state.clear()
         raise
 
 
@@ -336,6 +393,7 @@ async def _proceed_past_side_choice(
     now: datetime,
     deck_id: str | None,
     side: LearnSide,
+    token: str,
 ) -> None:
     async with session_factory() as session:
         await sync_user_card_types(session, user_id, now)
@@ -363,6 +421,9 @@ async def _proceed_past_side_choice(
         )
 
     if overdue > settings.debt_threshold:
+        debt_data = {"debt_now": now.isoformat(), "deck_id": deck_id, "side": side}
+        if not await _leave_starting(state, token, LearnStates.debt_choice, debt_data):
+            return
         logger.info(
             "event=learn.debt_prompt deck_id=%s side=%s overdue=%d threshold=%d",
             deck_id,
@@ -370,8 +431,6 @@ async def _proceed_past_side_choice(
             overdue,
             settings.debt_threshold,
         )
-        await state.set_state(LearnStates.debt_choice)
-        await state.update_data(debt_now=now.isoformat(), deck_id=deck_id, side=side)
         await answer_to.answer(
             f"Просрочено {overdue} карточек - это много за одну сессию.\n"
             f"Разгребать как обычно (по {settings.session_max_cards} за раз) "
@@ -380,7 +439,9 @@ async def _proceed_past_side_choice(
         )
         return
 
-    await _start_session(answer_to, state, session_factory, settings, user_id, now, deck_id, side)
+    await _start_session(
+        answer_to, state, session_factory, settings, user_id, now, deck_id, side, token
+    )
 
 
 @router.message(Command("learn"))
@@ -391,6 +452,11 @@ async def learn_start(
     session_factory: async_sessionmaker[AsyncSession],
     settings: Settings,
 ) -> None:
+    if await state.get_state() == LearnStates.starting.state:
+        # A side was just tapped and its session is being built - asking
+        # the side again would only race it.
+        await message.answer(STARTING_TEXT)
+        return
     async with session_factory() as session:
         decks = await list_decks(session, message.from_user.id)
 
@@ -440,13 +506,14 @@ async def learn_side_choice(
     # the filters, which yield, so both taps pass it. Hence the re-check
     # here; with MemoryStorage neither call yields, so check-and-claim is
     # atomic.
-    if not await _claim_state(state, LearnStates.side_choice, LearnStates.starting):
+    token = await _claim_start(state, LearnStates.side_choice)
+    if token is None:
         await learn_tap_while_starting(callback)
         return
     deck_id = (await state.get_data()).get("deck_id")
 
     logger.debug("event=learn.side_choice deck_id=%s side=%s", deck_id, side)
-    async with _clear_on_error(state):
+    async with _clear_on_error(state, token):
         await callback.answer()
         await _proceed_past_side_choice(
             callback.message,
@@ -457,6 +524,7 @@ async def learn_side_choice(
             datetime.now(UTC),
             deck_id,
             side,
+            token,
         )
 
 
@@ -469,17 +537,21 @@ async def learn_debt_choice(
 ) -> None:
     # Two taps - say "Отложить" and "как обычно" - would otherwise defer
     # the tail and start two sessions; see learn_side_choice.
-    if not await _claim_state(state, LearnStates.debt_choice, LearnStates.starting):
+    token = await _claim_start(state, LearnStates.debt_choice)
+    if token is None:
         await learn_tap_while_starting(callback)
         return
     action = callback.data.split(":")[2]
     user_id = callback.from_user.id
-    data = await state.get_data()
-    now = datetime.fromisoformat(data["debt_now"])
-    deck_id = data.get("deck_id")
-    side = LearnSide(data["side"])
 
-    async with _clear_on_error(state):
+    async with _clear_on_error(state, token):
+        # Answered before the database work, so a failing defer doesn't
+        # leave the button spinning.
+        await callback.answer()
+        data = await state.get_data()
+        now = datetime.fromisoformat(data["debt_now"])
+        deck_id = data.get("deck_id")
+        side = LearnSide(data["side"])
         if action == "defer":
             async with session_factory() as session:
                 postponed = await defer_overdue_tail(
@@ -499,9 +571,8 @@ async def learn_debt_choice(
         else:
             logger.debug("event=learn.debt_choice action=%s", action)
 
-        await callback.answer()
         await _start_session(
-            callback.message, state, session_factory, settings, user_id, now, deck_id, side
+            callback.message, state, session_factory, settings, user_id, now, deck_id, side, token
         )
 
 
