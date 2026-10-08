@@ -218,7 +218,7 @@ async def test_defer_overdue_tail_leaves_another_users_cards_alone(session_facto
         for card_id, due in dues.items()
         if card_id != "card-1"
     )
-    
+
 
 async def test_count_new_cards_today_window_includes_its_start_and_excludes_its_end(
     session_factory,
@@ -244,7 +244,6 @@ async def test_count_new_cards_today_window_includes_its_start_and_excludes_its_
         count = await count_new_cards_today(session, 1, now, boundary_hour=4)
 
     assert count == 2
-
 
 
 # --- build_session_queue -----------------------------------------------------
