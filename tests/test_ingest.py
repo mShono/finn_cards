@@ -12,10 +12,12 @@ from kielikaveri.db.models import Note, NoteKind
 from kielikaveri.ingest import (
     ResolvedLemma,
     TokenUsage,
+    _capitalized_mid_sentence,
     _chat_schema,
     _load_note_schema,
     _log_llm_request,
     _log_llm_response,
+    _of_pos,
     build_full_note,
     canonical_key,
     check_and_suggest,
@@ -166,16 +168,34 @@ def test_canonical_key_keeps_a_proper_noun_capitalised():
     assert canonical_key("Helsingissä", "substantiivi") == ("Helsinki", "substantiivi")
 
 
-def test_canonical_key_is_not_case_insensitive_for_an_ambiguous_lemma():
-    # Pins a known pre-existing gap, not a contract worth keeping: when the FST
-    # offers several lemmas, `if lemma in lemmas` can only match a lowercase
-    # input, so a capitalised one falls through to lemmas[0] - a *different*
-    # word. This is the mechanism behind the duplicate `seurojentalo` pair
-    # found in production 11.09.2026. The unique index deliberately does not
-    # paper over it: it compares what canonical_key() produced, so fixing the
-    # case asymmetry means fixing it here, in the one canonicalisation.
+def test_canonical_key_is_case_insensitive_for_an_ambiguous_lemma():
+    # The FST offers several lemmas for both spellings (seuratalo,
+    # seurojentalo, and Seura for the capitalized one). The capitalized one
+    # used to fall through to lemmas[0] - seuratalo, a *different* word: the
+    # duplicate `seurojentalo` pair found in production 11.09.2026. Fixed
+    # here, in the one canonicalisation the unique index relies on.
     assert canonical_key("seurojentalo", "substantiivi") == ("seurojentalo", "substantiivi")
-    assert canonical_key("Seurojentalo", "substantiivi") == ("seuratalo", "substantiivi")
+    assert canonical_key("Seurojentalo", "substantiivi") == ("seurojentalo", "substantiivi")
+
+
+def test_canonical_key_takes_a_typed_capital_as_meant():
+    # Context-free (/edit, where the student types the lemma): the FST knows
+    # both kesä and Kesä (a proper noun), and a capital the student typed is
+    # deliberate. /add settles this from the sentence instead - see the
+    # resolve_note_lemma tests - and either lemma it chooses is stable here.
+    assert canonical_key("Kesä", "substantiivi") == ("Kesä", "substantiivi")
+    assert canonical_key("kesä", "substantiivi") == ("kesä", "substantiivi")
+
+
+def test_canonical_key_lemmatizes_an_inflected_form_by_its_pos():
+    # "tulin" is a form of both tulla (verb) and tuli (noun) - the FST lists
+    # tulla first, which is only right for a verb.
+    assert canonical_key("tulin", "substantiivi") == ("tuli", "substantiivi")
+    assert canonical_key("tulin", "verbi") == ("tulla", "verbi")
+
+
+def test_canonical_key_leaves_a_word_the_fst_does_not_know_unchanged():
+    assert canonical_key("Xyzquu", "substantiivi") == ("Xyzquu", "substantiivi")
 
 
 # --- strict schema wrapper -------------------------------------------------------
@@ -589,6 +609,282 @@ async def test_resolve_note_lemma_still_lemmatizes_an_inflected_llm_lemma():
     )
 
     assert resolved == ResolvedLemma("työ", in_dictionary=True)
+
+
+async def test_resolve_note_lemma_matches_a_capitalized_llm_lemma_case_insensitively():
+    # A sentence-initial word the LLM copied with its capital: the FST's own
+    # (lowercase) spelling of that very lemma, not the first lemma on its list.
+    client = MagicMock()
+    client.responses.create = AsyncMock()
+
+    resolved, _usage = await resolve_note_lemma(
+        client,
+        make_breaker(),
+        "gpt-5.6-terra",
+        "Seurojentalo",
+        "substantiivi",
+        "Seurojentalo",
+        "Seurojentalo on kylän keskellä.",
+        NOW,
+    )
+
+    assert resolved == ResolvedLemma("seurojentalo", in_dictionary=True)
+    client.responses.create.assert_not_called()
+
+
+async def test_resolve_note_lemma_asks_about_a_sentence_initial_capital():
+    # "Kesä" is both the common noun and a proper noun to the FST, and a
+    # capital at the start of a sentence says nothing - the LLM picks, from
+    # exactly those two. Taking the proper noun silently here would key the
+    # card apart from an existing "kesä" (the seurojentalo duplicate again).
+    client = MagicMock()
+    client.responses.create = AsyncMock(return_value=fake_response({"lemma": "kesä"}))
+
+    resolved, usage = await resolve_note_lemma(
+        client,
+        make_breaker(),
+        "gpt-5.6-terra",
+        "Kesä",
+        "substantiivi",
+        "Kesä",
+        "Kesä on lyhyt.",
+        NOW,
+    )
+
+    schema = client.responses.create.call_args.kwargs["text"]["format"]["schema"]
+    assert schema["properties"]["lemma"]["enum"] == ["Kesä", "kesä"]
+    assert resolved == ResolvedLemma("kesä", in_dictionary=True)
+    assert usage is not None
+
+
+async def test_resolve_note_lemma_takes_the_common_word_for_a_lowercase_surface():
+    # The LLM capitalized the lemma, the text didn't: the FST gives no proper
+    # noun reading for "kesällä", so that settles it without a call.
+    client = MagicMock()
+    client.responses.create = AsyncMock()
+
+    resolved, _usage = await resolve_note_lemma(
+        client,
+        make_breaker(),
+        "gpt-5.6-terra",
+        "Kesä",
+        "substantiivi",
+        "kesällä",
+        "Satoi paljon kesällä.",
+        NOW,
+    )
+
+    assert resolved == ResolvedLemma("kesä", in_dictionary=True)
+    client.responses.create.assert_not_called()
+
+
+async def test_resolve_note_lemma_takes_the_proper_noun_for_a_mid_sentence_capital():
+    client = MagicMock()
+    client.responses.create = AsyncMock()
+
+    resolved, _usage = await resolve_note_lemma(
+        client,
+        make_breaker(),
+        "gpt-5.6-terra",
+        "Lahti",
+        "substantiivi",
+        "Lahdessa",
+        "Asun Lahdessa.",
+        NOW,
+    )
+
+    assert resolved == ResolvedLemma("Lahti", in_dictionary=True)
+    client.responses.create.assert_not_called()
+
+
+async def test_resolve_note_lemma_does_not_take_the_fsts_first_lemma_of_an_inflected_llm_lemma():
+    # "tulin" is a form of tulla (verb, listed first) and tuli (noun); the
+    # LLM's pos says which reading this is.
+    client = MagicMock()
+    client.responses.create = AsyncMock()
+
+    resolved, _usage = await resolve_note_lemma(
+        client, make_breaker(), "gpt-5.6-terra", "tulin", "substantiivi", None, None, NOW
+    )
+
+    assert resolved == ResolvedLemma("tuli", in_dictionary=True)
+    client.responses.create.assert_not_called()
+
+
+async def test_resolve_note_lemma_asks_about_an_inflected_llm_lemma_from_the_surface():
+    # "tulet" is a form of tulla, tuli and tule. pos rules out the verb; the
+    # two nouns are left to the sentence - the LLM only picks among them.
+    client = MagicMock()
+    client.responses.create = AsyncMock(return_value=fake_response({"lemma": "tuli"}))
+
+    resolved, _usage = await resolve_note_lemma(
+        client,
+        make_breaker(),
+        "gpt-5.6-terra",
+        "tulet",
+        "substantiivi",
+        "tulet",
+        "Kaikki tulet sammuivat.",
+        NOW,
+    )
+
+    schema = client.responses.create.call_args.kwargs["text"]["format"]["schema"]
+    assert schema["properties"]["lemma"]["enum"] == ["tule", "tuli"]
+    assert resolved == ResolvedLemma("tuli", in_dictionary=True)
+
+
+async def test_resolve_note_lemma_does_not_keep_another_words_lemma_for_a_verb_form():
+    # "tuli" is a lemma (the noun "fire") and a form of tulla. The sentence
+    # and the LLM's pos say the verb - the FST's verb lemma, not the noun
+    # with a "he came home" example (resolve_note_pos would then have
+    # flipped the pos to match the wrong lemma).
+    client = MagicMock()
+    client.responses.create = AsyncMock()
+
+    for lemma, surface, context, expected in [
+        ("tuli", "tuli", "Hän tuli kotiin.", "tulla"),
+        ("koski", "koski", "Hän koski seinää.", "koskea"),
+        ("tuuli", "tuuli", "Eilen tuuli kovaa.", "tuulla"),
+    ]:
+        resolved, _usage = await resolve_note_lemma(
+            client, make_breaker(), "gpt-5.6-terra", lemma, "verbi", surface, context, NOW
+        )
+        assert resolved == ResolvedLemma(expected, in_dictionary=True), lemma
+
+    client.responses.create.assert_not_called()
+
+
+async def test_resolve_note_lemma_finds_the_verb_when_no_case_match_is_one():
+    # "Usko" matches usko and Usko up to case - both nouns. Neither may end
+    # up as the answer (or as the whole enum) for a verb: uskoa is the FST's
+    # verb lemma of the text's word.
+    client = MagicMock()
+    client.responses.create = AsyncMock()
+
+    resolved, _usage = await resolve_note_lemma(
+        client, make_breaker(), "gpt-5.6-terra", "Usko", "verbi", "Usko", "Usko minua!", NOW
+    )
+
+    assert resolved == ResolvedLemma("uskoa", in_dictionary=True)
+    client.responses.create.assert_not_called()
+
+
+async def test_resolve_note_lemma_keeps_a_real_lemma_when_only_the_pos_is_wrong():
+    # No reading of "tuli" is an adjective - the pos is the mistake, and
+    # resolve_note_pos() corrects it later; the lemma stays.
+    client = MagicMock()
+    client.responses.create = AsyncMock()
+
+    resolved, _usage = await resolve_note_lemma(
+        client, make_breaker(), "gpt-5.6-terra", "tuli", "adjektiivi", None, None, NOW
+    )
+
+    assert resolved == ResolvedLemma("tuli", in_dictionary=True)
+    client.responses.create.assert_not_called()
+
+
+async def test_resolve_note_lemma_follows_a_mid_sentence_capital_over_a_lowercase_lemma():
+    client = MagicMock()
+    client.responses.create = AsyncMock()
+
+    resolved, _usage = await resolve_note_lemma(
+        client,
+        make_breaker(),
+        "gpt-5.6-terra",
+        "lahti",
+        "substantiivi",
+        "Lahdessa",
+        "Asun Lahdessa.",
+        NOW,
+    )
+
+    assert resolved == ResolvedLemma("Lahti", in_dictionary=True)
+    client.responses.create.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("lemma", "surface", "context", "expected"),
+    [
+        ("Helsinki", "Helsingissä", "Asun Helsingissä.", "Helsinki"),
+        ("Turku", "Turussa", "Asun Turussa.", "Turku"),
+        ("Pori", "Porissa", "Asun Porissa.", "Pori"),
+    ],
+)
+async def test_resolve_note_lemma_keeps_a_proper_noun_lemma_for_a_mid_sentence_capital(
+    lemma, surface, context, expected
+):
+    # The surface's other capitalized lemmas are junk splits (Helsing, Turu,
+    # Turunen, Po, Porissa) - the LLM's own lemma, already confirmed by the
+    # FST, is the answer without a call.
+    client = MagicMock()
+    client.responses.create = AsyncMock()
+
+    resolved, _usage = await resolve_note_lemma(
+        client, make_breaker(), "gpt-5.6-terra", lemma, "substantiivi", surface, context, NOW
+    )
+
+    assert resolved == ResolvedLemma(expected, in_dictionary=True)
+    client.responses.create.assert_not_called()
+
+
+def test_of_pos_admits_a_lemma_without_a_known_pos_only_as_a_last_resort(monkeypatch):
+    pos_sets = {"talo": {"substantiivi"}, "Seura": set(), "juosta": {"verbi"}}
+    monkeypatch.setattr("kielikaveri.ingest.pos_set_for_lemma", pos_sets.__getitem__)
+
+    assert _of_pos(["Seura", "talo", "juosta"], "substantiivi") == ["talo"]
+    assert _of_pos(["Seura", "juosta"], "substantiivi") == ["Seura"]
+    assert _of_pos(["juosta"], "substantiivi") == []
+
+
+async def test_resolve_note_lemma_asks_when_a_capital_may_start_a_line():
+    # Not a sentence start by punctuation, but not evidence of a proper noun
+    # either - asked, not silently taken as the proper noun.
+    client = MagicMock()
+    client.responses.create = AsyncMock(return_value=fake_response({"lemma": "kesä"}))
+
+    resolved, _usage = await resolve_note_lemma(
+        client,
+        make_breaker(),
+        "gpt-5.6-terra",
+        "Kesä",
+        "substantiivi",
+        "Kesä",
+        "Vuodenajat\n- Kesä\n- Talvi",
+        NOW,
+    )
+
+    schema = client.responses.create.call_args.kwargs["text"]["format"]["schema"]
+    assert schema["properties"]["lemma"]["enum"] == ["Kesä", "kesä"]
+    assert resolved == ResolvedLemma("kesä", in_dictionary=True)
+
+
+@pytest.mark.parametrize(
+    ("surface", "context", "expected"),
+    [
+        ("Lahdessa", "Asun Lahdessa.", True),
+        ("Kesä", "Kesä on lyhyt.", False),
+        ("Kesä", "Satoi. Kesä on lyhyt.", False),
+        ("Kesä", '"Kesä on lyhyt", hän sanoi.', False),
+        ("Kesä", "Hän sanoi: Kesä on lyhyt.", False),
+        ("Turku", "Turku on kaunis, ja Turku on vanha.", True),
+        ("Kesä", "Kesäkuu on lyhyt.", False),
+        ("kesä", "Pitkä kesä.", False),
+        ("Kesä", None, False),
+        ("Turku", "Asun Espoossa, Turku on kaukana.", True),
+        ("Turku", "Vuonna 1827 Turku paloi.", True),
+        # Anything that may start a sentence, a heading or a list item is
+        # "don't know", not "proper noun":
+        ("Kesä", 'Hän sanoi "Kesä on kiva".', False),
+        ("Kesä", "Kesä tuli\nKesä meni.", False),
+        ("Kesä", "Vuodenajat\n- Kesä\n- Talvi", False),
+        ("Kesä", "🌞 Kesä on täällä!", False),
+        ("Kesä", "1) Kesä on lyhyt.", False),
+        ("Kesä", "Suomen Kesä ja Talvi", False),
+        ("Lahdessa", "Asun Lahdessa", False),
+    ],
+)
+def test_capitalized_mid_sentence(surface, context, expected):
+    assert _capitalized_mid_sentence(surface, context) is expected
 
 
 async def test_resolve_note_lemma_flags_a_word_the_fst_does_not_know_at_all():

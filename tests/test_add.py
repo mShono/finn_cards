@@ -1043,25 +1043,27 @@ async def test_add_save_logs_event_with_saved_and_duplicate_counts(
 # --- pos correction end to end -----------------------------------------------------
 
 
+TULI_NOUN_CANDIDATE = {
+    "lemma": "tuli",
+    "pos": "adjektiivi",
+    "translation_ru": "огонь",
+    "example_fi": "Tuli palaa takassa.",
+    "example_ru": "Огонь горит в камине.",
+    "kind": "word",
+    "meta": {"topics": ["koti"]},
+}
+
+
 async def test_chat_saves_tuli_as_a_noun_with_real_grammar_forms(session_factory, monkeypatch):
     """Regression, end to end with the real FST: only the OpenAI call is faked.
 
-    The LLM reads "hän tuli kotiin" and answers lemma="tuli", pos="verbi" -
-    right about the sentence, wrong about the lemma, because that verb form
-    belongs to "tulla". generate_forms("tuli", "verbi") used to return
-    nothing at all, so the note landed with empty principal_forms and
-    forms_verified=False and srs.graduation never gave it a grammar card.
+    The LLM gets the lemma right but the part of speech wrong. No reading of
+    "tuli" is an adjective, so the lemma stays and the FST corrects the pos.
+    generate_forms() with the wrong pos used to return nothing at all, so the
+    note landed with empty principal_forms and forms_verified=False and
+    srs.graduation never gave it a grammar card.
     """
-    candidate = {
-        "lemma": "tuli",
-        "pos": "verbi",
-        "translation_ru": "огонь",
-        "example_fi": "Hän tuli kotiin.",
-        "example_ru": "Он пришёл домой.",
-        "kind": "word",
-        "meta": {"topics": ["koti"]},
-    }
-    patch_check_and_suggest(monkeypatch, "Добавляю.", [candidate])
+    patch_check_and_suggest(monkeypatch, "Добавляю.", [TULI_NOUN_CANDIDATE])
     state = make_state()
 
     await chat_message(
@@ -1078,28 +1080,46 @@ async def test_chat_saves_tuli_as_a_noun_with_real_grammar_forms(session_factory
         note = (await session.scalars(select(Note))).one()
 
     assert note.lemma == "tuli"
-    assert note.pos == "substantiivi"  # not the LLM's "verbi"
+    assert note.pos == "substantiivi"  # not the LLM's "adjektiivi"
     assert note.meta["forms_verified"] is True
     assert note.meta["forms_source"] == "fst"
     assert note.meta["principal_forms"]["partitiivi"] == "tulta"
 
 
+async def test_chat_saves_the_verb_form_tuli_under_tulla(session_factory, monkeypatch):
+    """ "Hän tuli kotiin." with lemma="tuli", pos="verbi": right about the
+    sentence, wrong about the lemma - that verb form belongs to tulla. It
+    used to be saved as the noun "tuli" with this verb example.
+    """
+    candidate = {
+        **TULI_NOUN_CANDIDATE,
+        "pos": "verbi",
+        "translation_ru": "прийти",
+        "example_fi": "Hän tuli kotiin.",
+        "example_ru": "Он пришёл домой.",
+        "surface_fi": "tuli",
+    }
+    patch_check_and_suggest(monkeypatch, "Добавляю.", [candidate])
+    # tulla's forms need an LLM pick among FST candidates - not what's tested.
+    forms = patch_resolve_note_forms(monkeypatch)
+
+    await _add_via_chat(session_factory)
+
+    async with session_factory() as session:
+        note = (await session.scalars(select(Note))).one()
+    assert note.lemma == "tulla"
+    assert note.pos == "verbi"
+    assert forms.call_args.args[3] == "tulla"
+
+
 async def test_chat_dedups_against_the_corrected_pos(session_factory, monkeypatch):
     """The dedup key is computed from the LLM's pos, before the FST sees it.
 
-    Two turns that both say pos="verbi" for "tuli" both get corrected to
+    Two turns that both say pos="adjektiivi" for "tuli" both get corrected to
     "substantiivi", so the second one is a duplicate of the first even
     though neither key matched what was already stored.
     """
-    candidate = {
-        "lemma": "tuli",
-        "pos": "verbi",
-        "translation_ru": "огонь",
-        "example_fi": "Hän tuli kotiin.",
-        "example_ru": "Он пришёл домой.",
-        "kind": "word",
-        "meta": {},
-    }
+    candidate = TULI_NOUN_CANDIDATE
 
     async def add_once() -> SimpleNamespace:
         state = make_state()

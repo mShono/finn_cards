@@ -23,9 +23,10 @@ first only fire for a genuine ambiguity the FST can't settle alone:
    noun), only the sentence can decide, so the LLM picks again from an enum
    of exactly the FST's set. See resolve_note_pos().
 4. choose_lemma() - the same pattern for the lemma: when the LLM's lemma
-   is unknown to the FST, the FST lemmatizes the word as the text spells it
-   instead, and the LLM only picks among those lemmas. See
-   resolve_note_lemma().
+   is not itself an FST lemma, the FST lemmatizes the word as the text
+   spells it instead; when the text still leaves several (or the lemma is
+   both a common word and a proper noun, "Kesä"), the LLM only picks among
+   those FST lemmas. See resolve_note_lemma().
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -724,40 +726,76 @@ async def resolve_note_lemma(
     """The lemma a candidate is saved under - the FST's, whenever it has one.
 
     The LLM sometimes makes a lemma up ("riensiä" for the text's "riensi",
-    whose real lemma is "rientää"). The FST can't analyze a made-up string,
-    but it can analyze the word as the text spells it (`surface`, see
-    _chat_schema()), so:
+    whose real lemma is "rientää"), answers with an inflected form, or with
+    the lemma of another word spelled like the text's form ("tuli" the noun
+    for "Hän tuli kotiin.", whose verb is tulla). The FST can't analyze a
+    made-up string, but it can analyze the word as the text spells it
+    (`surface`, see _chat_schema()). The options are always FST lemmas:
 
-    * the FST knows `lemma` - canonical_key() rules, nothing new;
-    * it doesn't, and lemmatize(surface) gives one lemma - take it;
-    * several - keep the ones whose part of speech matches the LLM's `pos`
-      (it describes the same reading in the same sentence); one left - take
-      it, otherwise the LLM picks from an enum of them (choose_lemma());
-    * nothing, or no `surface` (candidates cached before the field existed) -
-      keep `lemma` as is, but flagged: it may be a real word the FST lacks
-      (slang, a loan, a rare word), so it can't simply be rejected.
+    * `lemma` itself, up to case and in the FST's spelling ("Seurojentalo"
+      -> seurojentalo) - if it is a lemma of `surface` too and of the LLM's
+      `pos` (it describes the same reading in the same sentence). Usually
+      one; a capitalized word can also be a proper noun, though ("Kesä" ->
+      kesä, Kesä - a lowercase surface gets no proper noun reading, so
+      "kesällä" leaves just kesä);
+    * otherwise lemmatize(surface) - or lemmatize(lemma), with no `surface`
+      (candidates cached before the field existed) or one the FST can't
+      analyze - narrowed to `pos`. "tuli" + verbi gives tulla, "Usko" +
+      verbi gives uskoa, never the FST's first lemma or a wrong-pos one;
+    * no reading of `pos` at all - the pos is what's wrong: `lemma` if the
+      FST has it (resolve_note_pos() fixes the pos), else all of them;
+    * `surface` capitalized mid-sentence (_capitalized_mid_sentence) - its
+      proper noun lemmas of `pos`, if any: Finnish capitalizes nothing else
+      there. A sentence-initial capital says nothing: "Kesä on lyhyt." is
+      summer, "Turku on kaunis." is the city;
+    * one left - take it, otherwise the LLM picks from an enum of them
+      (choose_lemma()).
+
+    No options at all - keep `lemma` as is, but flagged: it may be a real
+    word the FST lacks (slang, a loan, a rare word), so it can't simply be
+    rejected.
     """
     if pos is None:
         # kind="pattern" - a construction, not a lemma (see canonical_key).
         return ResolvedLemma(lemma, in_dictionary=True), None
 
-    known = _dictionary_lemma(lemma)
-    if known is not None:
-        return ResolvedLemma(known, in_dictionary=True), None
-
-    options = lemmatize(surface) if surface else []
-    if not options:
+    lemma_options = lemmatize(lemma)
+    surface_options = lemmatize(surface) if surface else []
+    if not lemma_options and not surface_options:
         logger.info("event=resolve_note_lemma.unknown lemma=%s surface=%s", lemma, surface)
         return ResolvedLemma(lemma, in_dictionary=False), None
 
+    case_matches = _case_matches(lemma, lemma_options)
+    if surface_options:
+        case_matches = [option for option in case_matches if option in surface_options]
+    options = _of_pos(case_matches, pos)
+    if not options:
+        # `lemma` is not a lemma of this reading: made up, inflected, or the
+        # lemma of another word that shares the spelling ("tuli" the noun for
+        # the verb form "tuli" of tulla). The text's word decides.
+        candidates = surface_options or lemma_options
+        options = _of_pos(candidates, pos)
+        # No reading of that part of speech at all - the LLM's pos is what's
+        # wrong, not its lemma (resolve_note_pos() corrects it later). Keep
+        # its lemma if the FST has one, otherwise every candidate - never a
+        # wrong-pos subset that leaves the right lemma out of the enum.
+        options = options or case_matches or candidates
+
     usage = None
-    if len(options) > 1:
-        options = [option for option in options if pos in pos_set_for_lemma(option)] or options
+    if _capitalized_mid_sentence(surface, context):
+        # The capitalized options already found first ("Helsinki" for
+        # "Asun Helsingissä." stays the answer, not one of the surface's
+        # junk splits like Helsing); the surface's only for a lowercase LLM
+        # lemma ("lahti" -> Lahti).
+        proper = [o for o in options if o[:1].isupper()] or _of_pos(
+            [o for o in surface_options if o[:1].isupper()], pos
+        )
+        options = proper or options
     if len(options) == 1:
         chosen = options[0]
     else:
         chosen, usage = await choose_lemma(
-            client, breaker, model, surface, sorted(options), context, now
+            client, breaker, model, surface or lemma, sorted(options), context, now
         )
         if chosen not in options:
             # The strict enum should make this unreachable - keep the LLM's
@@ -770,25 +808,105 @@ async def resolve_note_lemma(
             )
             return ResolvedLemma(lemma, in_dictionary=False), usage
 
-    logger.info(
-        "event=resolve_note_lemma.corrected llm_lemma=%s surface=%s lemma=%s",
-        lemma,
-        surface,
-        chosen,
-    )
+    if chosen != lemma:
+        logger.info(
+            "event=resolve_note_lemma.corrected llm_lemma=%s surface=%s lemma=%s",
+            lemma,
+            surface,
+            chosen,
+        )
     return ResolvedLemma(chosen, in_dictionary=True), usage
 
 
-def _dictionary_lemma(word: str) -> str | None:
-    """`word` itself if the FST knows it as a lemma, else the first lemma it inflects, else None."""
+# What may stand right before a capital for it to count as mid-sentence
+# (besides a letter or a digit): anything else - a newline, a quote, a
+# bracket, a dash, a list marker, an emoji, ":" before direct speech - may
+# just as well start a sentence, a heading or a list item.
+_MID_SENTENCE_BEFORE = ",;"
+_SENTENCE_END = ".!?…"
+
+
+def _of_pos(lemmas: list[str], pos: str) -> list[str]:
+    """The lemmas the FST allows `pos` for - or, only if there are none, those
+    it names no part of speech for at all (it can't say, so can't rule out).
+    """
+    allowed = {lemma: pos_set_for_lemma(lemma) for lemma in lemmas}
+    return [lemma for lemma in lemmas if pos in allowed[lemma]] or [
+        lemma for lemma in lemmas if not allowed[lemma]
+    ]
+
+
+def _case_matches(word: str, lemmas: list[str]) -> list[str]:
+    """The lemmas among `lemmas` that are `word` up to case, in the FST's spelling.
+
+    The FST analyzes a capitalized common word fine ("Seurojentalo" ->
+    seuratalo, seurojentalo, Seura), so this is a plain comparison against
+    its lemmas - `word` is never lowercased before lemmatize(): the FST
+    gives no proper noun readings for a lowercase string ("helsinki" ->
+    nothing). A capitalized `word` can match twice, the common word and a
+    proper noun ("Kesä" -> kesä, Kesä); a lowercase one at most once.
+    """
+    folded = word.casefold()
+    return [lemma for lemma in lemmas if lemma.casefold() == folded]
+
+
+def _capitalized_mid_sentence(surface: str | None, context: str | None) -> bool:
+    """Whether the text capitalizes `surface` where only a proper noun would be.
+
+    Errs towards False ("don't know" - the caller then asks the LLM),
+    because True skips that call and a wrong True saves the proper noun
+    instead of the common word - a silent duplicate of an existing card.
+    So an occurrence spelled exactly like `surface` counts only when, on
+    its own line, a letter, a digit, "," or ";" comes right before it
+    (spaces aside), and a sentence-ending mark comes after it - a line with
+    none is a heading or a list item, where Title Case is common.
+    """
+    if not surface or not context or not surface[:1].isupper():
+        return False
+    for match in re.finditer(rf"(?<!\w){re.escape(surface)}(?!\w)", context):
+        line_start = context.rfind("\n", 0, match.start()) + 1
+        line_end = context.find("\n", match.end())
+        before = context[line_start : match.start()].rstrip(" \t")
+        after = context[match.end() : len(context) if line_end == -1 else line_end]
+        if (
+            before
+            and (before[-1].isalnum() or before[-1] in _MID_SENTENCE_BEFORE)
+            and any(mark in after for mark in _SENTENCE_END)
+        ):
+            return True
+    return False
+
+
+def _dictionary_lemma(word: str, pos: str) -> str | None:
+    """The FST's lemma for `word`, spelled the FST's way - or None if it can't analyze it.
+
+    No context here (see canonical_key()), so in order:
+
+    * `word` is itself a lemma, same case - `word` ("Helsinki", "hakea",
+      and "Kesä" the proper noun as much as "kesä");
+    * it is a lemma up to case - the FST's spelling of it. `word in lemmas`
+      alone missed the case-shifted match and fell through to lemmas[0] -
+      a *different* word ("Seurojentalo" -> seuratalo): the duplicate
+      `seurojentalo` pair found in production 11.09.2026. Several such
+      matches - the first in the FST's (deterministic) reading order; not
+      seen in practice, see _case_matches();
+    * otherwise `word` is an inflected form - the first lemma it inflects
+      whose part of speech is `pos`, or the first one at all if none is
+      ("Töitä" -> työ, "Helsingissä" -> Helsinki, "tulin" as a noun -> tuli,
+      not the verb tulla).
+    """
     lemmas = lemmatize(word)
     if word in lemmas:
         return word
+    case_matches = _case_matches(word, lemmas)
+    if case_matches:
+        return case_matches[0]
+    lemmas = [lemma for lemma in lemmas if pos in pos_set_for_lemma(lemma)] or lemmas
     return lemmas[0] if lemmas else None
 
 
 def canonical_key(lemma: str, pos: str | None) -> tuple[str, str | None]:
-    """Dedup key (plan phase 3): lemmatize the LLM's candidate, don't trust it as a lemma.
+    """Dedup key (plan phase 3): lemmatize a typed lemma, don't trust it as a lemma.
 
     `cards/instructions.md`: the LLM sometimes returns an inflected form as
     "lemma" (e.g. töitä instead of työ) - lemmatize() resolves that. `pos` is
@@ -798,12 +916,18 @@ def canonical_key(lemma: str, pos: str | None) -> tuple[str, str | None]:
     lemma to resolve - pos is None there, so the raw construction string is
     the key as-is.
 
+    Context-free, for /edit, where the student types the lemma: a capital
+    they typed is taken as meant ("Kesä" stays the proper noun). /add has
+    the text's sentence and settles the lemma in resolve_note_lemma()
+    instead; whatever lemma it chooses is stable here
+    (canonical_key(chosen) keeps `chosen`), being an exact FST lemma.
+
     Only the lemma is settled here. The part of speech is passed through
     untouched and reconciled with the FST later, in resolve_note_pos().
     """
     if pos is None:
         return lemma, None
-    return _dictionary_lemma(lemma) or lemma, pos
+    return _dictionary_lemma(lemma, pos) or lemma, pos
 
 
 async def existing_note_keys(
