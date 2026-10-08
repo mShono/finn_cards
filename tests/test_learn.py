@@ -18,6 +18,7 @@ from kielikaveri.bot.add import delete_confirm
 from kielikaveri.bot.learn import (
     DECK_ALL_TOKEN,
     SIDE_PROMPT,
+    STARTING_TEXT,
     LearnStates,
     Rating,
     _show_next_card,
@@ -181,9 +182,9 @@ async def _seed_reviewed_card(session_factory, card_id: str) -> None:
 
 
 # --- render_card: one branch per CardType --------------------------------
-# Only the recognition branch was exercised before (indirectly, via
-# learn_reveal/_show_next_card tests) - production and inflection had zero
-# coverage, including inflection's random.choice over principal_forms.
+# An inflection card asks exactly the form stored in card.form, looked up in
+# the note's principal_forms and FORM_TASKS; anything it can't resolve falls
+# back to the bare lemma instead of raising.
 
 
 def test_render_card_recognition_shows_finnish_front_and_translation_back():
@@ -258,11 +259,14 @@ def test_render_card_inflection_without_principal_forms_falls_back_to_the_lemma(
     # Defensive path: ensure_card_types only creates an inflection card once
     # principal_forms is populated, but render_card doesn't re-check that -
     # if meta were ever edited afterward to drop the forms, this is what
-    # /learn would show instead of crashing on an empty random.choice().
+    # /learn would show instead of a KeyError on forms[card.form]. The form
+    # itself is valid (it has a FORM_TASKS entry), so the missing
+    # principal_forms is the only reason to fall back.
     note = make_note()
     note.meta = {}
     card = make_card("card-A", "note-1", 1, due=NOW)
     card.type = CardType.inflection
+    card.form = "illatiivi"
 
     front, back = render_card(card, note)
 
@@ -370,6 +374,45 @@ async def test_rating_the_card_at_queue_head_records_exactly_one_review(session_
     # the FSM data - nothing left over for a subsequent stray callback to act on.
     assert await state.get_data() == {}
     callback.message.answer.assert_awaited_once()
+
+
+async def test_a_rating_that_lifts_recognition_past_the_threshold_opens_production_at_once(
+    session_factory,
+):
+    # learn_rate's ensure_card_types: the production card is written in the
+    # same commit as the review that earned it, not left for the next
+    # /learn's sync - the deck screen counts it straight away.
+    now = datetime.now(UTC)
+    async with session_factory() as session:
+        session.add(User(id=1))
+        session.add(make_note())
+        await session.flush()
+        card = make_card("card-A", "note-1", 1, due=now, reps=3)
+        card.state = CardState.review
+        card.stability = 2.0  # below the threshold until this rating lifts it
+        card.difficulty = 5.0
+        session.add(card)
+        await session.flush()
+        session.add(
+            Review(card_id="card-A", user_id=1, rating=3, reviewed_at=now - timedelta(days=10))
+        )
+        await session.commit()
+
+    state = make_state()
+    await state.update_data(
+        queue=["card-A"],
+        reviewed_count=0,
+        session_started_at=now.isoformat(),
+        session_max_minutes=10,
+    )
+
+    await learn_rate(make_callback("learn:rate:card-A:3"), state, session_factory)
+
+    async with session_factory() as session:
+        types = set(
+            (await session.scalars(select(Card.type).where(Card.note_id == "note-1"))).all()
+        )
+    assert types == {CardType.recognition, CardType.production}
 
 
 # --- _show_next_card and the two session-end conditions ------------------
@@ -1045,6 +1088,175 @@ async def test_learn_debt_choice_that_fails_leaves_no_state_behind(session_facto
         )
 
     assert await state.get_state() is None
+
+
+async def test_learn_debt_choice_answers_the_tap_even_when_the_defer_fails(
+    session_factory, monkeypatch
+):
+    async def fail(*args, **kwargs):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr("kielikaveri.bot.learn.defer_overdue_tail", fail)
+    state = make_state()
+    await state.set_state(LearnStates.debt_choice)
+    await state.update_data(debt_now=datetime.now(UTC).isoformat(), deck_id=None, side="mix")
+    callback = make_callback("learn:debt:defer")
+
+    with pytest.raises(RuntimeError):
+        await learn_debt_choice(callback, state, session_factory, make_settings())
+
+    callback.answer.assert_awaited_once_with()
+
+
+async def test_learn_debt_choice_with_broken_data_leaves_no_state_behind(session_factory):
+    # A debt prompt from before the side question existed carries no side.
+    state = make_state()
+    await state.set_state(LearnStates.debt_choice)
+    await state.update_data(debt_now=datetime.now(UTC).isoformat(), deck_id=None)
+    callback = make_callback("learn:debt:batch")
+
+    with pytest.raises(KeyError):
+        await learn_debt_choice(callback, state, session_factory, make_settings())
+
+    assert await state.get_state() is None
+    callback.answer.assert_awaited_once_with()
+
+
+async def test_a_session_whose_first_card_fails_to_show_leaves_no_state_behind(session_factory):
+    # In `reviewing` with nothing on screen, the session could not go on.
+    await _seed_due_cards(session_factory, 1, datetime.now(UTC))
+    state = make_state()
+    await state.set_state(LearnStates.side_choice)
+    await state.update_data(deck_id=None)
+    message = make_message()
+    message.answer = AsyncMock(side_effect=RuntimeError("Telegram is down"))
+
+    with pytest.raises(RuntimeError):
+        await _pick_side(state, session_factory, make_settings(), message)
+
+    assert await state.get_state() is None
+
+
+async def test_a_debt_prompt_that_fails_to_send_leaves_no_state_behind(session_factory):
+    async with session_factory() as session:
+        session.add(User(id=1))
+        session.add(make_note())
+        await session.flush()
+        for i in range(3):
+            session.add(make_card(f"card-{i}", "note-1", 1, due=NOW - timedelta(days=1), reps=1))
+        await session.commit()
+    state = make_state()
+    await state.set_state(LearnStates.side_choice)
+    await state.update_data(deck_id=None)
+    message = make_message()
+    message.answer = AsyncMock(side_effect=RuntimeError("Telegram is down"))
+
+    with pytest.raises(RuntimeError):
+        await _pick_side(state, session_factory, make_settings(debt_threshold=2), message)
+
+    assert await state.get_state() is None
+
+
+async def test_a_session_after_the_debt_choice_whose_first_card_fails_leaves_no_state_behind(
+    session_factory,
+):
+    # The debt tap claims the start with a token of its own.
+    await _seed_due_cards(session_factory, 1, datetime.now(UTC))
+    state = make_state()
+    await state.set_state(LearnStates.debt_choice)
+    await state.update_data(
+        debt_now=datetime.now(UTC).isoformat(), deck_id=None, side="mix", start_token="old"
+    )
+    callback = make_callback("learn:debt:batch")
+    callback.message.answer = AsyncMock(side_effect=RuntimeError("Telegram is down"))
+
+    with pytest.raises(RuntimeError):
+        await learn_debt_choice(callback, state, session_factory, make_settings())
+
+    assert await state.get_state() is None
+
+
+async def test_a_failing_start_leaves_a_newer_state_alone(session_factory, monkeypatch):
+    # While the first tap synced cards, /add ended it and /learn asked the
+    # side again; the old attempt's failure must not wipe that question.
+    state = make_state()
+
+    async def restart_then_fail(*args, **kwargs):
+        await state.clear()
+        await state.set_state(LearnStates.side_choice)
+        await state.update_data(deck_id=None)
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr("kielikaveri.bot.learn.sync_user_card_types", restart_then_fail)
+    await state.set_state(LearnStates.side_choice)
+    await state.update_data(deck_id=None)
+
+    with pytest.raises(RuntimeError):
+        await learn_side_choice(
+            make_callback("learn:side:fi"), state, session_factory, make_settings()
+        )
+
+    assert await state.get_state() == LearnStates.side_choice
+
+
+async def test_a_start_ended_while_syncing_shows_no_debt_prompt(session_factory, monkeypatch):
+    # The debt prompt is a step of the start - after /add stopped it, it
+    # must not come back as a debt question either.
+    async with session_factory() as session:
+        session.add(User(id=1))
+        session.add(make_note())
+        await session.flush()
+        for i in range(3):
+            session.add(make_card(f"card-{i}", "note-1", 1, due=NOW - timedelta(days=1), reps=1))
+        await session.commit()
+    state = make_state()
+
+    async def stopped_meanwhile(*args, **kwargs):
+        await state.clear()  # what add_during_learn does
+
+    monkeypatch.setattr("kielikaveri.bot.learn.sync_user_card_types", stopped_meanwhile)
+    await state.set_state(LearnStates.side_choice)
+    await state.update_data(deck_id=None)
+    message = make_message()
+
+    await _pick_side(state, session_factory, make_settings(debt_threshold=2), message)
+
+    message.answer.assert_not_awaited()
+    assert await state.get_state() is None
+
+
+async def test_learn_while_the_session_starts_says_it_is_coming():
+    state = make_state()
+    await state.set_state(LearnStates.starting)
+    message = make_message()
+
+    await learn_start(message, state, None, make_settings())
+
+    message.answer.assert_awaited_once_with(STARTING_TEXT)
+    assert await state.get_state() == LearnStates.starting
+
+
+@pytest.mark.parametrize(
+    "side, ending",
+    [
+        ("mix", " - всё на сегодня!"),
+        ("fi", " - на этой стороне всё на сегодня!"),
+    ],
+)
+async def test_session_end_after_one_side_says_only_that_side_is_done(
+    session_factory, side, ending
+):
+    # The Russian side may still have cards due after a Finnish session.
+    await _seed_due_cards(session_factory, 1, datetime.now(UTC))
+    state = make_state()
+    message = make_message()
+    await _learn(state, session_factory, make_settings(), message, side)
+    rate = make_callback("learn:rate:card-0:3")
+    rate.message = message
+
+    await learn_rate(rate, state, session_factory)
+
+    assert message.answer.call_args.args[0] == f"Сессия окончена: 1 карточек пройдено{ending}"
 
 
 async def test_a_tap_while_the_session_starts_is_answered_quietly():

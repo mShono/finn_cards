@@ -67,6 +67,34 @@ def test_after_boundary_hour_belongs_to_todays_study_day():
     assert end == datetime(2026, 8, 25, 4, 0, tzinfo=HELSINKI).astimezone(UTC)
 
 
+def test_the_boundary_instant_itself_starts_the_new_study_day():
+    now = datetime(2026, 8, 24, 4, 0, tzinfo=HELSINKI).astimezone(UTC)
+    start, end = study_day_bounds(now, boundary_hour=4)
+    assert start == now
+    assert end == datetime(2026, 8, 25, 4, 0, tzinfo=HELSINKI).astimezone(UTC)
+
+
+def test_the_study_day_spanning_spring_forward_is_23_hours_long():
+    # 2026-03-29 03:00 EET -> 04:00 EEST. The day still runs from 04:00 to
+    # 04:00 on the learner's clock, which is one hour short in real time -
+    # not a fixed 24h that would shift the boundary to 05:00 local.
+    now = datetime(2026, 3, 29, 2, 30, tzinfo=HELSINKI).astimezone(UTC)
+    start, end = study_day_bounds(now, boundary_hour=4)
+    assert start == datetime(2026, 3, 28, 2, 0, tzinfo=UTC)  # 04:00 EET
+    assert end == datetime(2026, 3, 29, 1, 0, tzinfo=UTC)  # 04:00 EEST
+    assert end - start == timedelta(hours=23)
+
+
+def test_the_study_day_spanning_fall_back_is_25_hours_long():
+    # 2026-10-25 04:00 EEST -> 03:00 EET: 03:00-04:00 happens twice, and the
+    # second 03:30 (fold=1) is still before the boundary - the old day.
+    now = datetime(2026, 10, 25, 3, 30, fold=1, tzinfo=HELSINKI).astimezone(UTC)
+    start, end = study_day_bounds(now, boundary_hour=4)
+    assert start == datetime(2026, 10, 24, 1, 0, tzinfo=UTC)  # 04:00 EEST
+    assert end == datetime(2026, 10, 25, 2, 0, tzinfo=UTC)  # 04:00 EET
+    assert end - start == timedelta(hours=25)
+
+
 # --- due_cards / overdue_count ----------------------------------------------
 
 
@@ -190,6 +218,34 @@ async def test_defer_overdue_tail_leaves_another_users_cards_alone(session_facto
         for card_id, due in dues.items()
         if card_id != "card-1"
     )
+
+    
+
+async def test_count_new_cards_today_window_includes_its_start_and_excludes_its_end(
+    session_factory,
+):
+    now = datetime(2026, 8, 24, 10, 0, tzinfo=UTC)
+    start, end = study_day_bounds(now, boundary_hour=4)
+    first_reviews = {
+        "at-start": start,
+        "just-before-start": start - timedelta(seconds=1),
+        "just-before-end": end - timedelta(seconds=1),
+        "at-end": end,
+    }
+    async with session_factory() as session:
+        session.add(User(id=1))
+        session.add(make_note("note-1", 1))
+        await session.flush()
+        for card_id, reviewed_at in first_reviews.items():
+            session.add(make_card(card_id, "note-1", 1, due=now, reps=1))
+            await session.flush()
+            session.add(Review(card_id=card_id, user_id=1, rating=3, reviewed_at=reviewed_at))
+        await session.commit()
+
+        count = await count_new_cards_today(session, 1, now, boundary_hour=4)
+
+    assert count == 2  # at-start and just-before-end
+
 
 
 # --- build_session_queue -----------------------------------------------------
