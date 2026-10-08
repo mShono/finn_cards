@@ -7,7 +7,7 @@ from sqlalchemy import select
 from kielikaveri.db.decks import create_deck
 from kielikaveri.db.engine import create_all, make_engine, make_session_factory
 from kielikaveri.db.models import Note, User
-from kielikaveri.import_cards import DEFAULT_CARDS_DIR, import_notes
+from kielikaveri.import_cards import DEFAULT_CARDS_DIR, import_notes, note_id_for
 
 
 @pytest.fixture
@@ -113,12 +113,6 @@ async def test_invalid_note_is_rejected(session_factory, tmp_path):
         await import_notes(session_factory, user_id=1, cards_dir=bad_dir)
 
 
-@pytest.mark.xfail(
-    reason="import_notes dedups by note.id alone, not (user_id, id) - a second "
-    "user importing the same examples silently gets 0 notes. Known gap, plan's "
-    "'Известные пробелы' (2026-08-21); strict so a real fix must remove this marker.",
-    strict=True,
-)
 async def test_import_gives_each_user_their_own_notes(session_factory):
     await import_notes(session_factory, user_id=1, cards_dir=DEFAULT_CARDS_DIR)
     second_user_imported = await import_notes(
@@ -129,3 +123,85 @@ async def test_import_gives_each_user_their_own_notes(session_factory):
     async with session_factory() as session:
         user_2_notes = (await session.scalars(select(Note).where(Note.user_id == 2))).all()
         assert {n.lemma for n in user_2_notes} == {"hakea", "hammas", "pitää"}
+
+    async with session_factory() as session:
+        user_1_notes = (await session.scalars(select(Note).where(Note.user_id == 1))).all()
+    assert len(user_1_notes) == 3
+    # Separate rows, not user 1's notes reassigned or shared.
+    assert not {n.id for n in user_1_notes} & {n.id for n in user_2_notes}
+
+
+async def test_reimporting_is_idempotent_per_user(session_factory):
+    await import_notes(session_factory, user_id=1, cards_dir=DEFAULT_CARDS_DIR)
+    await import_notes(session_factory, user_id=2, cards_dir=DEFAULT_CARDS_DIR)
+
+    assert await import_notes(session_factory, user_id=1, cards_dir=DEFAULT_CARDS_DIR) == []
+    assert await import_notes(session_factory, user_id=2, cards_dir=DEFAULT_CARDS_DIR) == []
+    async with session_factory() as session:
+        notes = (await session.scalars(select(Note))).all()
+    assert sorted(n.user_id for n in notes) == [1, 1, 1, 2, 2, 2]
+
+
+async def test_reimport_skips_notes_imported_under_the_raw_file_id(session_factory):
+    # Imports before per-user ids stored the file's id verbatim - a prod DB
+    # still has those rows, and re-running the import must not duplicate them.
+    payload = json.loads((DEFAULT_CARDS_DIR / "hakea.json").read_text())
+    async with session_factory() as session:
+        session.add(User(id=1))
+        deck = await create_deck(session, 1, "Общая")
+        session.add(
+            Note(
+                id=payload["id"],
+                user_id=1,
+                lemma="hakea",
+                pos="verbi",
+                translation_ru=payload["translation_ru"],
+                example_fi=payload["example_fi"],
+                example_ru=payload["example_ru"],
+                kind="word",
+                # Moved into a deck since - the deckless clash check would
+                # not see it, only the id lookup does.
+                deck_id=deck.id,
+                meta=payload["meta"],
+            )
+        )
+        await session.commit()
+
+    imported = await import_notes(session_factory, user_id=1, cards_dir=DEFAULT_CARDS_DIR)
+
+    assert len(imported) == 2
+    assert note_id_for(1, payload["id"]) not in imported
+    async with session_factory() as session:
+        hakeas = (await session.scalars(select(Note).where(Note.lemma == "hakea"))).all()
+    assert [n.id for n in hakeas] == [payload["id"]]
+
+
+async def test_another_users_raw_file_id_does_not_block_import(session_factory):
+    # User 1's legacy row holds the raw file id - user 2 still gets their own
+    # note, and user 1's row is left as it was.
+    payload = json.loads((DEFAULT_CARDS_DIR / "hakea.json").read_text())
+    async with session_factory() as session:
+        session.add(User(id=1))
+        session.add(
+            Note(
+                id=payload["id"],
+                user_id=1,
+                lemma="hakea",
+                pos="verbi",
+                translation_ru=payload["translation_ru"],
+                example_fi=payload["example_fi"],
+                example_ru=payload["example_ru"],
+                kind="word",
+                meta=payload["meta"],
+            )
+        )
+        await session.commit()
+
+    imported = await import_notes(session_factory, user_id=2, cards_dir=DEFAULT_CARDS_DIR)
+
+    assert note_id_for(2, payload["id"]) in imported
+    async with session_factory() as session:
+        legacy = await session.get(Note, payload["id"])
+        mine = await session.get(Note, note_id_for(2, payload["id"]))
+    assert legacy.user_id == 1
+    assert mine.user_id == 2

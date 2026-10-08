@@ -10,8 +10,7 @@ import pytest
 from aiogram import Bot
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.methods import SendMessage
-from sqlalchemy import select
-from test_add import (
+from bot_helpers import (
     WORD_CANDIDATE,
     RecordingSession,
     make_breaker,
@@ -20,7 +19,9 @@ from test_add import (
     tg_callback_update,
     tg_text_update,
 )
+from sqlalchemy import select
 
+import kielikaveri.bot.learn as learn_module
 from kielikaveri.bot.add import (
     ADD_PROMPT,
     LEARN_STOPPED_TEXT,
@@ -31,7 +32,7 @@ from kielikaveri.bot.add import (
 )
 from kielikaveri.bot.decks import DeckStates
 from kielikaveri.bot.edit import EditStates
-from kielikaveri.bot.learn import SIDE_PROMPT, LearnStates
+from kielikaveri.bot.learn import SIDE_PROMPT, STARTING_TEXT, LearnStates
 from kielikaveri.db.decks import get_or_create_default_deck
 from kielikaveri.db.engine import create_all, make_engine, make_session_factory
 from kielikaveri.db.models import Card, CardType, Deck, Note, NoteKind
@@ -401,6 +402,88 @@ async def test_double_tap_on_the_debt_buttons_starts_one_session(routed):
     # Only the first tap ran: one defer report, one card front.
     assert texts == ["Отложено 0 карточек на 7 дн.", "🇫🇮 hakea"]
     assert await routed["get_state"]() == LearnStates.reviewing.state
+
+
+def _hold_card_sync(monkeypatch, holds: int = 1) -> list[tuple[asyncio.Event, asyncio.Event]]:
+    """Make the first `holds` card syncs wait: each gets an (entered, release)
+    pair - set once the sync is reached, and to let it go on."""
+    real = learn_module.sync_user_card_types
+    gates = [(asyncio.Event(), asyncio.Event()) for _ in range(holds)]
+    calls = iter(gates)
+
+    async def held(*args, **kwargs):
+        gate = next(calls, None)
+        if gate is not None:
+            gate[0].set()
+            await asyncio.wait_for(gate[1].wait(), 5)
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr("kielikaveri.bot.learn.sync_user_card_types", held)
+    return gates
+
+
+async def test_add_while_the_session_starts_keeps_it_stopped(routed, monkeypatch):
+    # The side tap is still syncing cards when /add ends the session; the
+    # tap finishing afterwards must not bring the session back.
+    await _add_note(routed["session_factory"])
+    [(entered, release)] = _hold_card_sync(monkeypatch)
+    await routed["send"]("/learn")
+    since = len(routed["sent"])
+
+    async def add_meanwhile():
+        await asyncio.wait_for(entered.wait(), 5)
+        await routed["send"]("/add")
+        release.set()
+
+    await asyncio.gather(routed["tap"]("learn:side:fi"), add_meanwhile())
+
+    texts = [m.text for m in routed["sent"][since:] if isinstance(m, SendMessage)]
+    assert texts == [LEARN_STOPPED_TEXT, ADD_PROMPT]
+    assert await routed["get_state"]() is None
+
+
+async def test_learn_while_the_session_starts_lets_it_start(routed, monkeypatch):
+    await _add_note(routed["session_factory"])
+    [(entered, release)] = _hold_card_sync(monkeypatch)
+    await routed["send"]("/learn")
+    since = len(routed["sent"])
+
+    async def learn_meanwhile():
+        await asyncio.wait_for(entered.wait(), 5)
+        await routed["send"]("/learn")
+        release.set()
+
+    await asyncio.gather(routed["tap"]("learn:side:fi"), learn_meanwhile())
+
+    texts = [m.text for m in routed["sent"][since:] if isinstance(m, SendMessage)]
+    assert texts == [STARTING_TEXT, "🇫🇮 hakea"]
+    assert await routed["get_state"]() == LearnStates.reviewing.state
+
+
+async def test_an_old_start_leaves_a_newer_one_alone(routed, monkeypatch):
+    # The first tap is stopped by /add mid-sync, then /learn and a new tap
+    # start over. The old tap, finishing while the new one still syncs,
+    # finds `starting` again - but not its own, so it must step aside.
+    await _add_note(routed["session_factory"])
+    [(old_in, old_go), (new_in, new_go)] = _hold_card_sync(monkeypatch, holds=2)
+    await routed["send"]("/learn")
+    since = len(routed["sent"])
+
+    old_tap = asyncio.ensure_future(routed["tap"]("learn:side:fi"))
+    await asyncio.wait_for(old_in.wait(), 5)
+    await routed["send"]("/add")
+    await routed["send"]("/learn")
+    new_tap = asyncio.ensure_future(routed["tap"]("learn:side:mix"))
+    await asyncio.wait_for(new_in.wait(), 5)
+    old_go.set()
+    await old_tap  # the old start runs to its end first
+    new_go.set()
+    await new_tap
+
+    texts = [m.text for m in routed["sent"][since:] if isinstance(m, SendMessage)]
+    assert texts == [LEARN_STOPPED_TEXT, ADD_PROMPT, SIDE_PROMPT, "🇫🇮 hakea"]
+    assert await routed["get_state"]() == LearnStates.reviewing.state
+    assert (await routed["get_data"]())["side"] == "mix"
 
 
 async def test_old_edit_menu_cancel_leaves_a_review_session_alone(routed):

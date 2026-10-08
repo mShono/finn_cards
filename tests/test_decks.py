@@ -7,6 +7,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import InlineKeyboardButton
+from sqlalchemy import text
 
 from kielikaveri.bot.decks import (
     NOTES_PER_PAGE,
@@ -17,7 +18,7 @@ from kielikaveri.bot.decks import (
 )
 from kielikaveri.db.decks import create_deck, get_or_create_default_deck, list_decks
 from kielikaveri.db.engine import create_all, make_engine, make_session_factory
-from kielikaveri.db.models import Card, CardStatus, CardType, Note, NoteKind, User
+from kielikaveri.db.models import Card, CardStatus, CardType, Deck, Note, NoteKind, User
 
 NOW = datetime(2026, 8, 26, 10, 0, tzinfo=UTC)
 
@@ -70,6 +71,64 @@ async def test_get_or_create_default_deck_returns_the_existing_first_deck(sessio
     async with session_factory() as session:
         again = await get_or_create_default_deck(session, 1)
     assert again.id == first_id
+
+
+async def _add_same_second_decks(session_factory) -> list[str]:
+    """Three decks sharing one created_at second, inserted in an order that
+    both their ids and their names sort against - so only a creation-order
+    (rowid) tiebreaker gives back the insertion order. Returns their ids in
+    insertion order.
+    """
+    inserted = [("deck-c", "Б"), ("deck-b", "В"), ("deck-a", "А")]
+    async with session_factory() as session:
+        for deck_id, name in inserted:
+            session.add(Deck(id=deck_id, user_id=1, name=name, created_at=NOW))
+            # One flush per deck pins the INSERT (and so rowid) order.
+            await session.flush()
+        # An index the ORDER BY can walk (ties then come out in its id order)
+        # - without an explicit tiebreaker the result follows the query plan,
+        # and this makes that dependence visible instead of luckily hidden by
+        # a plain table scan that happens to go in rowid order.
+        await session.execute(
+            text("CREATE INDEX ix_test_decks_order ON decks (user_id, created_at, id)")
+        )
+        await session.commit()
+    return [deck_id for deck_id, _ in inserted]
+
+
+async def test_list_decks_breaks_a_created_at_tie_by_creation_order(session_factory):
+    inserted_ids = await _add_same_second_decks(session_factory)
+
+    async with session_factory() as session:
+        decks = await list_decks(session, 1)
+
+    assert [d.id for d in decks] == inserted_ids
+
+
+async def test_get_or_create_default_deck_picks_the_first_created_on_a_created_at_tie(
+    session_factory,
+):
+    inserted_ids = await _add_same_second_decks(session_factory)
+
+    async with session_factory() as session:
+        deck = await get_or_create_default_deck(session, 1)
+
+    assert deck.id == inserted_ids[0]
+
+
+async def test_list_decks_orders_by_created_at_before_creation_order(session_factory):
+    # The tiebreaker only breaks ties: a deck inserted later but stamped
+    # earlier still comes first.
+    async with session_factory() as session:
+        session.add(Deck(id="later", user_id=1, name="Новая", created_at=NOW))
+        await session.flush()
+        session.add(Deck(id="earlier", user_id=1, name="Старая", created_at=NOW - timedelta(1)))
+        await session.commit()
+
+    async with session_factory() as session:
+        decks = await list_decks(session, 1)
+
+    assert [d.id for d in decks] == ["earlier", "later"]
 
 
 # --- bot.decks -------------------------------------------------------------------
@@ -209,6 +268,35 @@ async def test_decks_open_puts_each_note_on_an_edit_button_with_its_translation(
     assert edit_buttons[0].text == "✍️ 1. hakea - искать"
     assert "verbi" not in edit_buttons[0].text
     callback.answer.assert_awaited_once()
+
+
+async def test_decks_open_ignores_another_users_note_in_the_deck(session_factory):
+    # Shouldn't exist (add_deck_choice checks the deck's owner), but the
+    # screen mustn't rely on that alone - deck_id is no proof of whose note.
+    async with session_factory() as session:
+        deck = await create_deck(session, 1, "Общая")
+        await session.flush()
+        for note_id, user_id, lemma in (("own", 1, "hakea"), ("foreign", 2, "naapuri")):
+            session.add(
+                Note(
+                    id=note_id,
+                    user_id=user_id,
+                    lemma=lemma,
+                    translation_ru="x",
+                    example_fi="x",
+                    example_ru="y",
+                    kind=NoteKind.word,
+                    deck_id=deck.id,
+                    meta={},
+                )
+            )
+        await session.commit()
+
+    callback = make_callback(f"decks:open:{deck.id}")
+    await decks_open(callback, session_factory)
+
+    assert "слов: 1" in callback.message.answer.call_args.args[0]
+    assert [b.callback_data for b in _note_buttons(callback)] == ["noteedit:own"]
 
 
 async def test_deck_screens_count_only_their_own_deck_cards(session_factory):

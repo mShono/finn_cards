@@ -5,7 +5,11 @@ from sqlalchemy import select
 
 from kielikaveri.db.engine import create_all, make_engine, make_session_factory
 from kielikaveri.db.models import Card, CardType, Note, NoteKind, User
-from kielikaveri.srs.graduation import ensure_card_types, sync_user_card_types
+from kielikaveri.srs.graduation import (
+    PRODUCTION_STABILITY_THRESHOLD_DAYS,
+    ensure_card_types,
+    sync_user_card_types,
+)
 
 NOW = datetime(2026, 8, 24, 10, 0, tzinfo=UTC)
 
@@ -97,6 +101,33 @@ async def test_production_opens_once_recognition_stability_crosses_threshold(ses
         (await session.get(Card, "rec-1")).stability = 3.5
         created = await ensure_card_types(session, note, NOW)
         await session.commit()
+
+    assert {c.type for c in created} == {CardType.production}
+
+
+async def test_production_opens_at_exactly_the_threshold_not_only_above_it(session_factory):
+    # The boundary itself: a recognition card whose stability lands exactly
+    # on the threshold has earned production, a hair below has not.
+    async with session_factory() as session:
+        session.add(User(id=1))
+        note = make_note("note-1", 1)
+        session.add(note)
+        session.add(
+            Card(
+                id="rec-1",
+                note_id="note-1",
+                user_id=1,
+                type=CardType.recognition,
+                due=NOW,
+                stability=PRODUCTION_STABILITY_THRESHOLD_DAYS - 0.01,
+            )
+        )
+        await session.flush()
+
+        assert await ensure_card_types(session, note, NOW) == []
+
+        (await session.get(Card, "rec-1")).stability = PRODUCTION_STABILITY_THRESHOLD_DAYS
+        created = await ensure_card_types(session, note, NOW)
 
     assert {c.type for c in created} == {CardType.production}
 
