@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -41,7 +42,7 @@ from kielikaveri.bot.decks import NEW_DECK_PROMPT
 from kielikaveri.db.decks import create_deck, get_or_create_default_deck
 from kielikaveri.db.engine import create_all, make_engine, make_session_factory
 from kielikaveri.db.models import Card, Deck, IngestCache, Note, Review
-from kielikaveri.ingest import ResolvedForms, TokenUsage
+from kielikaveri.ingest import FORM_CHOICE_SCHEMA_NAME, ResolvedForms, TokenUsage
 from kielikaveri.llm.breaker import CallBreaker, CircuitOpenError
 
 NOW = datetime(2026, 8, 26, 10, 0, tzinfo=UTC)
@@ -1119,15 +1120,20 @@ async def test_chat_saves_a_made_up_lemma_under_the_fsts_lemma(session_factory, 
     assert "⚠️" not in report
 
 
-async def test_chat_dedups_against_the_fsts_lemma(session_factory, monkeypatch):
+async def test_chat_dedups_against_the_fsts_lemma(session_factory, monkeypatch, caplog):
     patch_check_and_suggest(monkeypatch, "Добавляю.", [RIENTAA_CANDIDATE])
 
-    await _add_via_chat(session_factory)
-    second = await _add_via_chat(session_factory)
+    with caplog.at_level(logging.INFO, logger="kielikaveri.bot.add"):
+        await _add_via_chat(session_factory)
+        second = await _add_via_chat(session_factory)
 
     async with session_factory() as session:
         assert len((await session.scalars(select(Note))).all()) == 1
     assert "не дублирую: rientää" in second.message.answer.call_args.args[0]
+    # Caught by the lookup before the insert, not by the unique index's
+    # race branch - which words its report the same way.
+    events = [log_fields(r.message).get("event") for r in caplog.records]
+    assert "add.duplicate_race" not in events
 
 
 async def test_chat_flags_a_word_the_fst_does_not_know(session_factory, monkeypatch):
@@ -1165,3 +1171,113 @@ async def test_chat_reports_a_failed_lemma_choice_without_blocking_the_others(
         ]
     report = callback.message.answer.call_args.args[0]
     assert "Не удалось сохранить «kuusie» - предохранитель сработал." in report
+
+
+# --- an inflected form the FST knows, end to end through /add ----------------------
+
+
+TOITA_CANDIDATE = {
+    "lemma": "töitä",
+    "pos": "substantiivi",
+    "translation_ru": "работа",
+    "example_fi": "Haen töitä.",
+    "example_ru": "Я ищу работу.",
+    "kind": "word",
+    "meta": {},
+    "surface_fi": "töitä",
+}
+
+
+def patch_form_choice_only(monkeypatch) -> AsyncMock:
+    """Fake the OpenAI client for everything after the chat call.
+
+    The FST alone settles "töitä" -> "työ": a lemma or pos choice call means
+    it didn't, so those fail the test. The one call allowed is the routine
+    form tie-break ("töiden"/"töitten"), answered from the FST's own options.
+    """
+
+    async def create(**kwargs):
+        schema_format = kwargs["text"]["format"]
+        assert schema_format["name"] == FORM_CHOICE_SCHEMA_NAME, schema_format["name"]
+        properties = schema_format["schema"]["properties"]
+        payload = {name: spec["enum"][-1] for name, spec in properties.items()}
+        return SimpleNamespace(
+            output_text=json.dumps(payload, ensure_ascii=False),
+            usage=SimpleNamespace(input_tokens=10, output_tokens=5, total_tokens=15),
+        )
+
+    mock = AsyncMock(side_effect=create)
+    monkeypatch.setattr(
+        "kielikaveri.bot.add.make_client",
+        lambda *args, **kwargs: SimpleNamespace(responses=SimpleNamespace(create=mock)),
+    )
+    return mock
+
+
+async def _add_via_command(session_factory, text: str) -> tuple[SimpleNamespace, str]:
+    state = make_state()
+    await add_command(
+        make_message(f"/add {text}"),
+        make_command(text),
+        state,
+        session_factory,
+        make_settings(),
+        make_breaker(),
+    )
+    data = await state.get_data()
+    async with session_factory() as session:
+        deck_id = (await get_or_create_default_deck(session, 1)).id
+    callback = make_callback(f"adddeck:{data['batch_id']}:{deck_id}")
+    await add_deck_choice(callback, state, session_factory, make_settings(), make_breaker())
+    return callback, deck_id
+
+
+async def test_add_saves_an_inflected_form_under_the_fsts_lemma(session_factory, monkeypatch):
+    """The LLM answers the text's "töitä" as the lemma. Only the OpenAI call
+    is faked - the real FST has to turn it into "työ" before the dedup check
+    and the insert, so the note never lands under the inflected form.
+    """
+    patch_check_and_suggest(monkeypatch, "Добавляю.", [TOITA_CANDIDATE])
+    create = patch_form_choice_only(monkeypatch)
+
+    callback, deck_id = await _add_via_command(session_factory, "Haen töitä.")
+
+    async with session_factory() as session:
+        note = (await session.scalars(select(Note))).one()
+    assert note.lemma == "työ"
+    assert note.pos == "substantiivi"
+    assert note.user_id == 1
+    assert note.deck_id == deck_id
+    assert note.meta["forms_verified"] is True
+    assert note.meta["forms_source"] == "fst+llm"  # the plural genitive tie-break
+    assert note.meta["principal_forms"]["partitiivi"] == "työtä"
+    assert note.meta["principal_forms"]["monikon_partitiivi"] == "töitä"
+    assert note.meta["principal_forms"]["monikon_genetiivi"] == "töiden"  # the fake's pick
+    assert "surface_fi" not in note.meta
+    report = callback.message.answer.call_args.args[0]
+    assert "🇫🇮 työ → работа" in report
+    assert "töitä" not in report
+    assert "⚠️" not in report
+    create.assert_awaited_once()  # the form tie-break, nothing else
+
+
+async def test_add_dedups_an_inflected_form_against_the_fsts_lemma(
+    session_factory, monkeypatch, caplog
+):
+    patch_check_and_suggest(monkeypatch, "Добавляю.", [TOITA_CANDIDATE])
+    create = patch_form_choice_only(monkeypatch)
+
+    with caplog.at_level(logging.INFO, logger="kielikaveri.bot.add"):
+        await _add_via_command(session_factory, "Haen töitä.")
+        second, _deck_id = await _add_via_command(session_factory, "Haen töitä.")
+
+    async with session_factory() as session:
+        assert [note.lemma for note in (await session.scalars(select(Note))).all()] == ["työ"]
+    assert "не дублирую: työ." in second.message.answer.call_args.args[0]
+    # Caught by the lookup before the insert, not by the unique index's
+    # race branch - which words its report the same way: the second turn
+    # never got as far as the forms (the first turn's tie-break is the only
+    # call) and never hit the index.
+    create.assert_awaited_once()
+    events = [log_fields(r.message).get("event") for r in caplog.records]
+    assert "add.duplicate_race" not in events
