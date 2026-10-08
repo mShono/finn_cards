@@ -375,6 +375,45 @@ async def test_rating_the_card_at_queue_head_records_exactly_one_review(session_
     callback.message.answer.assert_awaited_once()
 
 
+async def test_a_rating_that_lifts_recognition_past_the_threshold_opens_production_at_once(
+    session_factory,
+):
+    # learn_rate's ensure_card_types: the production card is written in the
+    # same commit as the review that earned it, not left for the next
+    # /learn's sync - the deck screen counts it straight away.
+    now = datetime.now(UTC)
+    async with session_factory() as session:
+        session.add(User(id=1))
+        session.add(make_note())
+        await session.flush()
+        card = make_card("card-A", "note-1", 1, due=now, reps=3)
+        card.state = CardState.review
+        card.stability = 2.0  # below the threshold until this rating lifts it
+        card.difficulty = 5.0
+        session.add(card)
+        await session.flush()
+        session.add(
+            Review(card_id="card-A", user_id=1, rating=3, reviewed_at=now - timedelta(days=10))
+        )
+        await session.commit()
+
+    state = make_state()
+    await state.update_data(
+        queue=["card-A"],
+        reviewed_count=0,
+        session_started_at=now.isoformat(),
+        session_max_minutes=10,
+    )
+
+    await learn_rate(make_callback("learn:rate:card-A:3"), state, session_factory)
+
+    async with session_factory() as session:
+        types = set(
+            (await session.scalars(select(Card.type).where(Card.note_id == "note-1"))).all()
+        )
+    assert types == {CardType.recognition, CardType.production}
+
+
 # --- _show_next_card and the two session-end conditions ------------------
 
 
