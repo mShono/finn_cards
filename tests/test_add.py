@@ -1,24 +1,27 @@
 import asyncio
-import functools
 import json
 import logging
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import openai
 import pytest
-from aiogram import Bot, Dispatcher
-from aiogram.client.session.base import BaseSession
+from aiogram import Bot
 from aiogram.filters import CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.methods import SendMessage
-from aiogram.types import CallbackQuery as TgCallbackQuery
-from aiogram.types import Chat, InlineKeyboardMarkup, Update
-from aiogram.types import Message as TgMessage
-from aiogram.types import User as TgUser
+from bot_helpers import (
+    WORD_CANDIDATE,
+    RecordingSession,
+    make_breaker,
+    make_settings,
+    routed_dispatcher,
+    tg_callback_update,
+    tg_text_update,
+)
 from conftest import log_fields
 from sqlalchemy import select
 
@@ -36,8 +39,6 @@ from kielikaveri.bot.add import (
     delete_confirm,
 )
 from kielikaveri.bot.decks import NEW_DECK_PROMPT
-from kielikaveri.bot.main import build_dispatcher
-from kielikaveri.config import Settings
 from kielikaveri.db.decks import create_deck, get_or_create_default_deck
 from kielikaveri.db.engine import create_all, make_engine, make_session_factory
 from kielikaveri.db.models import Card, Deck, IngestCache, Note, Review
@@ -45,16 +46,6 @@ from kielikaveri.ingest import FORM_CHOICE_SCHEMA_NAME, ResolvedForms, TokenUsag
 from kielikaveri.llm.breaker import CallBreaker, CircuitOpenError
 
 NOW = datetime(2026, 8, 26, 10, 0, tzinfo=UTC)
-
-WORD_CANDIDATE = {
-    "lemma": "hakea",
-    "pos": "verbi",
-    "translation_ru": "искать",
-    "example_fi": "Haen töitä kaupungista.",
-    "example_ru": "Я ищу работу в городе.",
-    "kind": "word",
-    "meta": {"topics": ["työnhaku"]},
-}
 
 PATTERN_CANDIDATE = {
     "lemma": "hakea + partitiivi",
@@ -77,22 +68,6 @@ async def session_factory(tmp_path):
 
 def make_state() -> FSMContext:
     return FSMContext(storage=MemoryStorage(), key=StorageKey(bot_id=0, chat_id=1, user_id=1))
-
-
-def make_settings(**overrides) -> Settings:
-    defaults = {
-        "openai_api_key": "sk-test",
-        "openai_text_model": "gpt-5.6-terra",
-        "openai_timeout_seconds": 1.0,
-        "breaker_max_calls": 60,
-        "breaker_window_minutes": 10,
-    }
-    return Settings(**{**defaults, **overrides})
-
-
-def make_breaker(**overrides) -> CallBreaker:
-    defaults = {"max_calls": 60, "window": timedelta(minutes=10)}
-    return CallBreaker(**{**defaults, **overrides})
 
 
 def make_message(text: str) -> SimpleNamespace:
@@ -184,9 +159,8 @@ async def test_chat_reports_a_tripped_breaker_honestly(session_factory, monkeypa
 
     await chat_message(message, make_state(), session_factory, make_settings(), make_breaker())
 
-    assert (
-        "предохранитель" in message.answer.call_args.args[0].lower()
-        or "баг" in message.answer.call_args.args[0]
+    message.answer.assert_awaited_once_with(
+        "Слишком много обращений к OpenAI подряд - похоже на баг, я остановилась. Попробуй позже."
     )
 
 
@@ -673,78 +647,6 @@ async def test_add_new_deck_save_reprompts_on_an_empty_name(session_factory):
 
 
 # --- routing through the real Dispatcher -------------------------------------------
-
-
-class RecordingSession(BaseSession):
-    """Stands in for Telegram: records outgoing API calls instead of sending them."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.sent: list = []
-
-    async def make_request(self, bot, method, timeout=None):
-        self.sent.append(method)
-        if isinstance(method, SendMessage):
-            return TgMessage(
-                message_id=len(self.sent),
-                date=datetime.now(UTC),
-                chat=Chat(id=1, type="private"),
-                text=method.text,
-                # A received Message only ever carries an inline keyboard -
-                # /start's reply keyboard isn't echoed back by Telegram either.
-                reply_markup=method.reply_markup
-                if isinstance(method.reply_markup, InlineKeyboardMarkup)
-                else None,
-            )
-        return True
-
-    async def stream_content(self, *args, **kwargs):
-        raise NotImplementedError
-
-    async def close(self) -> None:
-        pass
-
-
-@functools.cache
-def routed_dispatcher() -> Dispatcher:
-    # bot/main.py's own build_dispatcher - same middlewares, same router
-    # order. Built once per process: aiogram refuses to attach a router twice.
-    return build_dispatcher({1})
-
-
-def tg_user() -> TgUser:
-    return TgUser(id=1, is_bot=False, first_name="Test")
-
-
-def tg_text_update(update_id: int, text: str) -> Update:
-    return Update(
-        update_id=update_id,
-        message=TgMessage(
-            message_id=update_id,
-            date=datetime.now(UTC),
-            chat=Chat(id=1, type="private"),
-            from_user=tg_user(),
-            text=text,
-        ),
-    )
-
-
-def tg_callback_update(update_id: int, data: str) -> Update:
-    return Update(
-        update_id=update_id,
-        callback_query=TgCallbackQuery(
-            id=str(update_id),
-            from_user=tg_user(),
-            chat_instance="test",
-            data=data,
-            message=TgMessage(
-                message_id=update_id,
-                date=datetime.now(UTC),
-                chat=Chat(id=1, type="private"),
-                text="В какую колоду добавить?",
-            ),
-        ),
-    )
 
 
 async def test_new_deck_name_is_routed_to_add_new_deck_save_not_to_chat(

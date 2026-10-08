@@ -1,8 +1,9 @@
 from datetime import UTC, datetime
+from zoneinfo import ZoneInfo
 
 import pytest
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, StatementError
 
 from kielikaveri.db.decks import create_deck
 from kielikaveri.db.engine import create_all, make_engine, make_session_factory
@@ -94,6 +95,61 @@ async def test_note_without_pos_is_allowed(session_factory):
         note = await session.get(Note, "note-2")
         assert note.pos is None
         assert note.kind == NoteKind.pattern
+
+
+# --- UTCDateTime ---------------------------------------------------------------
+#
+# The contract is "aware in, aware UTC out". A naive datetime has no instant
+# - .timestamp() would read it as the *server's* local time and store a due
+# date shifted by the VPS's offset - so it is refused rather than guessed.
+
+
+async def _seed_note(session) -> None:
+    session.add(User(id=1))
+    session.add(
+        Note(
+            id="note-1",
+            user_id=1,
+            lemma="hakea",
+            translation_ru="искать",
+            example_fi="Haen töitä.",
+            example_ru="Я ищу работу.",
+            kind=NoteKind.word,
+            meta={},
+        )
+    )
+    await session.flush()
+
+
+async def test_a_naive_datetime_is_refused_rather_than_read_as_local_time(session_factory):
+    async with session_factory() as session:
+        await _seed_note(session)
+        session.add(
+            Card(
+                id="card-1",
+                note_id="note-1",
+                user_id=1,
+                type=CardType.recognition,
+                due=datetime(2026, 9, 1, 6, 0),  # noqa: DTZ001 - naive on purpose
+            )
+        )
+        with pytest.raises(StatementError, match="timezone-aware"):
+            await session.flush()
+
+
+async def test_an_aware_non_utc_datetime_is_stored_as_the_same_instant(session_factory):
+    due = datetime(2026, 9, 1, 9, 0, tzinfo=ZoneInfo("Europe/Helsinki"))
+    async with session_factory() as session:
+        await _seed_note(session)
+        session.add(
+            Card(id="card-1", note_id="note-1", user_id=1, type=CardType.recognition, due=due)
+        )
+        await session.commit()
+
+    async with session_factory() as session:
+        card = await session.get(Card, "card-1")
+    assert card.due == datetime(2026, 9, 1, 6, 0, tzinfo=UTC)
+    assert card.due.tzinfo is UTC
 
 
 # --- (user, deck, lemma, pos) uniqueness -----------------------------------
