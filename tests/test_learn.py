@@ -181,9 +181,9 @@ async def _seed_reviewed_card(session_factory, card_id: str) -> None:
 
 
 # --- render_card: one branch per CardType --------------------------------
-# Only the recognition branch was exercised before (indirectly, via
-# learn_reveal/_show_next_card tests) - production and inflection had zero
-# coverage, including inflection's random.choice over principal_forms.
+# An inflection card asks exactly the form stored in card.form, looked up in
+# the note's principal_forms and FORM_TASKS; anything it can't resolve falls
+# back to the bare lemma instead of raising.
 
 
 def test_render_card_recognition_shows_finnish_front_and_translation_back():
@@ -258,11 +258,14 @@ def test_render_card_inflection_without_principal_forms_falls_back_to_the_lemma(
     # Defensive path: ensure_card_types only creates an inflection card once
     # principal_forms is populated, but render_card doesn't re-check that -
     # if meta were ever edited afterward to drop the forms, this is what
-    # /learn would show instead of crashing on an empty random.choice().
+    # /learn would show instead of a KeyError on forms[card.form]. The form
+    # itself is valid (it has a FORM_TASKS entry), so the missing
+    # principal_forms is the only reason to fall back.
     note = make_note()
     note.meta = {}
     card = make_card("card-A", "note-1", 1, due=NOW)
     card.type = CardType.inflection
+    card.form = "illatiivi"
 
     front, back = render_card(card, note)
 
