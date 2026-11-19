@@ -1,0 +1,55 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# One deploy at a time; a newer push waits for the running one instead of
+# killing it halfway through a migration.
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  tests:
+    uses: ./.github/workflows/tests.yml
+
+  deploy:
+    needs: tests
+    # workflow_dispatch can be started from any branch; only main deploys.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    steps:
+      # Secrets (Settings -> Environments -> production; that environment
+      # must allow only the main branch, or a workflow from any branch could
+      # read them):
+      #   DEPLOY_HOST         server IP or hostname
+      #   DEPLOY_SSH_KEY      private key whose public half is in
+      #                       ~kielikaveri/.ssh/authorized_keys, restricted
+      #                       there to scripts/deploy_entry.sh
+      #   DEPLOY_KNOWN_HOSTS  output of `ssh-keyscan <host>` - pins the host
+      #                       key instead of trusting whatever answers
+      - name: Configure ssh
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+
+      # The key's forced command (scripts/deploy_entry.sh) ignores what we ask
+      # to run and only reads the sha. If this connection drops, the deploy
+      # keeps running on the server - its log is in logs/deploy-*.log there.
+      - name: Deploy
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: >
+          ssh -i ~/.ssh/deploy_key -o BatchMode=yes
+          -o ConnectTimeout=10 -o ServerAliveInterval=15
+          -o ServerAliveCountMax=4
+          "kielikaveri@$DEPLOY_HOST" "$GITHUB_SHA"

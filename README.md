@@ -39,6 +39,8 @@ See `cards/instructions.md` for the exact algorithm and its rationale.
     the database.
 - `alembic/` - migrations for the schema above.
 - `deploy/kielikaveri.service` - systemd unit template for the bot.
+- `scripts/deploy_entry.sh`, `scripts/deploy.sh` - server side of the
+  auto-deploy (see below).
 - `scripts/backup_db.sh` - daily SQLite backup (off-server copy step not
   wired up yet - see the script).
 - `scripts/measure_coverage.py` - measures hypothesis G3 (does the FST
@@ -62,6 +64,54 @@ alembic upgrade head
 ```bash
 python -m kielikaveri.bot.main
 ```
+
+## Auto-deploy
+
+Every push to `main` runs `.github/workflows/deploy.yml`: the test suite
+first, then an ssh call to the server. The deploy key there can only run
+`scripts/deploy_entry.sh`, which checks that the sent sha is on
+`origin/main`, takes `scripts/deploy.sh` from that commit and runs it
+detached (an ssh drop doesn't kill it mid-migration; the log is in
+`logs/deploy-*.log`). `deploy.sh`: service stop, `git reset --hard`, `uv
+sync --frozen`, `backup_db.sh`, `alembic upgrade head`, service start, then
+20 seconds to check it stayed up without restarts. If any step fails the
+bot stays stopped - see the job log. Can also be started by hand from the
+Actions tab (`workflow_dispatch`, main only).
+
+Rolling back: push a revert commit. Re-running an old deploy puts old code
+on a database already migrated past it: alembic fails on the unknown
+revision and the bot stays stopped.
+
+One-time setup:
+
+1. On your machine, a dedicated key without a passphrase:
+   `ssh-keygen -t ed25519 -N "" -C kielikaveri-deploy -f deploy_key`.
+2. On the server, as root:
+   - add `deploy_key.pub` to `~kielikaveri/.ssh/authorized_keys` as
+     ```
+     restrict,command="/opt/kielikaveri/finn_cards/scripts/deploy_entry.sh" ssh-ed25519 AAAA... kielikaveri-deploy
+     ```
+     (`kielikaveri` needs a real shell, not `nologin`; the script must
+     already be in the checkout);
+   - let `kielikaveri` stop/start only the bot's service, via `visudo -f
+     /etc/sudoers.d/kielikaveri-deploy`:
+     ```
+     kielikaveri ALL=(root) NOPASSWD: /usr/bin/systemctl stop kielikaveri.service, /usr/bin/systemctl start kielikaveri.service
+     ```
+   - `usermod -aG systemd-journal kielikaveri`, so a failed deploy shows
+     the bot's journal lines;
+   - `kielikaveri` must own `/opt/kielikaveri/finn_cards`: `chown -R
+     kielikaveri:kielikaveri /opt/kielikaveri/finn_cards`. The venv has no
+     pip; `deploy.sh` uses uv from `~kielikaveri/.local/bin/uv` (override
+     with `UV=`);
+   - the Finnish FST model must live in `~kielikaveri/.uralicnlp/fin`, not
+     in `.venv/.../site-packages/uralicNLP/models/fin` - `uv sync`
+     reinstalls uralicNLP whenever its version changes in `uv.lock`, which
+     would wipe a model inside the package.
+3. On GitHub, Settings -> Environments -> new environment `production`,
+   Deployment branches limited to `main`, with secrets `DEPLOY_HOST`,
+   `DEPLOY_SSH_KEY` (contents of `deploy_key`) and `DEPLOY_KNOWN_HOSTS`
+   (output of `ssh-keyscan <host>`). Then delete the local `deploy_key`.
 
 ## Logs
 
