@@ -1,11 +1,11 @@
 name: deploy
 
+# By hand only (Actions -> deploy -> Run workflow): a deploy stops the bot,
+# so merging a PR - even a docs-only one - must not trigger one by itself.
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
-# One deploy at a time; a newer push waits for the running one instead of
+# One deploy at a time; a second run waits for the running one instead of
 # killing it halfway through a migration.
 concurrency:
   group: deploy

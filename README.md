@@ -67,18 +67,18 @@ python -m kielikaveri.bot.main
 
 ## Auto-deploy
 
-Every push to `main` runs `.github/workflows/deploy.yml`: the test suite
-first, then an ssh call to the server. The deploy key there can only run
+Started by hand: Actions -> deploy -> Run workflow, on `main` (other
+branches skip the deploy job). `.github/workflows/deploy.yml` runs the test
+suite first, then an ssh call to the server. The deploy key there can only run
 `scripts/deploy_entry.sh`, which checks that the sent sha is on
 `origin/main`, takes `scripts/deploy.sh` from that commit and runs it
 detached (an ssh drop doesn't kill it mid-migration; the log is in
 `logs/deploy-*.log`). `deploy.sh`: service stop, `git reset --hard`, `uv
 sync --frozen`, `backup_db.sh`, `alembic upgrade head`, service start, then
 20 seconds to check it stayed up without restarts. If any step fails the
-bot stays stopped - see the job log. Can also be started by hand from the
-Actions tab (`workflow_dispatch`, main only).
+bot stays stopped - see the job log.
 
-Rolling back: push a revert commit. Re-running an old deploy puts old code
+Rolling back: push a revert commit and run the deploy. Re-running an old deploy puts old code
 on a database already migrated past it: alembic fails on the unknown
 revision and the bot stays stopped.
 
