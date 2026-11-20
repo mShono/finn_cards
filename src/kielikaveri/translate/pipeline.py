@@ -13,6 +13,7 @@ token usage only (plan, "Логи").
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -368,6 +369,18 @@ def _aligned(payload: dict, expected: list[int]) -> dict[int, str]:
     return got
 
 
+def _fst_flags(paragraphs: dict[int, str], names: list[str]) -> dict[int, list[str]]:
+    """Unknown words per paragraph. Synchronous FST lookups for a whole
+    chapter take seconds - callers run this in a thread, or the bot's event
+    loop would freeze while a chapter is checked in the background."""
+    flags = {}
+    for pid, text in paragraphs.items():
+        flagged = unknown_words(text, names)
+        if flagged:
+            flags[pid] = flagged
+    return flags
+
+
 async def prepare_guide(
     client: AsyncOpenAI,
     breaker: CallBreaker,
@@ -460,10 +473,7 @@ async def translate_chapter(
 
     names = guide.names_fi
     current = dict(result.draft)
-    for pid, text in current.items():
-        flagged = unknown_words(text, names)
-        if flagged:
-            result.fst_flags[pid] = flagged
+    result.fst_flags = await asyncio.to_thread(_fst_flags, current, names)
 
     if fst:
         for ids in chapter_blocks:
@@ -546,8 +556,5 @@ async def translate_chapter(
             current.update(_aligned(answer, ids))
 
     result.final = current
-    for pid, text in current.items():
-        flagged = unknown_words(text, names)
-        if flagged:
-            result.fst_flags_final[pid] = flagged
+    result.fst_flags_final = await asyncio.to_thread(_fst_flags, current, names)
     return result
