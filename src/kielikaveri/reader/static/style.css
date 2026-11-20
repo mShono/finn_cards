@@ -1,0 +1,53 @@
+/* Colors come from Telegram's theme (telegram-web-app.js sets the
+   --tg-theme-* variables); the fallbacks are for a plain browser. */
+:root {
+  --bg: var(--tg-theme-bg-color, #ffffff);
+  --text: var(--tg-theme-text-color, #1b1b1b);
+  --hint: var(--tg-theme-hint-color, #8a8a8a);
+  --link: var(--tg-theme-link-color, #2a7ad8);
+  --accent: var(--tg-theme-button-color, #2a7ad8);
+  --accent-text: var(--tg-theme-button-text-color, #ffffff);
+  --card: var(--tg-theme-secondary-bg-color, #f2f2f4);
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 16px/1.5 -apple-system, "Roboto", "Segoe UI", sans-serif;
+}
+
+main { padding: 16px 16px 48px; max-width: 42rem; margin: 0 auto; }
+
+h1 { font-size: 1.3rem; margin: 0 0 4px; }
+h2 { font-size: 1.05rem; margin: 24px 0 8px; }
+.muted { color: var(--hint); }
+.small { font-size: 0.85rem; }
+
+.chapters { list-style: none; margin: 0; padding: 0; }
+.chapters li {
+  display: flex; justify-content: space-between; gap: 12px;
+  padding: 10px 12px; margin-bottom: 6px;
+  background: var(--card); border-radius: 10px;
+}
+.chapters li.ready { cursor: pointer; }
+.chapters .status { color: var(--hint); font-size: 0.85rem; text-align: right; }
+
+.banner {
+  background: var(--card); color: var(--hint);
+  border-radius: 10px; padding: 8px 12px; margin: 12px 0 20px;
+  font-size: 0.85rem;
+}
+
+.text p { margin: 0 0 1em; font-size: 1.1rem; line-height: 1.65; }
+/* Each word is its own span (П3 makes them tappable). */
+.text .w { border-radius: 4px; }
+
+.next { margin-top: 32px; }
+button {
+  width: 100%; padding: 12px; border: 0; border-radius: 10px;
+  background: var(--accent); color: var(--accent-text);
+  font: inherit; cursor: pointer;
+}

@@ -21,8 +21,18 @@ _WORD_RE = re.compile(r"[A-Za-zÅÄÖåäöŠšŽžÉé]+(?:[-:'’][A-Za-zÅÄ�
 _MIN_NAME_STEM = 3
 
 
+_SPLIT_RE = re.compile(f"({_WORD_RE.pattern})")
+
+
 def words(text: str) -> list[str]:
     return _WORD_RE.findall(text)
+
+
+def split_words(text: str) -> list[str]:
+    """`text` cut into [gap, word, gap, word, ..., gap]: the words sit at odd
+    indices and are exactly words(text) - what the reader wraps in tappable
+    spans, so a tap names the same word the FST check saw."""
+    return _SPLIT_RE.split(text)
 
 
 def _known(word: str, analyze: Callable[[str], list[str]]) -> bool:
