@@ -278,3 +278,85 @@ class Review(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
     rating: Mapped[int] = mapped_column()
     reviewed_at: Mapped[datetime] = mapped_column(UTCDateTime, default=lambda: datetime.now(UTC))
+
+
+class ChapterStatus(str, enum.Enum):
+    """Where a chapter is in translation (plan 2026-11-20-kirjakaveri-reader,
+    "П1"). Only chapter 1 is queued on upload; chapter N+1 is queued when
+    chapter N is opened in the reader - translating the whole book at once
+    would cost ~$20 for chapters that may never be read.
+
+        pending       stored, nobody asked for it yet
+        queued        waiting for the background translator
+        translating   in progress; back to queued on restart
+        done          fi_paragraphs ready for the reader
+        failed        `error` says why; the bot offers a retry
+    """
+
+    pending = "pending"
+    queued = "queued"
+    translating = "translating"
+    done = "done"
+    failed = "failed"
+
+
+class Book(Base):
+    """A user's own book, stored on the server on purpose - a conscious
+    exception to plan 3.9 (decided 20.11.2026). The repository is public and
+    books are copyrighted: they live in the DB only, never in the log."""
+
+    __tablename__ = "books"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    title: Mapped[str] = mapped_column(String)
+    source_lang: Mapped[str] = mapped_column(String)  # "ru" or "en"
+    # sha256 of the decoded text - the same file sent twice is recognized
+    # instead of paying for a second glossary.
+    source_hash: Mapped[str] = mapped_column(String)
+    front_matter: Mapped[list] = mapped_column(JSON)
+    # translate.pipeline.BookGuide, split as the plan names it: characters
+    # and terms here, the free-text style notes below. NULL until the guide
+    # is prepared - right before the first chapter is translated.
+    glossary: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    style_notes: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=lambda: datetime.now(UTC))
+
+    chapters: Mapped[list[BookChapter]] = relationship(
+        back_populates="book", order_by="BookChapter.number", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (Index("uq_books_user_hash", "user_id", "source_hash", unique=True),)
+
+
+class BookChapter(Base):
+    __tablename__ = "chapters"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    book_id: Mapped[str] = mapped_column(ForeignKey("books.id"))
+    # Running number across the whole book, not the one printed in the text
+    # ("Покаянные дни" restarts at 1 in every part) - the deck is named
+    # "<book> - гл.<number>" (decided 20.11.2026).
+    number: Mapped[int] = mapped_column(Integer)
+    part: Mapped[str | None] = mapped_column(String, nullable=True)
+    title: Mapped[str] = mapped_column(String)
+    # JSON lists aligned by index: fi_paragraphs[i] translates
+    # source_paragraphs[i] - what lets the reader show the original later.
+    source_paragraphs: Mapped[list] = mapped_column(JSON)
+    fi_paragraphs: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    # {paragraph index: [words]} left unknown to the FST after all steps,
+    # and the review's issues - kept for the reader, not for translation.
+    fst_flags: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    review_issues: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    status: Mapped[ChapterStatus] = mapped_column(
+        Enum(ChapterStatus, native_enum=False), default=ChapterStatus.pending, index=True
+    )
+    # Exception class and message only (RefusedError: ..., MisalignedError: ...)
+    # - never book text.
+    error: Mapped[str | None] = mapped_column(String, nullable=True)
+    opened_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    translated_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+
+    book: Mapped[Book] = relationship(back_populates="chapters")
+
+    __table_args__ = (Index("uq_chapters_book_number", "book_id", "number", unique=True),)

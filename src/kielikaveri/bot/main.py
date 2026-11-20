@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import functools
 from datetime import timedelta
 
 from aiogram import Bot, Dispatcher
@@ -8,6 +10,8 @@ from aiogram.types import BotCommand
 
 from kielikaveri.bot.add import WORDS_NOT_SAVED_TEXT, AddStates
 from kielikaveri.bot.add import router as add_router
+from kielikaveri.bot.books import router as books_router
+from kielikaveri.bot.books import send_chapter_event
 from kielikaveri.bot.decks import DeckStates
 from kielikaveri.bot.decks import router as decks_router
 from kielikaveri.bot.edit import CANCEL_WORDS, EditStates
@@ -24,7 +28,9 @@ from kielikaveri.bot.middleware import (
 from kielikaveri.config import Settings, load_settings
 from kielikaveri.db.engine import make_engine, make_session_factory
 from kielikaveri.llm.breaker import CallBreaker
+from kielikaveri.llm.client import make_client
 from kielikaveri.logging_config import setup_logging
+from kielikaveri.translate.worker import Translator
 
 # Shown behind Telegram's "/" menu button. Kept short - the persistent
 # keyboard (bot/handlers.py's MAIN_KEYBOARD) is the primary way in.
@@ -71,6 +77,8 @@ def build_dispatcher(whitelist: set[int]) -> Dispatcher:
     Callable once per process - aiogram refuses to attach a router twice.
     """
     dp = Dispatcher()
+    # bot/books.py ignores a .txt sent while one of these waits for input.
+    dp["input_states"] = INPUT_STATES
     # Registered after construction, so both run after the Dispatcher's own
     # UserContextMiddleware and can rely on event_from_user being set.
     # RequestLoggingMiddleware first - it must wrap WhitelistMiddleware to
@@ -84,6 +92,7 @@ def build_dispatcher(whitelist: set[int]) -> Dispatcher:
     dp.include_router(learn_router)
     dp.include_router(decks_router)
     dp.include_router(edit_router)
+    dp.include_router(books_router)
     # add_router last - chat_message's plain-text catch-all would otherwise
     # shadow every other router's text/state-based message handlers (e.g.
     # decks.py's DeckStates.naming prompt, edit.py's EditStates.awaiting_value
@@ -115,11 +124,32 @@ async def run(settings: Settings) -> None:
         settings.breaker_max_calls, timedelta(minutes=settings.breaker_window_minutes)
     )
 
+    # Same process, own breaker (plan 2026-11-20-kirjakaveri-reader, "Старт П1").
+    translator = Translator(
+        session_factory,
+        functools.partial(make_client, settings.openai_api_key, settings.translate_timeout_seconds),
+        settings.openai_text_model,
+        CallBreaker(
+            settings.translate_breaker_max_calls,
+            timedelta(minutes=settings.translate_breaker_window_minutes),
+        ),
+        functools.partial(send_chapter_event, bot),
+    )
+    translator_task = asyncio.create_task(translator.run(), name="translator")
+
     try:
         await dp.start_polling(
-            bot, session_factory=session_factory, settings=settings, breaker=breaker
+            bot,
+            session_factory=session_factory,
+            settings=settings,
+            breaker=breaker,
+            translator=translator,
         )
     finally:
+        # A chapter cut off here stays `translating` and is requeued on start.
+        translator_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await translator_task
         await engine.dispose()
         await bot.session.close()
 

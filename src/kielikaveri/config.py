@@ -29,6 +29,18 @@ class Settings(BaseSettings):
     breaker_max_calls: int = 60
     breaker_window_minutes: int = 10
 
+    # The background book translator (translate/worker.py) has its own
+    # breaker: one chapter is ~15 calls, glossary included, and must neither
+    # trip the bot's breaker nor be starved by it. A chapter takes minutes,
+    # so 60 calls in 10 minutes still means a retry loop, not reading.
+    translate_breaker_max_calls: int = 60
+    translate_breaker_window_minutes: int = 10
+    # A 6k-char block comes back as ~6k chars of Finnish - minutes, not the
+    # 60 s an /add reply gets.
+    translate_timeout_seconds: float = 300.0
+    # Telegram lets bots download up to 20 MB; a long novel is ~1-2 MB.
+    max_book_bytes: int = 5_000_000
+
     database_url: str = "sqlite+aiosqlite:///./kielikaveri.db"
 
     log_level: str = "INFO"

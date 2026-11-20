@@ -7,7 +7,13 @@ import pytest
 
 from kielikaveri.llm.breaker import CallBreaker
 from kielikaveri.translate import fst_check, pipeline
-from kielikaveri.translate.chapters import Chapter, read_text, split_book
+from kielikaveri.translate.chapters import (
+    Chapter,
+    UndecodableError,
+    decode_text,
+    read_text,
+    split_book,
+)
 from kielikaveri.translate.fst_check import likely_names, unknown_words
 from kielikaveri.translate.pipeline import (
     BookGuide,
@@ -78,6 +84,24 @@ def test_read_text_handles_crlf_and_cp1251(tmp_path):
 
     assert read_text(utf) == "1\n\nПривет\n"
     assert read_text(legacy) == "Привет\n"
+
+
+def test_undecodable_bytes_are_rejected():
+    with pytest.raises(UndecodableError):
+        decode_text(b"\x00\x01\x02\xff\xfe" * 400)
+
+
+def test_titled_chapters_and_part_words_are_headings():
+    book = split_book(
+        "Часть первая\n\nГлава 1. Дом\n\nТекст.\n\nPart II\n\nChapter 2: Road\n\nText.\n\n"
+        "Part of the problem was the road."
+    )
+
+    assert [(c.part, c.title) for c in book.chapters] == [
+        ("Часть первая", "Глава 1. Дом"),
+        ("Part II", "Chapter 2: Road"),
+    ]
+    assert book.chapters[1].paragraphs == ["Text.", "Part of the problem was the road."]
 
 
 KNOWN = {"hän", "meni", "kotiin", "talo", "ja"}
