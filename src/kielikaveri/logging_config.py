@@ -25,6 +25,26 @@ from kielikaveri import logging_context  # noqa: F401
 # real "httpx" package is still a dependency but unused by the SDK itself.
 _NOISY_LOGGERS = ("httpx", "httpx2", "openai", "aiogram")
 
+# Kept above DEBUG even when the app runs at DEBUG: aiosqlite logs every
+# queued call with its untruncated SQL parameters - twice - so a stored book
+# chapter would land in the log four times (audit 20.11.2026, reader plan
+# "Логи"). SQLAlchemy's own statement lines show the same SQL anyway.
+_TEXT_LEAKING_LOGGERS = ("aiosqlite",)
+
+
+class DropRequestBodies(logging.Filter):
+    """openai at DEBUG logs "Request options: ..." with the whole prompt,
+    once per retry attempt. Only that record is dropped - retries,
+    request_id and status lines stay, they're what API failures need.
+
+    On the handlers, not the "openai" logger: a logger's filters don't see
+    records from its children ("openai._base_client")."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not (
+            record.name.startswith("openai") and str(record.msg).startswith("Request options")
+        )
+
 
 def setup_logging(log_level: str = "INFO", log_file: str = "") -> None:
     root = logging.getLogger()
@@ -34,6 +54,7 @@ def setup_logging(log_level: str = "INFO", log_file: str = "") -> None:
     root.handlers.clear()
 
     console_handler = logging.StreamHandler()
+    console_handler.addFilter(DropRequestBodies())
     console_handler.setFormatter(
         logging.Formatter("%(levelname)s %(name)s: trace=%(trace_id)s %(message)s")
     )
@@ -45,6 +66,7 @@ def setup_logging(log_level: str = "INFO", log_file: str = "") -> None:
         file_handler = TimedRotatingFileHandler(
             path, when="midnight", backupCount=14, encoding="utf-8"
         )
+        file_handler.addFilter(DropRequestBodies())
         file_handler.setFormatter(
             logging.Formatter("%(asctime)s %(levelname)s %(name)s: trace=%(trace_id)s %(message)s")
         )
@@ -53,3 +75,5 @@ def setup_logging(log_level: str = "INFO", log_file: str = "") -> None:
     if log_level != "DEBUG":
         for name in _NOISY_LOGGERS:
             logging.getLogger(name).setLevel(logging.WARNING)
+    for name in _TEXT_LEAKING_LOGGERS:
+        logging.getLogger(name).setLevel(logging.INFO)
