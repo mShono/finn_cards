@@ -2,6 +2,7 @@ import logging
 
 import pytest
 
+from kielikaveri.db.engine import make_engine
 from kielikaveri.logging_config import setup_logging
 
 
@@ -11,7 +12,8 @@ def restore_logging_state():
     handlers_before = list(root.handlers)
     level_before = root.level
     noisy_levels_before = {
-        name: logging.getLogger(name).level for name in ("httpx", "httpx2", "openai", "aiogram")
+        name: logging.getLogger(name).level
+        for name in ("httpx", "httpx2", "openai", "aiogram", "aiosqlite")
     }
     yield
     root.handlers[:] = handlers_before
@@ -70,3 +72,43 @@ def test_rerunning_setup_does_not_stack_handlers(tmp_path):
     setup_logging("INFO", log_file)
 
     assert len(logging.getLogger().handlers) == 2
+
+
+def test_aiosqlite_stays_quiet_even_at_debug(tmp_path):
+    setup_logging("DEBUG", str(tmp_path / "kielikaveri.log"))
+
+    assert not logging.getLogger("aiosqlite").isEnabledFor(logging.DEBUG)
+
+
+def test_openai_request_body_is_dropped_but_other_openai_lines_stay(tmp_path):
+    log_file = tmp_path / "kielikaveri.log"
+    setup_logging("DEBUG", str(log_file))
+    client_log = logging.getLogger("openai._base_client")
+
+    client_log.debug("Request options: %s", {"input": "SECRET BOOK TEXT"})
+    client_log.debug("request_id: %s", "req_123")
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+
+    written = log_file.read_text(encoding="utf-8")
+    assert "SECRET BOOK TEXT" not in written
+    assert "req_123" in written
+
+
+async def test_sql_parameters_stay_out_of_logs_when_sql_logging_is_on(tmp_path, caplog):
+    from sqlalchemy import text
+
+    # SQLAlchemy pins its own logger to WARNING on import, so root DEBUG
+    # alone logs no SQL; this is someone switching statement logging on.
+    caplog.set_level(logging.INFO, logger="sqlalchemy.engine")
+    engine = make_engine(f"sqlite+aiosqlite:///{tmp_path / 'db.sqlite'}")
+    async with engine.begin() as conn:
+        await conn.execute(text("create table t (body text)"))
+        await conn.execute(text("insert into t values (:b)"), {"b": "SECRET CHAPTER"})
+    await engine.dispose()
+
+    logged = "\n".join(
+        record.getMessage() for record in caplog.records if record.name.startswith("sqlalchemy")
+    )
+    assert "insert into t" in logged  # the statement itself is still visible
+    assert "SECRET CHAPTER" not in logged

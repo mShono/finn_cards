@@ -6,7 +6,10 @@ from kielikaveri.db.models import Base
 
 
 def make_engine(database_url: str):
-    return create_async_engine(database_url)
+    # Bound values (message texts, book chapters) stay out of exception
+    # messages and out of the log if SQL statement logging is ever switched
+    # on - the SQL itself stays readable.
+    return create_async_engine(database_url, hide_parameters=True)
 
 
 def make_session_factory(engine) -> async_sessionmaker[AsyncSession]:
