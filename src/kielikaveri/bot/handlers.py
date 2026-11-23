@@ -3,7 +3,16 @@ from __future__ import annotations
 from aiogram import Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
-from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+    WebAppInfo,
+)
+
+from kielikaveri.config import Settings
 
 router = Router(name="core")
 
@@ -39,8 +48,34 @@ async def help_(message: Message) -> None:
         "/start - поздороваться\n"
         "/help - эта справка\n"
         "/learn - повторить карточки, которым пора\n"
+        "/read - открыть читалку книг\n"
         "/decks - список колод, создать новую, посмотреть и поправить карточки\n"
         "/add <текст> - то же самое, что просто написать текст в чат\n"
         "/delete <слово> - удалить слово из колоды\n\n"
         "Пришли книгу файлом .txt - переведу её на финский по главам."
+    )
+
+
+READER_NOT_CONFIGURED_TEXT = "Читалка не настроена."
+
+
+@router.message(Command("read"))
+async def read(message: Message, settings: Settings) -> None:
+    if not settings.reader_url:
+        await message.answer(READER_NOT_CONFIGURED_TEXT)
+        return
+    # An inline button, not a reply-keyboard one: a Mini App opened from a
+    # keyboard button gets no signed initData (sendData only), and
+    # reader/auth.py needs it. Inline and menu buttons both pass it.
+    await message.answer(
+        "Открываю читалку:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="📖 Открыть читалку", web_app=WebAppInfo(url=settings.reader_url)
+                    )
+                ]
+            ]
+        ),
     )

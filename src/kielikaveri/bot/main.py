@@ -6,7 +6,7 @@ import functools
 from datetime import timedelta
 
 from aiogram import Bot, Dispatcher
-from aiogram.types import BotCommand, MenuButtonDefault, MenuButtonWebApp, WebAppInfo
+from aiogram.types import BotCommand, MenuButtonCommands
 from aiohttp import web
 
 from kielikaveri.bot.add import WORDS_NOT_SAVED_TEXT, AddStates
@@ -35,9 +35,11 @@ from kielikaveri.reader.app import make_app
 from kielikaveri.translate.worker import Translator
 
 # Shown behind Telegram's "/" menu button. Kept short - the persistent
-# keyboard (bot/handlers.py's MAIN_KEYBOARD) is the primary way in.
+# keyboard (bot/handlers.py's MAIN_KEYBOARD) is the primary way in; /read is
+# the reader's only entry point (see bot/handlers.py's read).
 BOT_COMMANDS = [
     BotCommand(command="learn", description="Повторить карточки"),
+    BotCommand(command="read", description="📖 Читать"),
     BotCommand(command="add", description="Добавить слова из текста"),
     BotCommand(command="delete", description="Удалить слово"),
     BotCommand(command="decks", description="Колоды"),
@@ -70,6 +72,15 @@ def drops_unsaved_words(raw_state: str | None, text: str) -> bool:
         command = text.split(maxsplit=1)[0].split("@")[0] if text.startswith("/") else ""
         return command in PICKER_BREAKERS
     return False
+
+
+async def set_up_menu(bot: Bot) -> None:
+    """The commands list and the menu button that shows it."""
+    await bot.set_my_commands(BOT_COMMANDS)
+    # Always the commands button: a Mini App button here would replace the
+    # command list. The reader opens from /read's inline button instead. Set
+    # explicitly, so a WebApp button left by an older deploy is undone.
+    await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
 
 
 def build_dispatcher(whitelist: set[int]) -> Dispatcher:
@@ -113,7 +124,7 @@ async def run(settings: Settings) -> None:
         raise RuntimeError("WHITELIST_USER_IDS is not set - see .env.example")
 
     bot = Bot(token=settings.bot_token)
-    await bot.set_my_commands(BOT_COMMANDS)
+    await set_up_menu(bot)
     dp = build_dispatcher(settings.whitelist)
 
     # Schema is managed by alembic (`alembic upgrade head`), not created here.
@@ -148,13 +159,6 @@ async def run(settings: Settings) -> None:
     reader = web.AppRunner(make_app(session_factory, settings, translator), access_log=None)
     await reader.setup()
     await web.TCPSite(reader, settings.reader_host, settings.reader_port).start()
-    # A menu button, not a keyboard one: only the menu button gives the
-    # Mini App the signed initData that reader/auth.py checks.
-    await bot.set_chat_menu_button(
-        menu_button=MenuButtonWebApp(text="📖 Читать", web_app=WebAppInfo(url=settings.reader_url))
-        if settings.reader_url
-        else MenuButtonDefault()
-    )
     # Logs at once if the loop ever dies (plan 2026-11-20-kirjakaveri-reader, И1).
     translator_task = translator.start()
 
