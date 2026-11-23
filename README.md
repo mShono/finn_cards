@@ -41,8 +41,9 @@ See `cards/instructions.md` for the exact algorithm and its rationale.
 - `deploy/kielikaveri.service` - systemd unit template for the bot.
 - `scripts/deploy_entry.sh`, `scripts/deploy.sh` - server side of the
   auto-deploy (see below).
-- `scripts/backup_db.sh` - daily SQLite backup (off-server copy step not
-  wired up yet - see the script).
+- `scripts/backup_db.sh` - nightly SQLite backup on the server;
+  `scripts/pull_backup.sh` - pulls the newest one to your own machine
+  (see "Backups" below).
 - `scripts/measure_coverage.py` - measures hypothesis G3 (does the FST
   cover the forms we need without LLM help) on a curated word list.
 
