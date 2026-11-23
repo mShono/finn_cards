@@ -95,11 +95,16 @@ async def queue_chapter(session: AsyncSession, chapter_id: str) -> bool:
 async def mark_opened(session: AsyncSession, chapter: BookChapter) -> BookChapter | None:
     """The reader's one signal to the translator: chapter N is being read,
     so N+1 goes into the queue and is ready by the time N is finished.
-    Returns the chapter that was queued, if any."""
+    Returns the chapter that was queued, if any.
+
+    Only a pending N+1 is queued: a failed one waits for the "retry" button,
+    otherwise every reopening of N would pay for another doomed attempt."""
     if chapter.opened_at is None:
         chapter.opened_at = datetime.now(UTC)
     following = await chapter_by_number(session, chapter.book_id, chapter.number + 1)
-    if following is not None and await queue_chapter(session, following.id):
+    if following is not None and await _move(
+        session, following.id, {ChapterStatus.pending}, ChapterStatus.queued
+    ):
         return following
     return None
 
