@@ -197,9 +197,21 @@ hand, deploys don't touch it):
 }
 ```
 
-Ports 80 and 443 must be open (Let's Encrypt). With `READER_URL=https://46-62-147-103.sslip.io/`
-in `.env` the bot sets its menu button to "📖 Читать" on start; empty
-`READER_URL` restores the default commands button.
+Ports 80 and 443 must be open (Let's Encrypt). Set `READER_URL=https://46-62-147-103.sslip.io/`
+in `.env`.
+
+The reader opens via `/read` ("📖 Читать" in the commands menu): the bot
+replies with an inline "📖 Открыть читалку" button that launches the Mini App.
+Empty `READER_URL` makes `/read` answer "Читалка не настроена.". Why not a
+WebApp menu button or a keyboard button: a WebApp menu button would replace
+the commands menu, and a Mini App opened from a reply-keyboard button gets no
+signed initData (only `sendData`), which `reader/auth.py` requires - inline
+buttons do get it.
+
+On every start the bot re-registers its commands and sets the menu button
+to the commands list, so after a deploy the old "📖 Читать" WebApp button
+switches back automatically (Telegram may need the chat reopened to show it),
+and `/read` appears in the menu after the restart.
 
 ## Logs
 
