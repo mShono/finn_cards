@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Daily SQLite backup - meant to run from cron on the Hetzner server, and run
 # by scripts/deploy.sh before every migration.
-# Off-server copy destination is not wired up yet: pick one (private S3
-# bucket via rclone/aws-cli, or pull nightly from your own machine over
-# ssh/scp) and add that step below - not decided/configured yet.
+# The copies here live on the same disk as the database. The off-server copy
+# is pulled from your own machine by scripts/pull_backup.sh (see "Backups" in
+# README.md); nothing is pushed from here.
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
