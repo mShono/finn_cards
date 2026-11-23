@@ -25,7 +25,8 @@ class Settings(BaseSettings):
 
     # Plan 3.8 point 3: the in-process circuit breaker. More calls than this
     # within the window always means a bug (a human can't drive it by hand),
-    # so it trips and stops hitting the API until restart.
+    # so it trips. The window is rolling: calls go through again once the
+    # old ones age out of it - it caps the rate, not the total.
     breaker_max_calls: int = 60
     breaker_window_minutes: int = 10
 
@@ -35,6 +36,12 @@ class Settings(BaseSettings):
     # so 60 calls in 10 minutes still means a retry loop, not reading.
     translate_breaker_max_calls: int = 60
     translate_breaker_window_minutes: int = 10
+    # The total the rate window can't cap: rolling 24 hours, ~10 chapters.
+    # Past it every chapter fails with "try tomorrow" until calls age out.
+    translate_daily_max_calls: int = 150
+    # Each SDK retry of a timed-out 300 s request may be billed, and the
+    # breaker sees only one check for all of them - fewer than the bot's 3.
+    translate_max_retries: int = 1
     # A 6k-char block comes back as ~6k chars of Finnish - minutes, not the
     # 60 s an /add reply gets.
     translate_timeout_seconds: float = 300.0
