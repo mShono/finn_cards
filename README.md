@@ -41,8 +41,9 @@ See `cards/instructions.md` for the exact algorithm and its rationale.
 - `deploy/kielikaveri.service` - systemd unit template for the bot.
 - `scripts/deploy_entry.sh`, `scripts/deploy.sh` - server side of the
   auto-deploy (see below).
-- `scripts/backup_db.sh` - daily SQLite backup (off-server copy step not
-  wired up yet - see the script).
+- `scripts/backup_db.sh` - nightly SQLite backup on the server;
+  `scripts/pull_backup.sh` - pulls the newest one to your own machine
+  (see "Backups" below).
 - `scripts/measure_coverage.py` - measures hypothesis G3 (does the FST
   cover the forms we need without LLM help) on a curated word list.
 
@@ -112,6 +113,75 @@ One-time setup:
    Deployment branches limited to `main`, with secrets `DEPLOY_HOST`,
    `DEPLOY_SSH_KEY` (contents of `deploy_key`) and `DEPLOY_KNOWN_HOSTS`
    (output of `ssh-keyscan <host>`). Then delete the local `deploy_key`.
+
+## Backups
+
+**The backups contain the book text** (and all cards and review history).
+Keep them on the server and on your own machine only: never in git, never
+in a cloud folder or chat. `*.db` is in `.gitignore`, and `pull_backup.sh`
+refuses a destination inside a git repo.
+
+Two pieces:
+
+- `scripts/backup_db.sh`, on the server: `sqlite3 .backup` into
+  `backups/kielikaveri-<UTC timestamp>.db`, deletes copies older than 14
+  days (`KEEP_DAYS`). `deploy.sh` runs it before every migration; a nightly
+  run comes from cron.
+- `scripts/pull_backup.sh`, on your machine (WSL): fetches the newest of
+  those files over your normal ssh login (not the deploy key - it can only
+  run `deploy_entry.sh`), checks it with `PRAGMA integrity_check`, keeps
+  the last 14 copies (`-k`) in `~/kielikaveri-backups` (`-d`). Host and
+  user come from arguments or `BACKUP_SSH_HOST`/`BACKUP_SSH_USER`; see
+  `scripts/pull_backup.sh -h`. A failed fetch or check exits nonzero and
+  leaves the existing copies alone.
+
+Server, as root, once:
+
+```bash
+command -v sqlite3 || apt install sqlite3
+crontab -e -u kielikaveri
+# add (server local time, see `timedatectl`):
+# 30 3 * * * cd /opt/kielikaveri/finn_cards && scripts/backup_db.sh >> logs/backup.log 2>&1
+crontab -l -u kielikaveri
+```
+
+The next morning `ls -l /opt/kielikaveri/finn_cards/backups/` shows a fresh
+file and `logs/backup.log` ends with `Backed up ...`.
+
+Your machine, once:
+
+```bash
+sudo apt install sqlite3
+scripts/pull_backup.sh <user>@<host>   # by hand first: accepts the host key, shows errors
+```
+
+It runs with ssh `BatchMode=yes`, so a scheduled run needs a key that works
+without typing anything (no passphrase, or one already in a running agent).
+
+Schedule, one of:
+
+- **cron in WSL.** WSL doesn't start services by itself: either enable
+  systemd (`[boot]` / `systemd=true` in `/etc/wsl.conf`, then `wsl
+  --shutdown` from Windows and `sudo systemctl enable --now cron`) or run
+  `sudo service cron start` after every WSL start. Cron only fires while
+  the WSL VM is running, and a missed run is not repeated. `crontab -e`:
+  ```
+  0 9 * * * BACKUP_SSH_HOST=<host> BACKUP_SSH_USER=<user> $HOME/development/finn_cards/scripts/pull_backup.sh >> $HOME/kielikaveri-backups/pull.log 2>&1
+  ```
+- **Windows Task Scheduler** (also starts WSL itself). New task, daily
+  trigger, "Run task as soon as possible after a scheduled start is
+  missed" on, action `wsl.exe` with arguments
+  ```
+  -d <distro> -- bash -lc "BACKUP_SSH_HOST=<host> BACKUP_SSH_USER=<user> ~/development/finn_cards/scripts/pull_backup.sh >> ~/kielikaveri-backups/pull.log 2>&1"
+  ```
+  (`wsl -l` lists distro names).
+
+Check now and then: `tail ~/kielikaveri-backups/pull.log` and `ls -l
+~/kielikaveri-backups` - the newest file should be at most a day old.
+
+Restoring: stop the service, copy the backup over the database file (the
+one `DATABASE_URL` points to, `kielikaveri.db` in the checkout by default),
+`chown kielikaveri:kielikaveri` it, start the service.
 
 ## Reader Mini App
 
