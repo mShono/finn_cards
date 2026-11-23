@@ -27,6 +27,7 @@ from datetime import UTC, datetime
 import openai
 from openai import AsyncOpenAI
 from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from kielikaveri.db.books import claim_next, reset_interrupted
@@ -47,6 +48,14 @@ _ERROR_CHARS = 500
 # After an unexpected failure of the loop itself (not of a chapter) - a DB
 # error that repeats must not spin.
 _LOOP_ERROR_PAUSE_SECONDS = 60
+# The final write of a chapter: its translation is already paid for, so a
+# "database is locked" there is retried before the result is given up.
+_STORE_ATTEMPTS = 3
+_STORE_RETRY_SECONDS = 2
+
+
+class _ChapterGone(Exception):
+    """The chapter or its book was deleted while the chapter was translating."""
 
 
 @dataclass
@@ -72,6 +81,23 @@ def _guide(book: Book) -> BookGuide | None:
     return BookGuide(book.glossary["characters"], book.glossary["terms"], book.style_notes or "")
 
 
+def log_task_death(task: asyncio.Task) -> None:
+    """Done-callback for the translator task: it is never awaited until
+    shutdown, so without this its death would stay silent until then."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is None:
+        logger.error("event=translate.task_died task=%s reason=returned", task.get_name())
+    else:
+        logger.error(
+            "event=translate.task_died task=%s error=%s",
+            task.get_name(),
+            type(exc).__name__,
+            exc_info=exc,
+        )
+
+
 class Translator:
     def __init__(
         self,
@@ -91,6 +117,12 @@ class Translator:
     def wake(self) -> None:
         """Call after queueing a chapter; the loop otherwise sleeps."""
         self._wake.set()
+
+    def start(self) -> asyncio.Task:
+        """Run the loop as a task whose unexpected end is logged at once."""
+        task = asyncio.create_task(self.run(), name="translator")
+        task.add_done_callback(log_task_death)
+        return task
 
     async def run(self) -> None:
         async with self._session_factory() as session:
@@ -112,16 +144,22 @@ class Translator:
             if chapter_id is None:
                 await self._wake.wait()
                 continue
-            await self.translate_one(chapter_id)
+            try:
+                await self.translate_one(chapter_id)
+            except Exception:
+                logger.exception("event=translate.loop_error chapter_id=%s", chapter_id)
+                await asyncio.sleep(_LOOP_ERROR_PAUSE_SECONDS)
 
     async def translate_one(self, chapter_id: str) -> None:
-        """Translate a chapter already moved to `translating`. Never raises
-        (except cancellation): the loop must outlive any one chapter."""
+        """Translate a chapter already moved to `translating`. A chapter or
+        book deleted meanwhile is skipped. Only a DB error while reading the
+        chapter escapes (run() catches it) - and cancellation."""
         async with self._session_factory() as session:
             chapter = await session.get(BookChapter, chapter_id)
-            if chapter is None:
+            book = None if chapter is None else await session.get(Book, chapter.book_id)
+            if book is None:
+                logger.info("event=translate.chapter_gone chapter_id=%s stage=start", chapter_id)
                 return
-            book = await session.get(Book, chapter.book_id)
             event = ChapterEvent(
                 book.user_id, book.title, chapter.id, chapter.number, ChapterStatus.failed
             )
@@ -159,6 +197,8 @@ class Translator:
                 )
                 async with self._session_factory() as session:
                     stored = await session.get(Book, book.id)
+                    if stored is None:
+                        raise _ChapterGone
                     stored.glossary = {"characters": guide.characters, "terms": guide.terms}
                     stored.style_notes = guide.style_notes
                     await session.commit()
@@ -173,6 +213,9 @@ class Translator:
             )
         except asyncio.CancelledError:
             raise
+        except _ChapterGone:
+            logger.info("event=translate.chapter_gone chapter_id=%s stage=guide", chapter_id)
+            return
         except (TranslationError, CircuitOpenError, openai.APIError) as exc:
             event.error = _error_text(exc)
             logger.warning(
@@ -189,18 +232,7 @@ class Translator:
         else:
             event.status = ChapterStatus.done
 
-        async with self._session_factory() as session:
-            stored = await session.get(BookChapter, chapter_id)
-            stored.status = event.status
-            stored.error = event.error
-            if event.status is ChapterStatus.done:
-                stored.fi_paragraphs = [result.final[i] for i in range(len(source.paragraphs))]
-                # JSON object keys are strings anyway - made explicit here.
-                stored.fst_flags = {str(k): v for k, v in result.fst_flags_final.items()}
-                stored.review_issues = [asdict(issue) for issue in result.issues]
-                stored.translated_at = datetime.now(UTC)
-            await session.commit()
-
+        # Before the write: the tokens are spent whether or not it succeeds.
         steps = usage.steps.values()
         logger.info(
             "event=translate.chapter_end book_id=%s chapter=%d status=%s calls=%d "
@@ -213,7 +245,58 @@ class Translator:
             sum(s.output_tokens for s in steps),
             int(sum(s.seconds for s in steps)),
         )
+
+        values: dict = {"status": event.status, "error": event.error}
+        if event.status is ChapterStatus.done:
+            values.update(
+                fi_paragraphs=[result.final[i] for i in range(len(source.paragraphs))],
+                # JSON object keys are strings anyway - made explicit here.
+                fst_flags={str(k): v for k, v in result.fst_flags_final.items()},
+                review_issues=[asdict(issue) for issue in result.issues],
+                translated_at=datetime.now(UTC),
+            )
+        try:
+            stored = await self._store(chapter_id, values)
+        except OperationalError as exc:
+            # Type only: the statement's parameters in str(exc) carry the text.
+            # The chapter stays `translating` and is requeued on restart.
+            logger.error(
+                "event=translate.store_failed chapter_id=%s status=%s error=%s",
+                chapter_id,
+                event.status.value,
+                type(exc).__name__,
+            )
+            return
+        if not stored:
+            logger.info("event=translate.chapter_gone chapter_id=%s stage=store", chapter_id)
+            return
+
         try:
             await self._notify(event)
         except Exception:
             logger.exception("event=translate.notify_failed chapter_id=%s", chapter_id)
+
+    async def _store(self, chapter_id: str, values: dict) -> bool:
+        """Write the chapter's outcome; False if the chapter is gone. Retries
+        OperationalError (database is locked) and re-raises the last one."""
+        for attempt in range(1, _STORE_ATTEMPTS + 1):
+            try:
+                async with self._session_factory() as session:
+                    stored = await session.get(BookChapter, chapter_id)
+                    if stored is None:
+                        return False
+                    for name, value in values.items():
+                        setattr(stored, name, value)
+                    await session.commit()
+                    return True
+            except OperationalError as exc:
+                if attempt == _STORE_ATTEMPTS:
+                    raise
+                logger.warning(
+                    "event=translate.store_retry chapter_id=%s attempt=%d error=%s",
+                    chapter_id,
+                    attempt,
+                    type(exc).__name__,
+                )
+                await asyncio.sleep(_STORE_RETRY_SECONDS)
+        raise AssertionError("unreachable")
