@@ -113,6 +113,24 @@ One-time setup:
    `DEPLOY_SSH_KEY` (contents of `deploy_key`) and `DEPLOY_KNOWN_HOSTS`
    (output of `ssh-keyscan <host>`). Then delete the local `deploy_key`.
 
+## Reader Mini App
+
+The bot process also serves the reader (`kielikaveri/reader/`) on
+`READER_HOST:READER_PORT`, `127.0.0.1:8080` by default. Telegram opens Mini
+Apps over HTTPS only, so Caddy runs in front of it on the server (set up by
+hand, deploys don't touch it):
+
+```
+# /etc/caddy/Caddyfile
+46-62-147-103.sslip.io {
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
+Ports 80 and 443 must be open (Let's Encrypt). With `READER_URL=https://46-62-147-103.sslip.io/`
+in `.env` the bot sets its menu button to "📖 Читать" on start; empty
+`READER_URL` restores the default commands button.
+
 ## Logs
 
 Logs go to stdout (captured by `journalctl -u kielikaveri` under systemd)

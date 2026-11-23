@@ -41,6 +41,17 @@ class Settings(BaseSettings):
     # Telegram lets bots download up to 20 MB; a long novel is ~1-2 MB.
     max_book_bytes: int = 5_000_000
 
+    # The reader Mini App (plan 2026-11-20-kirjakaveri-reader, "П2"). The
+    # aiohttp app listens on localhost only; Caddy in front of it holds the
+    # HTTPS certificate. READER_URL is the public https address the menu
+    # button opens - empty leaves Telegram's default menu button.
+    reader_url: str = ""
+    reader_host: str = "127.0.0.1"
+    reader_port: int = 8080
+    # Telegram signs initData once, when the Mini App opens. Older than this
+    # is refused - a day covers a long reading session.
+    reader_init_data_max_age_hours: int = 24
+
     database_url: str = "sqlite+aiosqlite:///./kielikaveri.db"
 
     log_level: str = "INFO"

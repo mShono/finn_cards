@@ -6,7 +6,8 @@ import functools
 from datetime import timedelta
 
 from aiogram import Bot, Dispatcher
-from aiogram.types import BotCommand
+from aiogram.types import BotCommand, MenuButtonDefault, MenuButtonWebApp, WebAppInfo
+from aiohttp import web
 
 from kielikaveri.bot.add import WORDS_NOT_SAVED_TEXT, AddStates
 from kielikaveri.bot.add import router as add_router
@@ -30,6 +31,7 @@ from kielikaveri.db.engine import make_engine, make_session_factory
 from kielikaveri.llm.breaker import CallBreaker
 from kielikaveri.llm.client import make_client
 from kielikaveri.logging_config import setup_logging
+from kielikaveri.reader.app import make_app
 from kielikaveri.translate.worker import Translator
 
 # Shown behind Telegram's "/" menu button. Kept short - the persistent
@@ -135,6 +137,18 @@ async def run(settings: Settings) -> None:
         ),
         functools.partial(send_chapter_event, bot),
     )
+    # The reader (plan 2026-11-20-kirjakaveri-reader, "П2"). aiohttp's own
+    # access log is off: reader/app.py logs each request without headers.
+    reader = web.AppRunner(make_app(session_factory, settings, translator), access_log=None)
+    await reader.setup()
+    await web.TCPSite(reader, settings.reader_host, settings.reader_port).start()
+    # A menu button, not a keyboard one: only the menu button gives the
+    # Mini App the signed initData that reader/auth.py checks.
+    await bot.set_chat_menu_button(
+        menu_button=MenuButtonWebApp(text="📖 Читать", web_app=WebAppInfo(url=settings.reader_url))
+        if settings.reader_url
+        else MenuButtonDefault()
+    )
     translator_task = asyncio.create_task(translator.run(), name="translator")
 
     try:
@@ -150,6 +164,7 @@ async def run(settings: Settings) -> None:
         translator_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await translator_task
+        await reader.cleanup()
         await engine.dispose()
         await bot.session.close()
 
