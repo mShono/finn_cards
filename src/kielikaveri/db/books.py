@@ -38,13 +38,22 @@ async def find_book(session: AsyncSession, user_id: int, source_hash: str) -> Bo
 
 
 async def store_book(
-    session: AsyncSession, user_id: int, title: str, text: str, book: parsed.Book
+    session: AsyncSession,
+    user_id: int,
+    title: str,
+    text: str,
+    book: parsed.Book,
+    *,
+    source_lang: str | None = None,
+    source_hash: str | None = None,
 ) -> Book:
+    """source_lang and source_hash may come precomputed - the bot works them
+    out off the event loop together with the parsing."""
     row = Book(
         user_id=user_id,
         title=title,
-        source_lang=detect_lang(text),
-        source_hash=text_hash(text),
+        source_lang=source_lang or detect_lang(text),
+        source_hash=source_hash or text_hash(text),
         front_matter=book.front_matter,
     )
     session.add(row)
@@ -66,6 +75,31 @@ async def store_book(
 async def delete_book(session: AsyncSession, book_id: str) -> None:
     await session.execute(delete(BookChapter).where(BookChapter.book_id == book_id))
     await session.execute(delete(Book).where(Book.id == book_id))
+
+
+async def delete_unstarted_book(session: AsyncSession, book_id: str, user_id: int) -> bool:
+    """Deletes the book only while every chapter is still pending - the
+    check and the delete are the same statements, so a "yes" landing
+    in between can't lose a queued chapter. False if nothing was deleted
+    (not this user's book, or translation has started).
+
+    Chapters go first (books.id has no ON DELETE CASCADE); decks made from
+    a chapter keep their cards, decks.chapter_id is SET NULL by its FK."""
+    started = (
+        select(BookChapter.id)
+        .where(BookChapter.book_id == book_id, BookChapter.status != ChapterStatus.pending)
+        .exists()
+    )
+    owned = select(Book.id).where(Book.id == book_id, Book.user_id == user_id).exists()
+    await session.execute(
+        delete(BookChapter).where(BookChapter.book_id == book_id, owned, ~started)
+    )
+    # Gone only if its chapters are: a started book keeps them all.
+    left = select(BookChapter.id).where(BookChapter.book_id == book_id).exists()
+    result = await session.execute(
+        delete(Book).where(Book.id == book_id, Book.user_id == user_id, ~left)
+    )
+    return result.rowcount == 1
 
 
 async def chapter_by_number(session: AsyncSession, book_id: str, number: int) -> BookChapter | None:

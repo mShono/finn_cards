@@ -74,14 +74,23 @@ _LEGACY_ENCODINGS = ["cp1251", "koi8_r", "cp866", "mac_cyrillic", "iso8859_5", "
 
 def decode_text(raw: bytes) -> str:
     """UTF-8 first - it never decodes non-UTF-8 Cyrillic by accident; anything
-    else (cp1251, koi8-r from older sources) is left to charset-normalizer."""
-    try:
-        text = raw.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        best = from_bytes(raw, cp_isolation=_LEGACY_ENCODINGS).best()
-        if best is None:
-            raise UndecodableError("not a text file in any known encoding") from None
-        text = str(best)
+    else (cp1251, koi8-r from older sources) is left to charset-normalizer.
+
+    UTF-16 with a BOM (Windows Notepad's "Unicode") is taken by its BOM before
+    either: charset-normalizer can mistake its NUL-heavy bytes for binary."""
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        try:
+            text = raw.decode("utf-16")
+        except UnicodeDecodeError:
+            raise UndecodableError("broken UTF-16 after a byte order mark") from None
+    else:
+        try:
+            text = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            best = from_bytes(raw, cp_isolation=_LEGACY_ENCODINGS).best()
+            if best is None:
+                raise UndecodableError("not a text file in any known encoding") from None
+            text = str(best)
     return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
