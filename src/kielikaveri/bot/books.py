@@ -82,6 +82,9 @@ def failure_reason(error: str | None) -> str:
         return "модель отказалась переводить этот фрагмент"
     if kind == "MisalignedError":
         return "в переводе потерялись абзацы"
+    # Before CircuitOpenError: a subclass, and the wait is a day, not minutes.
+    if kind == "BudgetExceededError":
+        return "дневной лимит переводов исчерпан, нажми 🔁 завтра"
     if kind == "CircuitOpenError":
         return "слишком много обращений к OpenAI подряд, сработал предохранитель"
     return "ошибка при переводе"

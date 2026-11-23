@@ -129,11 +129,17 @@ async def run(settings: Settings) -> None:
     # Same process, own breaker (plan 2026-11-20-kirjakaveri-reader, "Старт П1").
     translator = Translator(
         session_factory,
-        functools.partial(make_client, settings.openai_api_key, settings.translate_timeout_seconds),
+        functools.partial(
+            make_client,
+            settings.openai_api_key,
+            settings.translate_timeout_seconds,
+            max_retries=settings.translate_max_retries,
+        ),
         settings.openai_text_model,
         CallBreaker(
             settings.translate_breaker_max_calls,
             timedelta(minutes=settings.translate_breaker_window_minutes),
+            daily_max_calls=settings.translate_daily_max_calls,
         ),
         functools.partial(send_chapter_event, bot),
     )

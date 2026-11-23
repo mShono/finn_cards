@@ -8,6 +8,9 @@ rather than reimplementing it - a 400 (bad request, schema violation) is
 never retried, since the same request would just fail the same way again,
 and blind retries on a non-transient error is the textbook way to build the
 budget-burning loop plan 3.8 exists to prevent.
+
+The book translator passes fewer: its breaker counts one check per logical
+call, and each SDK retry of a 300 s request may be billed on OpenAI's side.
 """
 
 from __future__ import annotations
@@ -15,5 +18,5 @@ from __future__ import annotations
 from openai import AsyncOpenAI
 
 
-def make_client(api_key: str, timeout_seconds: float) -> AsyncOpenAI:
-    return AsyncOpenAI(api_key=api_key, max_retries=3, timeout=timeout_seconds)
+def make_client(api_key: str, timeout_seconds: float, max_retries: int = 3) -> AsyncOpenAI:
+    return AsyncOpenAI(api_key=api_key, max_retries=max_retries, timeout=timeout_seconds)
