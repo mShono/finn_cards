@@ -9,13 +9,16 @@ always means a bug, not real usage.
 The rate window is rolling: once old calls age out, calls go through again.
 So a slow loop that stays under the rate limit could still run all day -
 the optional daily cap (a rolling 24 hours) bounds the total, which matters
-for the book translator, where every chapter is real money.
+for the book translator, where every chapter is real money. The daily
+window lives in memory, so after a restart the translator seeds it with the
+calls of the chapters it finished in the last 24 hours (seed_daily).
 """
 
 from __future__ import annotations
 
 import logging
 from collections import deque
+from collections.abc import Iterable
 from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
@@ -40,6 +43,9 @@ class CallBreaker:
         self._daily_max_calls = daily_max_calls
         self._calls: deque[datetime] = deque()
         self._day_calls: deque[datetime] = deque()
+        # Every call let through since start - a caller diffs it around a
+        # unit of work to learn how many calls that work made.
+        self.passed = 0
 
     def check(self, now: datetime) -> None:
         """Record a call attempt.
@@ -65,8 +71,21 @@ class CallBreaker:
                 f"more than {self._max_calls} OpenAI calls in {self._window} - stopped"
             )
         self._calls.append(now)
+        self.passed += 1
         if self._daily_max_calls is not None:
             self._day_calls.append(now)
+
+    def seed_daily(self, times: Iterable[datetime], now: datetime) -> int:
+        """Count calls made before a restart against the daily cap: one
+        timestamp per call. Only the daily window is seeded - the rate
+        window is minutes long and a restart outlasts it anyway. Returns the
+        number of calls now counted for the last 24 hours."""
+        if self._daily_max_calls is None:
+            return 0
+        cutoff = now - DAY
+        merged = sorted([*self._day_calls, *(t for t in times if t >= cutoff)])
+        self._day_calls = deque(merged)
+        return len(self._day_calls)
 
 
 def _prune(calls: deque[datetime], cutoff: datetime) -> None:
