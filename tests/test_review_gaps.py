@@ -111,11 +111,11 @@ def test_valid_signature_without_user_is_refused_as_no_user():
         _check(_signed(_fields(user=False)))
 
 
-def test_auth_date_in_the_future_is_currently_accepted():
-    """Current behaviour: only `now - auth_date > max_age` is checked, so a
-    correctly signed auth_date an hour ahead (clock skew) passes."""
+def test_auth_date_more_than_five_minutes_in_the_future_is_refused():
+    """A correctly signed auth_date an hour ahead is beyond any clock skew."""
     future = datetime.now(UTC) + timedelta(hours=1)
-    assert _check(_signed(_fields(auth_date=future))) == OWNER
+    with pytest.raises(AuthError, match="from_future"):
+        _check(_signed(_fields(auth_date=future)))
 
 
 def test_init_data_without_hash_is_refused():

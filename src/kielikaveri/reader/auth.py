@@ -13,6 +13,9 @@ from datetime import UTC, datetime, timedelta
 from aiogram.utils.web_app import safe_parse_webapp_init_data
 
 SCHEME = "tma "
+# How far ahead of our clock a signed auth_date may be: room for clock skew
+# between Telegram and this server, not for an initData minted to live long.
+MAX_CLOCK_SKEW = timedelta(minutes=5)
 
 
 class AuthError(Exception):
@@ -26,6 +29,10 @@ def user_id_from_header(
     max_age: timedelta,
     now: datetime | None = None,
 ) -> int:
+    # An empty token would make the HMAC key public knowledge: anyone could
+    # sign initData for any user id. Refuse rather than check against it.
+    if not bot_token:
+        raise AuthError("no_bot_token")
     if not header or not header.startswith(SCHEME):
         raise AuthError("missing")
     try:
@@ -37,6 +44,11 @@ def user_id_from_header(
     now = now or datetime.now(UTC)
     if now - data.auth_date > max_age:
         raise AuthError("expired")
+    # Telegram stamps auth_date with its own clock; one well ahead of ours
+    # means a skewed clock, and accepting it would let the initData outlive
+    # max_age by as much.
+    if data.auth_date - now > MAX_CLOCK_SKEW:
+        raise AuthError("from_future")
     if data.user is None:
         raise AuthError("no_user")
     if data.user.id not in whitelist:
