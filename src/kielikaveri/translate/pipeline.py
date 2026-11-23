@@ -32,6 +32,13 @@ BLOCK_CHARS = 6000
 # Paragraphs of already translated Finnish passed along for continuity only.
 CONTEXT_PARAGRAPHS = 2
 SAMPLE_CHARS_PER_CHAPTER = 1500
+# Ceiling on the chapter samples in the glossary prompt: past
+# GUIDE_MAX_CHARS // SAMPLE_CHARS_PER_CHAPTER chapters each sample gets
+# shorter, so the prompt stops growing with the book (review 23.11.2026, И3).
+GUIDE_MAX_CHARS = 100_000
+# Front matter is a title page and an epigraph; when the first heading comes
+# late it is half the book, and the glossary only needs its opening.
+GUIDE_FRONT_MATTER_CHARS = 3000
 
 REVIEW_CATEGORIES = [
     "rektio",  # wrong case government
@@ -393,12 +400,20 @@ async def prepare_guide(
     to be translated in full - the whole book in one prompt is mostly
     paying for text the guide doesn't need."""
     full_numbers = {c.number for c in full_chapters}
+    sample_chars = min(SAMPLE_CHARS_PER_CHAPTER, GUIDE_MAX_CHARS // max(1, len(book.chapters)))
     fragments = []
     for chapter in book.chapters:
         text = "\n".join(chapter.paragraphs)
         if chapter.number not in full_numbers:
-            text = text[:SAMPLE_CHARS_PER_CHAPTER]
+            text = text[:sample_chars]
         fragments.append({"chapter": chapter.number, "part": chapter.part, "text": text})
+    front_matter: list[str] = []
+    left = GUIDE_FRONT_MATTER_CHARS
+    for paragraph in book.front_matter:
+        if left <= 0:
+            break
+        front_matter.append(paragraph[:left])
+        left -= len(paragraph)
     payload = await _call(
         client,
         breaker,
@@ -406,7 +421,7 @@ async def prepare_guide(
         usage.step("guide"),
         "translate.guide",
         GUIDE_RULES,
-        {"front_matter": book.front_matter, "fragments": fragments},
+        {"front_matter": front_matter, "fragments": fragments},
         "book_guide",
         _guide_schema(),
     )

@@ -36,6 +36,13 @@ _SCENE_BREAK_RE = re.compile(r"^[*•\s]{3,}$")
 # No fallback split below this: a book with fewer headings is chunked instead.
 _MIN_CHAPTERS = 2
 FALLBACK_CHUNK_CHARS = 5000
+# A chapter longer than this is cut into numbered pieces: one chapter is one
+# background translation job, and the call breaker would trip halfway through
+# a huge one after the calls are already paid for (review 23.11.2026, И3).
+MAX_CHAPTER_CHARS = 30_000
+# More "chapters" than this is a mis-split (page numbers on their own lines
+# after OCR), not a book - the bot refuses it rather than storing it.
+MAX_CHAPTERS = 300
 
 
 @dataclass
@@ -112,7 +119,29 @@ def split_book(text: str) -> Book:
 
     if len(chapters) < _MIN_CHAPTERS:
         return Book(front_matter=[], chapters=chunk_paragraphs(paragraphs))
-    return Book(front_matter=front, chapters=chapters)
+    return Book(front_matter=front, chapters=_split_long(chapters))
+
+
+def _split_long(chapters: list[Chapter], max_chars: int = MAX_CHAPTER_CHARS) -> list[Chapter]:
+    """Cut chapters over `max_chars` into even pieces at paragraph boundaries.
+    Numbers stay running across the book; the piece shows in the title -
+    "13 (1/2)", "13 (2/2)" - and keeps the chapter's part."""
+    result: list[Chapter] = []
+    for chapter in chapters:
+        if chapter.chars <= max_chars:
+            pieces = [chapter.paragraphs]
+        else:
+            pieces = _even_pieces(chapter.paragraphs, chapter.chars, max_chars)
+        for index, paragraphs in enumerate(pieces, start=1):
+            title = (
+                chapter.title if len(pieces) == 1 else f"{chapter.title} ({index}/{len(pieces)})"
+            )
+            result.append(
+                Chapter(
+                    number=len(result) + 1, part=chapter.part, title=title, paragraphs=paragraphs
+                )
+            )
+    return result
 
 
 def chunk_paragraphs(paragraphs: list[str], max_chars: int = FALLBACK_CHUNK_CHARS) -> list[Chapter]:
@@ -130,3 +159,27 @@ def chunk_paragraphs(paragraphs: list[str], max_chars: int = FALLBACK_CHUNK_CHAR
     if current:
         chunks.append(Chapter(number=len(chunks) + 1, part=None, title="", paragraphs=current))
     return chunks
+
+
+def _even_pieces(paragraphs: list[str], chars: int, max_chars: int) -> list[list[str]]:
+    """Greedy cut that closes a piece once it reaches an even share of the
+    chapter, never going over `max_chars` - so 30 001 chars become two
+    halves, not a full piece plus a one-line stub. A single paragraph over
+    `max_chars` stays whole: paragraphs are never split."""
+    count = -(-chars // max_chars)
+    target = -(-chars // count)
+    pieces: list[list[str]] = []
+    current: list[str] = []
+    size = 0
+    for paragraph in paragraphs:
+        if current and size + len(paragraph) > max_chars:
+            pieces.append(current)
+            current, size = [], 0
+        current.append(paragraph)
+        size += len(paragraph)
+        if size >= target:
+            pieces.append(current)
+            current, size = [], 0
+    if current:
+        pieces.append(current)
+    return pieces

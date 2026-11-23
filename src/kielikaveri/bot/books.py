@@ -29,7 +29,12 @@ from kielikaveri.db.books import (
     text_hash,
 )
 from kielikaveri.db.models import Book, BookChapter, ChapterStatus
-from kielikaveri.translate.chapters import UndecodableError, decode_text, split_book
+from kielikaveri.translate.chapters import (
+    MAX_CHAPTERS,
+    UndecodableError,
+    decode_text,
+    split_book,
+)
 from kielikaveri.translate.worker import ChapterEvent, Translator
 
 logger = logging.getLogger(__name__)
@@ -40,6 +45,18 @@ NOT_TXT_TEXT = "Книги принимаю только в .txt. Другие �
 BUSY_TEXT = "Сейчас жду от тебя ответ на прошлый вопрос. Ответь или нажми /start, потом пришли книгу ещё раз."
 UNDECODABLE_TEXT = "Не смогла прочитать файл как текст. Пришли книгу в .txt (UTF-8 или cp1251)."
 TOO_SHORT_TEXT = "В файле почти нет текста - это точно книга?"
+TOO_MANY_CHAPTERS_TEXT = (
+    "Нашла в файле глав - {count}, это слишком много: беру книги до {limit} глав. "
+    "Похоже, в файле номера страниц на отдельных строках, и я приняла их за заголовки глав. "
+    "Убери номера страниц и пришли книгу ещё раз."
+)
+# Without headings the book is cut into ~5000-char pieces - so many pieces
+# means a very long text, not page numbers.
+TOO_LONG_TEXT = (
+    "Не нашла в файле заголовков глав, а без них книга делится на куски - "
+    "их получилось {count}, это слишком много: беру книги до {limit} глав. "
+    "Пришли книгу покороче или с заголовками глав."
+)
 # Shorter than this is a note, not a book - and not worth a glossary call.
 MIN_BOOK_CHARS = 1000
 
@@ -138,6 +155,12 @@ async def book_upload(
     chars = sum(c.chars for c in book.chapters)
     if chars < MIN_BOOK_CHARS:
         await message.answer(TOO_SHORT_TEXT)
+        return
+    if len(book.chapters) > MAX_CHAPTERS:
+        logger.info("event=book.too_many_chapters chapters=%d chars=%d", len(book.chapters), chars)
+        # Fallback chunks are the only chapters without a heading.
+        refusal = TOO_MANY_CHAPTERS_TEXT if book.chapters[0].title else TOO_LONG_TEXT
+        await message.answer(refusal.format(count=len(book.chapters), limit=MAX_CHAPTERS))
         return
 
     user_id = message.from_user.id
