@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from kielikaveri.config import Settings
 from kielikaveri.db.books import chapter_by_number, mark_opened
 from kielikaveri.db.models import Book, BookChapter, ChapterStatus
+from kielikaveri.llm.breaker import CallBreaker
 from kielikaveri.logging_context import new_trace_id, trace_id_var
 from kielikaveri.reader.auth import AuthError, user_id_from_header
 from kielikaveri.translate.fst_check import split_words
@@ -36,6 +37,9 @@ STATIC_DIR = Path(__file__).parent / "static"
 SESSION_FACTORY = web.AppKey("session_factory", async_sessionmaker[AsyncSession])
 SETTINGS = web.AppKey("settings", Settings)
 TRANSLATOR = web.AppKey("translator", Translator)
+# The reader's own breaker (plan 2026-11-20-kirjakaveri-reader, И6): word
+# lookup and TTS at reading pace must not trip the bot's shared one.
+READER_BREAKER = web.AppKey("reader_breaker", CallBreaker)
 USER_ID = web.RequestKey("user_id", int)
 
 Handler = Callable[[web.Request], Awaitable[web.StreamResponse]]
@@ -178,6 +182,10 @@ def make_app(
     app[SESSION_FACTORY] = session_factory
     app[SETTINGS] = settings
     app[TRANSLATOR] = translator
+    app[READER_BREAKER] = CallBreaker(
+        settings.reader_breaker_max_calls,
+        timedelta(minutes=settings.reader_breaker_window_minutes),
+    )
     app.router.add_get("/", index)
     app.router.add_get("/api/books", list_books)
     app.router.add_get("/api/chapters/{chapter_id}", get_chapter)

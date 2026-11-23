@@ -45,6 +45,13 @@ class Settings(BaseSettings):
     # A 6k-char block comes back as ~6k chars of Finnish - minutes, not the
     # 60 s an /add reply gets.
     translate_timeout_seconds: float = 300.0
+
+    # The reader (word lookup, TTS) has its own breaker too (plan
+    # 2026-11-20-kirjakaveri-reader, И6): a learner easily taps 60 words in
+    # 10 minutes at reading pace, and that must not starve /add and TTS in
+    # the bot. 150 in 10 minutes is still faster than anyone reads.
+    reader_breaker_max_calls: int = 150
+    reader_breaker_window_minutes: int = 10
     # Telegram lets bots download up to 20 MB; a long novel is ~1-2 MB.
     max_book_bytes: int = 5_000_000
 
