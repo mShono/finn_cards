@@ -149,7 +149,8 @@ async def run(settings: Settings) -> None:
         if settings.reader_url
         else MenuButtonDefault()
     )
-    translator_task = asyncio.create_task(translator.run(), name="translator")
+    # Logs at once if the loop ever dies (plan 2026-11-20-kirjakaveri-reader, И1).
+    translator_task = translator.start()
 
     try:
         await dp.start_polling(
@@ -162,7 +163,9 @@ async def run(settings: Settings) -> None:
     finally:
         # A chapter cut off here stays `translating` and is requeued on start.
         translator_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
+        # Exception too, so the cleanup below always runs; a death is already
+        # logged with its traceback by the task's done-callback.
+        with contextlib.suppress(asyncio.CancelledError, Exception):
             await translator_task
         await reader.cleanup()
         await engine.dispose()
