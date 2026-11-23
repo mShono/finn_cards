@@ -106,6 +106,10 @@ class User(Base):
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=lambda: datetime.now(UTC))
 
 
+DECK_CHAPTER_UNIQUE_INDEX = "uq_decks_chapter_id"
+DECK_CHAPTER_FK = "fk_decks_chapter_id_chapters"
+
+
 class Deck(Base):
     """A user-named grouping of notes (plan: "колоды", chosen deliberately
     manual - the learner decides what goes where, not an automatic
@@ -119,8 +123,21 @@ class Deck(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
     name: Mapped[str] = mapped_column(String)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=lambda: datetime.now(UTC))
+    # Set only on a reader chapter deck ("<book> - гл.N", plan И7): the deck is
+    # found by this column, never by its name - names are not unique and the
+    # book may be renamed. SET NULL, not CASCADE: a deck with cards must
+    # outlive its book. Note that SQLite enforces it only with
+    # PRAGMA foreign_keys=ON, which this project does not enable.
+    chapter_id: Mapped[str | None] = mapped_column(
+        ForeignKey("chapters.id", ondelete="SET NULL", name=DECK_CHAPTER_FK),
+        nullable=True,
+    )
 
     notes: Mapped[list[Note]] = relationship(back_populates="deck")
+
+    # Many NULLs are allowed in a SQLite unique index, so ordinary decks are
+    # unaffected; this is what makes get_or_create_chapter_deck() race-free.
+    __table_args__ = (Index(DECK_CHAPTER_UNIQUE_INDEX, "chapter_id", unique=True),)
 
 
 NOTE_UNIQUE_INDEX = "uq_notes_user_deck_lemma_pos"
