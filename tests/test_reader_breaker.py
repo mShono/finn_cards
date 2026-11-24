@@ -24,7 +24,7 @@ def test_app_has_its_own_breaker_with_default_limits():
     assert isinstance(breaker, CallBreaker)
     assert breaker._max_calls == 150
     assert breaker._window == timedelta(minutes=10)
-    assert breaker._daily_max_calls is None
+    assert breaker._daily_max_calls == 400
 
 
 def test_limits_come_from_settings():

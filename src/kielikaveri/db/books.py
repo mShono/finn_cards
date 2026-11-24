@@ -72,11 +72,6 @@ async def store_book(
     return row
 
 
-async def delete_book(session: AsyncSession, book_id: str) -> None:
-    await session.execute(delete(BookChapter).where(BookChapter.book_id == book_id))
-    await session.execute(delete(Book).where(Book.id == book_id))
-
-
 async def delete_unstarted_book(session: AsyncSession, book_id: str, user_id: int) -> bool:
     """Deletes the book only while every chapter is still pending - the
     check and the delete are the same statements, so a "yes" landing

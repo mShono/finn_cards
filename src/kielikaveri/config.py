@@ -52,6 +52,13 @@ class Settings(BaseSettings):
     # the bot. 150 in 10 minutes is still faster than anyone reads.
     reader_breaker_max_calls: int = 150
     reader_breaker_window_minutes: int = 10
+    # The total the reader's rate window can't cap (lookup and TTS cache
+    # misses together, rolling 24 hours) - like translate_daily_max_calls.
+    reader_daily_max_calls: int = 400
+    # mp3 of tapped words (reader/speech.py), one file per word, model,
+    # voice and speed. Relative to the working directory (the repo root
+    # under deploy/kielikaveri.service); git-ignored.
+    reader_tts_cache_dir: str = "data/tts_cache"
     # Telegram lets bots download up to 20 MB; a long novel is ~1-2 MB.
     max_book_bytes: int = 5_000_000
 

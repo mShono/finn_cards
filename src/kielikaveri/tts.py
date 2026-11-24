@@ -17,6 +17,8 @@ from openai import AsyncOpenAI
 logger = logging.getLogger(__name__)
 
 TTS_MAX_RETRIES = 1
+# Named so caches of synthesized audio (reader/speech.py) can key on it.
+TTS_VOICE = "alloy"
 
 
 def make_tts_client(api_key: str, timeout_seconds: float) -> AsyncOpenAI:
@@ -28,7 +30,9 @@ async def synthesize_speech(
 ) -> bytes:
     logger.debug("event=tts.request model=%s speed=%s", model, speed)
     start = time.monotonic()
-    response = await client.audio.speech.create(model=model, voice="alloy", input=text, speed=speed)
+    response = await client.audio.speech.create(
+        model=model, voice=TTS_VOICE, input=text, speed=speed
+    )
     audio = await response.aread()
     duration_ms = int((time.monotonic() - start) * 1000)
     logger.info(

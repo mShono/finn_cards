@@ -10,3 +10,5 @@ __pycache__/
 logs/
 *.db-wal
 *.db-shm
+# Reader TTS cache (READER_TTS_CACHE_DIR)
+data/tts_cache/

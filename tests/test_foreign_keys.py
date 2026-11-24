@@ -11,13 +11,12 @@ from unittest.mock import AsyncMock
 
 import pytest
 from aiogram.types import Update
-from conftest import add_users
+from conftest import add_users, delete_book
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 
 from kielikaveri.bot.add import delete_confirm
 from kielikaveri.bot.middleware import DECLINE_TEXT, WhitelistMiddleware
-from kielikaveri.db.books import delete_book
 from kielikaveri.db.decks import get_or_create_chapter_deck
 from kielikaveri.db.engine import create_all, make_engine, make_session_factory
 from kielikaveri.db.models import Book, BookChapter, Card, Deck, Note, NoteKind, Review, User

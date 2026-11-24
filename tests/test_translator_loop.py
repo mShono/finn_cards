@@ -6,7 +6,7 @@ import asyncio
 import logging
 
 import pytest
-from conftest import add_users
+from conftest import add_users, delete_book
 from sqlalchemy.exc import OperationalError
 from test_books import (
     GUIDE,
@@ -21,7 +21,7 @@ from test_books import (
     translation,
 )
 
-from kielikaveri.db.books import delete_book, queue_chapter
+from kielikaveri.db.books import queue_chapter
 from kielikaveri.db.engine import create_all, make_engine, make_session_factory
 from kielikaveri.db.models import BookChapter, ChapterStatus
 from kielikaveri.translate import fst_check, worker

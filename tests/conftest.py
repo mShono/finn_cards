@@ -1,8 +1,9 @@
 import re
 
+from sqlalchemy import delete
 from sqlalchemy.dialects.sqlite import insert
 
-from kielikaveri.db.models import User
+from kielikaveri.db.models import Book, BookChapter, User
 
 
 def log_fields(message: str) -> dict[str, str]:
@@ -25,3 +26,11 @@ async def add_users(session_factory, *user_ids: int) -> None:
         for user_id in user_ids:
             await session.execute(insert(User).values(id=user_id).on_conflict_do_nothing())
         await session.commit()
+
+
+async def delete_book(session, book_id: str) -> None:
+    """Removes a book outright, whatever its chapters' statuses - the tests'
+    way to make a book vanish mid-translation. The bot itself only deletes
+    an unstarted book (db.books.delete_unstarted_book)."""
+    await session.execute(delete(BookChapter).where(BookChapter.book_id == book_id))
+    await session.execute(delete(Book).where(Book.id == book_id))

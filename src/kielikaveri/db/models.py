@@ -287,6 +287,30 @@ class IngestCache(Base):
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=lambda: datetime.now(UTC))
 
 
+class LookupCache(Base):
+    """A reader word lookup (reader/lookup.py), keyed by
+    reader.lookup.lookup_key(): model, schema version, the word, its
+    sentence with the word marked, and the original paragraph.
+
+    Derived from the book's text, so it goes with the book: the chapter's
+    FK is ON DELETE CASCADE (PRAGMA foreign_keys=ON, db/engine.py).
+    """
+
+    __tablename__ = "lookup_cache"
+
+    key: Mapped[str] = mapped_column(String, primary_key=True)
+    chapter_id: Mapped[str] = mapped_column(ForeignKey("chapters.id", ondelete="CASCADE"))
+    model: Mapped[str] = mapped_column(String)
+    # lemma, pos, in_dictionary, form_ru, translation_ru, sentence_ru,
+    # puhekieli - what the /api/lookup answer needs besides the live fields.
+    result: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=lambda: datetime.now(UTC))
+
+    # SQLite indexes no foreign key on its own: without it every chapter
+    # delete would scan the whole cache for its cascade.
+    __table_args__ = (Index("ix_lookup_cache_chapter_id", "chapter_id"),)
+
+
 class Review(Base):
     __tablename__ = "reviews"
 
