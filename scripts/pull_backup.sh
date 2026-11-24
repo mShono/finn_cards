@@ -2,7 +2,9 @@
 # Off-server copy of the SQLite backups. Runs on your own machine (WSL), not
 # on the server: fetches the newest backups/kielikaveri-*.db that
 # scripts/backup_db.sh made on the server, checks it with
-# "PRAGMA integrity_check" and keeps the last N local copies.
+# "PRAGMA integrity_check" and keeps the last N local copies. The check uses
+# the sqlite3 CLI if it is installed and python3's sqlite3 module otherwise,
+# so nothing here needs sudo.
 #
 # Uses your normal ssh login to the server, NOT the deploy key: that key has
 # a forced command (scripts/deploy_entry.sh) and can't run anything else.
@@ -25,6 +27,34 @@ set -euo pipefail
 die() {
     echo "pull_backup: $*" >&2
     exit 1
+}
+
+# Prints the result of "PRAGMA integrity_check" for the database file $1
+# ("ok" for a good file) and fails if the check doesn't pass or can't run.
+# $1 is opened read-only, so the check never changes it. Uses $checker, set
+# by main().
+integrity_check() {
+    if [[ "$checker" == sqlite3 ]]; then
+        sqlite3 -readonly "$1" "PRAGMA integrity_check"
+    else
+        # The path goes in as an argument and is percent-encoded into the
+        # URI, never pasted into the code. -I: ignore PYTHON* variables and
+        # the current directory.
+        python3 -I -c '
+import pathlib, sqlite3, sys
+uri = pathlib.Path(sys.argv[1]).resolve().as_uri() + "?mode=ro"
+try:
+    con = sqlite3.connect(uri, uri=True)
+    try:
+        rows = [str(r[0]) for r in con.execute("PRAGMA integrity_check")]
+    finally:
+        con.close()
+except sqlite3.Error as e:
+    sys.exit(str(e))
+print("\n".join(rows))
+sys.exit(0 if rows == ["ok"] else 1)
+' "$1"
+    fi
 }
 
 usage() {
@@ -68,14 +98,23 @@ main() {
     [[ "$remote_dir" == /* ]] || die "remote dir must be an absolute path, got: '$remote_dir'"
     command -v ssh >/dev/null || die "ssh not found"
     command -v scp >/dev/null || die "scp not found"
-    command -v sqlite3 >/dev/null || die "sqlite3 not found (sudo apt install sqlite3)"
+    # Pick the checker before fetching anything: without one a broken copy
+    # can't be told from a good one.
+    local checker
+    if command -v sqlite3 >/dev/null; then
+        checker=sqlite3
+    elif command -v python3 >/dev/null && python3 -I -c 'import sqlite3' 2>/dev/null; then
+        checker=python3
+    else
+        die "can't check backups: neither the sqlite3 CLI nor python3 with its sqlite3 module found - nothing fetched"
+    fi
 
     local target="$host"
     if [[ -n "$user" ]]; then
         target="$user@$host"
     fi
-    # BatchMode: under cron there is nobody to type a password, so fail fast
-    # instead of hanging.
+    # BatchMode: in a scheduled run there is nobody to type a password, so
+    # fail fast instead of hanging.
     local ssh_opts=(-o BatchMode=yes -o ConnectTimeout=20)
 
     # The copy holds the book text and the whole learning history: keep it
@@ -113,13 +152,18 @@ main() {
             die "scp of $target:$remote_dir/$newest failed"
         fi
         local check
-        check="$(sqlite3 "$tmp" "PRAGMA integrity_check" 2>&1)" || true
-        if [[ "$check" != "ok" ]]; then
+        # An empty file opens as an empty database and passes the check.
+        if [[ ! -s "$tmp" ]]; then
+            die "fetched $newest is empty, not kept"
+        fi
+        local check_rc=0
+        check="$(integrity_check "$tmp" 2>&1)" || check_rc=$?
+        if [[ "$check_rc" -ne 0 || "$check" != "ok" ]]; then
             die "integrity check failed for $newest, not kept: $check"
         fi
         mv "$tmp" "$final"
         trap - EXIT
-        echo "Fetched $newest to $dest (integrity_check: ok)"
+        echo "Fetched $newest to $dest (integrity_check via $checker: ok)"
     fi
 
     # Rotation: keep the newest $keep copies, touch only files named like
