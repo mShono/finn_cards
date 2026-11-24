@@ -13,7 +13,17 @@ from kielikaveri.bot.middleware import (
     WhitelistMiddleware,
     _update_preview,
 )
+from kielikaveri.db.engine import create_all, make_engine, make_session_factory
 from kielikaveri.logging_context import trace_id_var
+
+
+@pytest.fixture
+async def session_factory():
+    # A whitelisted user's first update creates their `users` row.
+    engine = make_engine("sqlite+aiosqlite://")
+    await create_all(engine)
+    yield make_session_factory(engine)
+    await engine.dispose()
 
 
 def make_update():
@@ -46,11 +56,11 @@ def make_callback_update(data: str = "cb:1", *, inline: bool = False) -> Update:
     return Update.model_construct(update_id=1, callback_query=callback_query)
 
 
-async def test_whitelisted_user_reaches_handler():
+async def test_whitelisted_user_reaches_handler(session_factory):
     middleware = WhitelistMiddleware({1, 2})
     update, message = make_update()
     handler = AsyncMock(return_value="handled")
-    data = {"event_from_user": SimpleNamespace(id=1)}
+    data = {"event_from_user": SimpleNamespace(id=1), "session_factory": session_factory}
 
     result = await middleware(handler, update, data)
 
@@ -252,7 +262,7 @@ async def test_request_logging_gives_different_updates_different_trace_ids(caplo
     assert seen_trace_ids[0] != seen_trace_ids[1]
 
 
-async def test_request_logging_wraps_whitelist_and_shares_trace_id(caplog):
+async def test_request_logging_wraps_whitelist_and_shares_trace_id(caplog, session_factory):
     """One flow through RequestLoggingMiddleware -> WhitelistMiddleware -> handler
     must leave every log entry tagged with the same trace_id (the actual
     correlation guarantee the whole scheme depends on)."""
@@ -260,7 +270,7 @@ async def test_request_logging_wraps_whitelist_and_shares_trace_id(caplog):
     inner = WhitelistMiddleware({1})
     update, _message = make_update()
     handler = AsyncMock(return_value="handled")
-    data = {"event_from_user": SimpleNamespace(id=1)}
+    data = {"event_from_user": SimpleNamespace(id=1), "session_factory": session_factory}
 
     async def dispatch(event, data):
         return await inner(handler, event, data)
@@ -268,7 +278,11 @@ async def test_request_logging_wraps_whitelist_and_shares_trace_id(caplog):
     with caplog.at_level(logging.DEBUG):
         await outer(dispatch, update, data)
 
-    trace_ids = {r.trace_id for r in caplog.records if hasattr(r, "trace_id")}
+    # aiosqlite logs from its own worker thread, outside the update's
+    # context - and is kept above DEBUG in a real run (logging_config.py).
+    trace_ids = {
+        r.trace_id for r in caplog.records if hasattr(r, "trace_id") and r.name != "aiosqlite"
+    }
     assert len(trace_ids) == 1
     handler.assert_awaited_once()
 
@@ -435,7 +449,7 @@ async def test_request_logging_starts_a_fresh_trace_for_every_update_kind(
 # --- callback_data survives the full middleware chain unchanged -------------
 
 
-async def test_callback_data_reaches_the_handler_and_the_log_unchanged(caplog):
+async def test_callback_data_reaches_the_handler_and_the_log_unchanged(caplog, session_factory):
     """The value the real handler acts on (event.callback_query.data) and
     the value logged at update_received.detail must be the exact same
     string - through RequestLoggingMiddleware AND WhitelistMiddleware,
@@ -455,7 +469,7 @@ async def test_callback_data_reaches_the_handler_and_the_log_unchanged(caplog):
     async def dispatch(event, data):
         return await inner(real_handler, event, data)
 
-    request_data = {"event_from_user": SimpleNamespace(id=1)}
+    request_data = {"event_from_user": SimpleNamespace(id=1), "session_factory": session_factory}
     with caplog.at_level(logging.DEBUG, logger="kielikaveri.bot.middleware"):
         result = await outer(dispatch, update, request_data)
 

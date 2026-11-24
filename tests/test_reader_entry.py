@@ -19,12 +19,18 @@ from bot_helpers import (
 from kielikaveri.bot.decks import DeckStates
 from kielikaveri.bot.handlers import READER_NOT_CONFIGURED_TEXT
 from kielikaveri.bot.main import BOT_COMMANDS, set_up_menu
+from kielikaveri.db.engine import create_all, make_engine, make_session_factory
 
 READER_URL = "https://reader.example/"
 
 
 @pytest.fixture
 async def routed():
+    # /read itself reads nothing, but WhitelistMiddleware creates the user's
+    # `users` row on the first update.
+    engine = make_engine("sqlite+aiosqlite://")
+    await create_all(engine)
+    session_factory = make_session_factory(engine)
     dp = routed_dispatcher()
     telegram = RecordingSession()
     bot = Bot(token="42:TEST", session=telegram)
@@ -38,7 +44,7 @@ async def routed():
         await dp.feed_update(
             bot,
             tg_text_update(since + 1, text),
-            session_factory=None,
+            session_factory=session_factory,
             settings=make_settings(reader_url=reader_url),
             breaker=make_breaker(),
         )
@@ -47,6 +53,7 @@ async def routed():
     yield {"send": send, "storage": dp.storage, "key": key}
     await dp.storage.set_state(key, None)
     await dp.storage.set_data(key, {})
+    await engine.dispose()
 
 
 def web_app_urls(message: SendMessage) -> list[str]:
