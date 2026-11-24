@@ -126,8 +126,8 @@ class Deck(Base):
     # Set only on a reader chapter deck ("<book> - гл.N", plan И7): the deck is
     # found by this column, never by its name - names are not unique and the
     # book may be renamed. SET NULL, not CASCADE: a deck with cards must
-    # outlive its book. Note that SQLite enforces it only with
-    # PRAGMA foreign_keys=ON, which this project does not enable.
+    # outlive its book. SQLite enforces it only with PRAGMA foreign_keys=ON,
+    # which db/engine.py sets on every connection.
     chapter_id: Mapped[str | None] = mapped_column(
         ForeignKey("chapters.id", ondelete="SET NULL", name=DECK_CHAPTER_FK),
         nullable=True,
@@ -368,8 +368,8 @@ class BookChapter(Base):
     status: Mapped[ChapterStatus] = mapped_column(
         Enum(ChapterStatus, native_enum=False), default=ChapterStatus.pending, index=True
     )
-    # Exception class and message only (RefusedError: ..., MisalignedError: ...)
-    # - never book text.
+    # "Class: message" for our own exceptions, "Class: (details hidden)"
+    # otherwise (plan М17) - never book text.
     error: Mapped[str | None] = mapped_column(String, nullable=True)
     opened_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
     translated_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)

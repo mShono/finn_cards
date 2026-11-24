@@ -35,11 +35,18 @@ def _driver_in_transaction(dbapi_connection) -> bool:
 
 
 def _install_sqlite_events(engine: AsyncEngine, *, file_database: bool) -> None:
-    """Connection setup for SQLite: WAL, busy timeout, and a real
-    transaction around every SAVEPOINT.
+    """Connection setup for SQLite: WAL, busy timeout, foreign keys, and a
+    real transaction around every SAVEPOINT.
 
-    PRAGMA foreign_keys stays off (plan М14 open): most test fixtures insert
-    rows without the users/decks rows they reference.
+    PRAGMA foreign_keys=ON (plan М14): SQLite leaves it off by default, per
+    connection. The app deletes children first (bot/add.py's delete_confirm)
+    and has every parent row in the database before a child is added - the
+    unit of work orders INSERTs only along relationship(), and there is none
+    from users to anything, from chapters to decks or from cards to
+    reviews. The `users` row comes from bot/middleware.py. decks.chapter_id's
+    ON DELETE SET NULL fires. alembic/env.py builds its own engine, not this
+    one, so migrations run with it off - batch mode's table rebuilds need
+    that.
 
     The sqlite3 driver opens a transaction only right before the first
     INSERT/UPDATE/DELETE/REPLACE. A SAVEPOINT emitted before any of those
@@ -70,6 +77,9 @@ def _install_sqlite_events(engine: AsyncEngine, *, file_database: bool) -> None:
                 # for :memory:, which keeps journal_mode=memory.
                 cursor.execute("PRAGMA journal_mode=WAL")
             cursor.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+            # Off by default in SQLite, per connection. A no-op inside a
+            # transaction, and none is open here yet.
+            cursor.execute("PRAGMA foreign_keys=ON")
         finally:
             cursor.close()
 

@@ -84,7 +84,8 @@ async def delete_unstarted_book(session: AsyncSession, book_id: str, user_id: in
     (not this user's book, or translation has started).
 
     Chapters go first (books.id has no ON DELETE CASCADE); decks made from
-    a chapter keep their cards, decks.chapter_id is SET NULL by its FK."""
+    a chapter keep their cards, decks.chapter_id is SET NULL by its FK
+    (enforced: PRAGMA foreign_keys=ON, db/engine.py)."""
     started = (
         select(BookChapter.id)
         .where(BookChapter.book_id == book_id, BookChapter.status != ChapterStatus.pending)
