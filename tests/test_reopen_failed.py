@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 from bot_helpers import make_settings
+from conftest import add_users
 from sqlalchemy import update
 from test_reader import BOOK_TEXT, FI, OWNER, TOKEN, header
 
@@ -21,7 +22,10 @@ from kielikaveri.translate.chapters import split_book
 async def session_factory(tmp_path):
     engine = make_engine(f"sqlite+aiosqlite:///{tmp_path}/test.db")
     await create_all(engine)
-    yield make_session_factory(engine)
+    session_factory = make_session_factory(engine)
+    # The users the tests' rows point at (PRAGMA foreign_keys is on).
+    await add_users(session_factory, 1, 2)
+    yield session_factory
     await engine.dispose()
 
 

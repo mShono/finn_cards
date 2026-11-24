@@ -112,6 +112,7 @@ async def answer(session_factory, card_id: str, rating: Rating, at: datetime) ->
 async def add_note(session_factory, lemma: str, pos: str, meta: dict, created: datetime) -> None:
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(
             Note(
                 id="n1",

@@ -66,6 +66,7 @@ def make_noun(note_id: str, lemma: str, user_id: int = 1, created_at: datetime =
 async def seed_three_nouns(session_factory) -> None:
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         for i, lemma in enumerate(["kauppa", "talo", "kirje"]):
             session.add(make_noun(f"n{i}", lemma, created_at=NOW + timedelta(seconds=i)))
         await session.flush()
@@ -854,6 +855,7 @@ async def test_the_learner_meets_forms_in_the_order_the_curriculum_opened_them(s
     reversed_forms = list(reversed(QUIZZABLE_NOUN_FORMS))
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         note = make_noun("n0", "kauppa")
         note.meta = {
             "forms_verified": True,
@@ -895,6 +897,7 @@ async def test_forms_of_the_older_word_are_asked_before_forms_of_the_newer_one(s
     # database returns.
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         # Inserted newest-first on purpose, so insert order contradicts age.
         session.add(make_noun("n-new", "talo", created_at=NOW))
         session.add(make_noun("n-old", "kauppa", created_at=NOW - timedelta(days=30)))
@@ -977,6 +980,7 @@ async def seed_two_learners(session_factory) -> None:
     async with session_factory() as session:
         for user_id in (1, 2):
             session.add(User(id=user_id))
+            await session.flush()
             session.add(Deck(id=f"deck-{user_id}", user_id=user_id, name="x"))
             note = make_noun(f"u{user_id}", f"sana{user_id}", user_id=user_id)
             note.deck_id = f"deck-{user_id}"
@@ -1049,6 +1053,7 @@ async def test_forms_opened_in_one_deck_spend_the_budget_of_every_deck(session_f
     # switching decks on the same day must not open a second day's worth.
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         for name in ("a", "b"):
             session.add(Deck(id=f"deck-{name}", user_id=1, name=name))
             note = make_noun(f"n-{name}", f"sana{name}")

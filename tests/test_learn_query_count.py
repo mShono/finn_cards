@@ -25,7 +25,7 @@ from sqlalchemy import event, inspect, select
 
 from finn_cards.morphology import NOMINAL_FORMS
 from kielikaveri.db.engine import create_all, make_engine, make_session_factory
-from kielikaveri.db.models import Card, Note, NoteKind, Review, User
+from kielikaveri.db.models import Card, Deck, Note, NoteKind, Review, User
 from kielikaveri.grammar import FORM_TASKS
 from kielikaveri.srs.curriculum import (
     eligible_forms,
@@ -90,6 +90,7 @@ def make_noun(note_id: str, lemma: str, created_at: datetime, user_id: int = 1) 
 async def seed_notes(session_factory, count: int) -> None:
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         for i in range(count):
             # created_at spread out so introduce_due_forms' note order is total.
             session.add(make_noun(f"n{i}", f"sana{i}", NOW + timedelta(seconds=i)))
@@ -294,6 +295,10 @@ async def test_introduce_due_forms_batch_stays_inside_the_chosen_deck(counted):
     session_factory, _counter = counted
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
+        session.add_all(
+            [Deck(id="deck-a", user_id=1, name="A"), Deck(id="deck-b", user_id=1, name="B")]
+        )
         session.add(make_noun("in", "sisalla", NOW))
         session.add(make_noun("out", "ulkona", NOW + timedelta(seconds=1)))
         await session.flush()

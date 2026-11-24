@@ -9,7 +9,7 @@ import pytest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
-from conftest import log_fields
+from conftest import add_users, log_fields
 
 from finn_cards.morphology import NOMINAL_FORMS, VERB_FORMS, generate_forms
 from kielikaveri.bot.edit import (
@@ -32,7 +32,10 @@ NOW = datetime(2026, 8, 27, 10, 0, tzinfo=UTC)
 async def session_factory(tmp_path):
     engine = make_engine(f"sqlite+aiosqlite:///{tmp_path}/test.db")
     await create_all(engine)
-    yield make_session_factory(engine)
+    session_factory = make_session_factory(engine)
+    # The users the tests' rows point at (PRAGMA foreign_keys is on).
+    await add_users(session_factory, 1, 2)
+    yield session_factory
     await engine.dispose()
 
 

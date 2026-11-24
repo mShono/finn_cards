@@ -32,6 +32,7 @@ async def test_roundtrip_user_note_card_review(session_factory):
 
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(
             Note(
                 id="note-1",
@@ -55,6 +56,9 @@ async def test_roundtrip_user_note_card_review(session_factory):
                 due=due,
             )
         )
+        # Review has no relationship() to Card, so the unit of work wouldn't
+        # order its INSERT after the card's.
+        await session.flush()
         session.add(Review(card_id="card-1", user_id=1, rating=3))
         await session.commit()
 
@@ -76,6 +80,7 @@ async def test_roundtrip_user_note_card_review(session_factory):
 async def test_note_without_pos_is_allowed(session_factory):
     async with session_factory() as session:
         session.add(User(id=2))
+        await session.flush()
         session.add(
             Note(
                 id="note-2",
@@ -106,6 +111,7 @@ async def test_note_without_pos_is_allowed(session_factory):
 
 async def _seed_note(session) -> None:
     session.add(User(id=1))
+    await session.flush()
     session.add(
         Note(
             id="note-1",
@@ -178,6 +184,7 @@ def make_note(note_id: str, user_id: int, lemma: str, pos: str | None, deck_id: 
 async def _seed_deck(session_factory, user_id: int = 1, name: str = "Общая") -> str:
     async with session_factory() as session:
         session.add(User(id=user_id))
+        await session.flush()
         deck = await create_deck(session, user_id, name)
         await session.commit()
         return deck.id
@@ -275,6 +282,7 @@ async def test_notes_without_a_deck_cannot_duplicate(session_factory):
     # same COALESCE reason as pos above.
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(make_note("n1", 1, "hakea", "verbi", None))
         await session.commit()
 
