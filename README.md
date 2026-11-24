@@ -151,7 +151,8 @@ Two pieces:
   run comes from cron.
 - `scripts/pull_backup.sh`, on your machine (WSL): fetches the newest of
   those files over your normal ssh login (not the deploy key - it can only
-  run `deploy_entry.sh`), checks it with `PRAGMA integrity_check`, keeps
+  run `deploy_entry.sh`), checks it with `PRAGMA integrity_check` (the
+  `sqlite3` CLI if installed, otherwise python3's `sqlite3` module), keeps
   the last 14 copies (`-k`) in `~/kielikaveri-backups` (`-d`). Host and
   user come from arguments or `BACKUP_SSH_HOST`/`BACKUP_SSH_USER`; see
   `scripts/pull_backup.sh -h`. A failed fetch or check exits nonzero and
@@ -170,38 +171,145 @@ crontab -l -u kielikaveri
 The next morning `ls -l /opt/kielikaveri/finn_cards/backups/` shows a fresh
 file and `logs/backup.log` ends with `Backed up ...`.
 
-Your machine, once:
+### Your machine (WSL), once
+
+Nothing on your machine needs `sudo` or Windows admin rights. The commands
+below assume the repo is cloned at `~/development/finn_cards` in WSL.
+
+**Checker.** `pull_backup.sh` uses the `sqlite3` CLI if it is there and
+python3's built-in `sqlite3` module otherwise (it opens the copy
+read-only). Ubuntu's python3 has the module; check with
+`python3 -c 'import sqlite3; print(sqlite3.sqlite_version)'`. With neither,
+the script stops before fetching anything.
+
+**An ssh key that works unattended.** The script runs ssh with
+`BatchMode=yes`: nothing can ask for a password, a key passphrase or "accept
+this host key?". A scheduled run also has no ssh-agent. So make a separate
+key without a passphrase, just for this, and an alias for it:
 
 ```bash
-sudo apt install sqlite3
-scripts/pull_backup.sh <user>@<host>   # by hand first: accepts the host key, shows errors
+ssh-keygen -t ed25519 -N '' -C kielikaveri-backup -f ~/.ssh/kielikaveri_backup
+ssh-copy-id -i ~/.ssh/kielikaveri_backup.pub <user>@<host>   # asks for your usual login once
+cat >> ~/.ssh/config <<'EOF'
+
+Host kielikaveri-backup
+    HostName <host>
+    User <user>
+    IdentityFile ~/.ssh/kielikaveri_backup
+    IdentitiesOnly yes
+EOF
+chmod 600 ~/.ssh/config
+ssh kielikaveri-backup true && echo key ok   # first time: answer "yes" to the host key
 ```
 
-It runs with ssh `BatchMode=yes`, so a scheduled run needs a key that works
-without typing anything (no passphrase, or one already in a running agent).
+The last line must print `key ok` without asking for anything (apart from
+the host key the first time; `BatchMode` can't accept it, so this step is
+needed). Anyone who gets `~/.ssh/kielikaveri_backup` can log in as
+`<user>`: keep it in WSL (mode 600, which `ssh-keygen` sets), not on a
+Windows drive. To take a little away from it, on the server, in
+`~/.ssh/authorized_keys` of `<user>`, put `restrict ` (with the space) in
+front of the line ending in `kielikaveri-backup`: no port forwarding, no
+terminal; the `ls` and `scp` the script does still work.
 
-Schedule, one of:
+**First run, by hand:**
 
-- **cron in WSL.** WSL doesn't start services by itself: either enable
-  systemd (`[boot]` / `systemd=true` in `/etc/wsl.conf`, then `wsl
-  --shutdown` from Windows and `sudo systemctl enable --now cron`) or run
-  `sudo service cron start` after every WSL start. Cron only fires while
-  the WSL VM is running, and a missed run is not repeated. `crontab -e`:
-  ```
-  0 9 * * * BACKUP_SSH_HOST=<host> BACKUP_SSH_USER=<user> $HOME/development/finn_cards/scripts/pull_backup.sh >> $HOME/kielikaveri-backups/pull.log 2>&1
-  ```
-- **Windows Task Scheduler** (also starts WSL itself). New task, daily
-  trigger, "Run task as soon as possible after a scheduled start is
-  missed" on, action `wsl.exe` with arguments
-  ```
-  -d <distro> -- bash -lc "BACKUP_SSH_HOST=<host> BACKUP_SSH_USER=<user> ~/development/finn_cards/scripts/pull_backup.sh >> ~/kielikaveri-backups/pull.log 2>&1"
-  ```
-  (`wsl -l` lists distro names).
+```bash
+cd ~/development/finn_cards && git pull
+scripts/pull_backup.sh kielikaveri-backup
+ls -l ~/kielikaveri-backups   # a fresh kielikaveri-*.db, mode -rw-------
+```
 
-Check now and then: `tail ~/kielikaveri-backups/pull.log` and `ls -l
-~/kielikaveri-backups` - the newest file should be at most a day old.
+It ends with `Fetched kielikaveri-<timestamp>.db to ...
+(integrity_check via python3: ok)` (or `via sqlite3`) and `Local copies: 1
+in ...`. This also creates `~/kielikaveri-backups`, which the scheduled
+run below writes its log into.
 
-Restoring: stop the service, copy the backup over the database file (the
+### Keeping the copy fresh
+
+Each run fetches only the newest server backup, so weekly runs keep one
+copy a week; `-k 14` keeps 14 of them locally. The server keeps 14 days, so
+missing one week loses nothing yet.
+
+**By hand, once a week** (in WSL):
+
+```bash
+cd ~/development/finn_cards && git pull && scripts/pull_backup.sh kielikaveri-backup 2>&1 | tee -a ~/kielikaveri-backups/pull.log
+```
+
+**Or Windows Task Scheduler, as yourself, no admin.** Cron in WSL is not
+an option without `sudo` (WSL doesn't start the cron service by itself).
+In a normal Windows terminal - cmd or PowerShell, **not** "Run as
+administrator":
+
+```
+schtasks /Create /SC WEEKLY /D MON /ST 10:00 /IT /TN "kielikaveri-pull-backup" /TR "wsl.exe --cd ~ development/finn_cards/scripts/pull_backup.sh kielikaveri-backup >> kielikaveri-backups/pull.log 2>&1"
+```
+
+- `/D`: `MON`...`SUN`; `/ST`: 24-hour local time. Add `/F` to replace an
+  existing task of that name (that's also how to change the time).
+- No `/RU`: the task runs as you. No `/RL HIGHEST`: it runs without admin
+  rights (the default level is `LIMITED`). `/IT` ("interactive only") makes
+  explicit what a task created this way gets anyway: it runs **only while
+  you are logged on to Windows** (a locked screen is fine) and needs no
+  stored password. If the PC is off or you are logged out at that time, the
+  run is skipped until the next week. To catch up after a missed run: open
+  Task Scheduler (`taskschd.msc`) -> Task Scheduler Library ->
+  `kielikaveri-pull-backup` -> Properties -> Settings -> tick "Run task as
+  soon as possible after a scheduled start is missed" (`schtasks /Create`
+  has no flag for it). A console window pops up while it runs.
+- Why `wsl.exe --cd ~ ...` and not `wsl.exe -e bash -lc '...'`: Windows
+  doesn't treat single quotes as quotes, so bash would get a broken
+  command; and with nested `\"` quotes cmd sees `>>` outside quotes and
+  redirects the output of `schtasks` itself instead. Without `-e`,
+  `wsl.exe` hands the rest of the line to your default Linux shell, which
+  does the `>>` and `2>&1`. `--cd ~` starts in your WSL home (a task
+  otherwise starts in `C:\Windows\System32`), so the relative paths work.
+  The line has no `$` and no nested quotes, so the same line works in cmd
+  and in PowerShell. `/TR` is limited to 262 characters - this one is well
+  under.
+- Not the default WSL distro (`wsl -l -v` shows which one is)? Put `-d
+  <distro>` right after `wsl.exe`.
+- The task doesn't `git pull`; do that by hand now and then.
+- The task appends to `~/kielikaveri-backups/pull.log`; that directory must
+  exist (the first manual run creates it), or the shell can't open the log
+  and the task fails without a trace in it.
+
+Is "no admin" true for your PC? Microsoft's [schtasks create
+reference](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/schtasks-create)
+says that without `/RU` the task runs with the permissions of the current
+user and that `/RL` defaults to `LIMITED`, but the same page also says
+"Only Administrators can schedule tasks, regardless of the value of the /ru
+parameter", so it doesn't settle it. On ordinary Windows 10/11 a standard
+user can create tasks that run as themselves; an organisation's policy can
+forbid it. Just run the command in a non-elevated terminal: it either
+prints `SUCCESS: The scheduled task "kielikaveri-pull-backup" has
+successfully been created.` or `ERROR: Access is denied.` - then stay with
+the weekly run by hand.
+
+Check the task (cmd or PowerShell):
+
+```
+schtasks /Query /TN "kielikaveri-pull-backup" /V /FO LIST
+schtasks /Run /TN "kielikaveri-pull-backup"
+```
+
+In the `/Query` output: `Logon Mode: Interactive only`, `Run As User:`
+you, `Next Run Time:` the coming day and time, `Task To Run:` the line
+above. After `/Run` (or a scheduled run) `Last Result` is `0` if the
+script succeeded and `1` if it failed (`wsl.exe` passes the script's exit
+code on); `267009` means it is still running. The details are in the log,
+in WSL:
+
+```bash
+tail ~/kielikaveri-backups/pull.log   # newest lines: "Fetched ..." or "Already have ...", then "Local copies: ..."
+ls -l ~/kielikaveri-backups           # the newest file at most a week (plus a day) old
+```
+
+Remove the task: `schtasks /Delete /TN "kielikaveri-pull-backup" /F`.
+
+### Restoring
+
+Stop the service, copy the backup over the database file (the
 one `DATABASE_URL` points to, `kielikaveri.db` in the checkout by default),
 `chown kielikaveri:kielikaveri` it, start the service.
 
@@ -360,29 +468,26 @@ df -h /
 ### Off-server backup copy (still to do)
 
 Until `pull_backup.sh` runs on your machine, every backup is on the same
-disk as the database. Full description in "Backups"; the steps, in WSL:
+disk as the database. The steps are in "Backups" -> "Your machine (WSL),
+once" and "Keeping the copy fresh", with `<host>` = `46.62.147.103` and
+`<user>` = your normal ssh login to the server (not the deploy key). None
+of it needs `sudo` or Windows admin rights: the copy is checked with
+python3 when the `sqlite3` CLI is missing, and the schedule is a Windows
+Task Scheduler task running as you (or a weekly run by hand). In short, in
+WSL:
 
 ```bash
-sudo apt install sqlite3      # pull_backup.sh checks each copy with it
-cd ~/development/finn_cards
-scripts/pull_backup.sh -h     # options; check the defaults fit
-scripts/pull_backup.sh <user>@46.62.147.103
+cd ~/development/finn_cards && git pull
+scripts/pull_backup.sh -h                        # options; check the defaults fit
+ssh kielikaveri-backup true && echo key ok       # after setting up the key and alias
+scripts/pull_backup.sh kielikaveri-backup
+ls -l ~/kielikaveri-backups                      # one fresh kielikaveri-*.db, mode -rw-------
 ```
 
-`<user>` is your normal ssh login to the server, not the deploy key. The
-first run asks to accept the host key (scheduled runs use
-`BatchMode=yes` and can't) and should end with `Fetched
-kielikaveri-<timestamp>.db to /home/<you>/kielikaveri-backups
-(integrity_check: ok)` and `Local copies: 1 in ...`. Check:
-
-```bash
-ls -l ~/kielikaveri-backups   # one fresh kielikaveri-*.db, mode -rw-------
-```
-
-Then schedule it - cron in WSL or Windows Task Scheduler, both described
-in "Backups" (use `BACKUP_SSH_HOST=46.62.147.103 BACKUP_SSH_USER=<user>`
-there). The next day `tail ~/kielikaveri-backups/pull.log` should show a
-new `Fetched ...` line.
+Done when the scheduled task exists (`schtasks /Query /TN
+"kielikaveri-pull-backup" /V /FO LIST` in Windows) and, after its first
+run, `tail ~/kielikaveri-backups/pull.log` shows a `Fetched ...` line - or
+when the weekly run by hand is a habit.
 
 ## Importing phase 0 cards
 
