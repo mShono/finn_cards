@@ -14,6 +14,8 @@ chapter - and reused for every chapter after.
 
 No Telegram here: the bot passes `notify` and formats the message itself.
 Nothing of the book's text reaches the log - ids, counts and tokens only.
+An exception is logged by its class and stack alone (_log_error): its
+message, and its chain's, can quote the text (plan "Ревью Л0–П2", И8).
 """
 
 from __future__ import annotations
@@ -32,7 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from kielikaveri.db.books import claim_next, reset_interrupted
 from kielikaveri.db.models import Book, BookChapter, ChapterStatus
-from kielikaveri.llm.breaker import CallBreaker, CircuitOpenError
+from kielikaveri.llm.breaker import DAY, CallBreaker, CircuitOpenError
 from kielikaveri.translate import chapters as parsed
 from kielikaveri.translate.pipeline import (
     BookGuide,
@@ -52,10 +54,52 @@ _LOOP_ERROR_PAUSE_SECONDS = 60
 # "database is locked" there is retried before the result is given up.
 _STORE_ATTEMPTS = 3
 _STORE_RETRY_SECONDS = 2
+# Classes listed for an exception's __cause__/__context__ chain, at most.
+_CHAIN_DEPTH = 10
 
 
 class _ChapterGone(Exception):
     """The chapter or its book was deleted while the chapter was translating."""
+
+
+class LoggedError(Exception):
+    """Stands in for a logged exception: carries the real one's stack, but
+    only the class names of it and its chain as the message."""
+
+
+def _class_name(exc: BaseException) -> str:
+    cls = type(exc)
+    if cls.__module__ == "builtins":
+        return cls.__qualname__
+    return f"{cls.__module__}.{cls.__qualname__}"
+
+
+def _chain_names(exc: BaseException) -> str:
+    """ "KeyError <- ValueError": the exception, then what it was raised
+    from (or while handling) - names only, never str() of any of them."""
+    names: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen and len(names) < _CHAIN_DEPTH:
+        seen.add(id(current))
+        names.append(_class_name(current))
+        if current.__cause__ is not None:
+            current = current.__cause__
+        elif current.__suppress_context__:
+            current = None
+        else:
+            current = current.__context__
+    return " <- ".join(names)
+
+
+def _log_error(msg: str, *args: object, exc: BaseException) -> None:
+    """logger.exception without the text: str(exc) - and every message down
+    its __cause__/__context__ chain, and its __notes__ - can quote the book
+    (a JSON error on the model's answer, a KeyError keyed by a sentence).
+    The record still has exc_info, so handlers print a stack as usual, but
+    of a stand-in that holds the real traceback and only class names."""
+    stand_in = LoggedError(_chain_names(exc)).with_traceback(exc.__traceback__)
+    logger.error(msg + " error=%s", *args, type(exc).__name__, exc_info=stand_in)
 
 
 @dataclass
@@ -90,12 +134,17 @@ def log_task_death(task: asyncio.Task) -> None:
     if exc is None:
         logger.error("event=translate.task_died task=%s reason=returned", task.get_name())
     else:
-        logger.error(
-            "event=translate.task_died task=%s error=%s",
-            task.get_name(),
-            type(exc).__name__,
-            exc_info=exc,
-        )
+        _log_error("event=translate.task_died task=%s", task.get_name(), exc=exc)
+
+
+@dataclass
+class _Unstored:
+    """A chapter's paid-for outcome whose final write failed - kept until it
+    is written (plan "Ревью Л0–П2", М16)."""
+
+    chapter_id: str
+    values: dict
+    event: ChapterEvent
 
 
 class Translator:
@@ -113,6 +162,9 @@ class Translator:
         self._breaker = breaker
         self._notify = notify
         self._wake = asyncio.Event()
+        # Written before the next chapter is claimed: while a result waits
+        # here, translating more would only pile up more unwritten spend.
+        self._unstored: _Unstored | None = None
 
     def wake(self) -> None:
         """Call after queueing a chapter; the loop otherwise sleeps."""
@@ -128,17 +180,41 @@ class Translator:
         async with self._session_factory() as session:
             reset = await reset_interrupted(session)
             await session.commit()
+            now = datetime.now(UTC)
+            finished = (
+                await session.execute(
+                    select(BookChapter.finished_at, BookChapter.calls).where(
+                        BookChapter.finished_at >= now - DAY, BookChapter.calls > 0
+                    )
+                )
+            ).all()
         if reset:
             logger.info("event=translate.requeued chapters=%d", reset)
+        # The daily cap lives in memory: without this every restart (a
+        # deploy, a crash loop) would hand out a fresh day's budget.
+        seeded = self._breaker.seed_daily(
+            (finished_at for finished_at, calls in finished for _ in range(calls)), now
+        )
+        if seeded:
+            logger.info("event=translate.daily_seeded calls=%d", seeded)
         while True:
+            if self._unstored is not None:
+                try:
+                    flushed = await self._flush_unstored()
+                except Exception as exc:  # noqa: BLE001 - logged by _log_error
+                    _log_error("event=translate.loop_error stage=store", exc=exc)
+                    flushed = False
+                if not flushed:
+                    await asyncio.sleep(_LOOP_ERROR_PAUSE_SECONDS)
+                continue
             # Cleared before looking, so a wake() during the claim isn't lost.
             self._wake.clear()
             try:
                 async with self._session_factory() as session:
                     chapter_id = await claim_next(session)
                     await session.commit()
-            except Exception:
-                logger.exception("event=translate.loop_error")
+            except Exception as exc:  # noqa: BLE001 - logged by _log_error
+                _log_error("event=translate.loop_error", exc=exc)
                 await asyncio.sleep(_LOOP_ERROR_PAUSE_SECONDS)
                 continue
             if chapter_id is None:
@@ -146,14 +222,15 @@ class Translator:
                 continue
             try:
                 await self.translate_one(chapter_id)
-            except Exception:
-                logger.exception("event=translate.loop_error chapter_id=%s", chapter_id)
+            except Exception as exc:  # noqa: BLE001 - logged by _log_error
+                _log_error("event=translate.loop_error chapter_id=%s", chapter_id, exc=exc)
                 await asyncio.sleep(_LOOP_ERROR_PAUSE_SECONDS)
 
     async def translate_one(self, chapter_id: str) -> None:
         """Translate a chapter already moved to `translating`. A chapter or
         book deleted meanwhile is skipped. Only a DB error while reading the
-        chapter escapes (run() catches it) - and cancellation."""
+        chapter escapes (run() catches it) - and cancellation. A final write
+        that stays locked leaves the outcome in self._unstored for run()."""
         async with self._session_factory() as session:
             chapter = await session.get(BookChapter, chapter_id)
             book = None if chapter is None else await session.get(Book, chapter.book_id)
@@ -189,6 +266,8 @@ class Translator:
             source.chars,
         )
         usage = Usage()
+        # Calls let through by the breaker for this chapter, guide included.
+        passed_before = self._breaker.passed
         try:
             client = self._client_factory()
             if guide is None:
@@ -224,10 +303,13 @@ class Translator:
                 source.number,
                 type(exc).__name__,
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - logged by _log_error
             event.error = _error_text(exc)
-            logger.exception(
-                "event=translate.chapter_failed book_id=%s chapter=%d", book.id, source.number
+            _log_error(
+                "event=translate.chapter_failed book_id=%s chapter=%d",
+                book.id,
+                source.number,
+                exc=exc,
             )
         else:
             event.status = ChapterStatus.done
@@ -246,7 +328,12 @@ class Translator:
             int(sum(s.seconds for s in steps)),
         )
 
-        values: dict = {"status": event.status, "error": event.error}
+        values: dict = {
+            "status": event.status,
+            "error": event.error,
+            "calls": self._breaker.passed - passed_before,
+            "finished_at": datetime.now(UTC),
+        }
         if event.status is ChapterStatus.done:
             values.update(
                 fi_paragraphs=[result.final[i] for i in range(len(source.paragraphs))],
@@ -255,26 +342,46 @@ class Translator:
                 review_issues=[asdict(issue) for issue in result.issues],
                 translated_at=datetime.now(UTC),
             )
+        self._unstored = _Unstored(chapter_id, values, event)
+        await self._flush_unstored()
+
+    async def _flush_unstored(self) -> bool:
+        """Write the pending outcome, then notify. False if the write is
+        still locked: the outcome stays pending and run() retries it before
+        claiming anything else. A restart loses it, and the chapter, left
+        `translating`, is requeued (reset_interrupted)."""
+        pending = self._unstored
+        assert pending is not None
         try:
-            stored = await self._store(chapter_id, values)
+            stored = await self._store(pending.chapter_id, pending.values)
         except OperationalError as exc:
             # Type only: the statement's parameters in str(exc) carry the text.
-            # The chapter stays `translating` and is requeued on restart.
             logger.error(
                 "event=translate.store_failed chapter_id=%s status=%s error=%s",
-                chapter_id,
-                event.status.value,
+                pending.chapter_id,
+                pending.event.status.value,
                 type(exc).__name__,
             )
-            return
+            return False
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Not a lock: another try would fail the same way. The chapter
+            # stays `translating` for the restart, as before.
+            self._unstored = None
+            raise
+        self._unstored = None
         if not stored:
-            logger.info("event=translate.chapter_gone chapter_id=%s stage=store", chapter_id)
-            return
+            logger.info(
+                "event=translate.chapter_gone chapter_id=%s stage=store", pending.chapter_id
+            )
+            return True
 
         try:
-            await self._notify(event)
-        except Exception:
-            logger.exception("event=translate.notify_failed chapter_id=%s", chapter_id)
+            await self._notify(pending.event)
+        except Exception as exc:  # noqa: BLE001 - logged by _log_error
+            _log_error("event=translate.notify_failed chapter_id=%s", pending.chapter_id, exc=exc)
+        return True
 
     async def _store(self, chapter_id: str, values: dict) -> bool:
         """Write the chapter's outcome; False if the chapter is gone. Retries
@@ -285,7 +392,16 @@ class Translator:
                     stored = await session.get(BookChapter, chapter_id)
                     if stored is None:
                         return False
-                    for name, value in values.items():
+                    row = dict(values)
+                    # A retried failed chapter within a day: the earlier
+                    # attempt's calls still count against the daily cap.
+                    if (
+                        stored.calls
+                        and stored.finished_at is not None
+                        and stored.finished_at > row["finished_at"] - DAY
+                    ):
+                        row["calls"] += stored.calls
+                    for name, value in row.items():
                         setattr(stored, name, value)
                     await session.commit()
                     return True

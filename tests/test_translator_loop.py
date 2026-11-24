@@ -109,9 +109,7 @@ async def test_a_locked_final_write_is_retried(session_factory):
     assert notify.await_args.args[0].status is ChapterStatus.done
 
 
-async def test_run_survives_a_failed_final_write_and_takes_the_next_chapter(
-    session_factory, caplog
-):
+async def test_run_retries_a_failed_final_write_before_the_next_chapter(session_factory, caplog):
     caplog.set_level("DEBUG", logger="kielikaveri")
     book_id = await _stored(session_factory)
     other_id = await _stored(session_factory, user_id=2, text=OTHER_BOOK_TEXT)
@@ -123,14 +121,14 @@ async def test_run_survives_a_failed_final_write_and_takes_the_next_chapter(
 
     task = asyncio.create_task(translator.run())
     try:
-        await _wait_for(lambda: notify.await_count == 1)
+        await _wait_for(lambda: notify.await_count == 2)
     finally:
         await _stop(task)
 
-    # The lost write leaves the chapter for the restart's requeue.
-    assert (await _chapter(session_factory, book_id, 1)).status is ChapterStatus.translating
+    # The kept result is written on the loop's next pass, before chapter 2 is taken.
+    assert (await _chapter(session_factory, book_id, 1)).fi_paragraphs == ["Hän meni.", "Talo."]
     assert (await _chapter(session_factory, other_id, 1)).fi_paragraphs == ["Talo."]
-    assert notify.await_args.args[0].user_id == 2
+    assert [c.args[0].user_id for c in notify.await_args_list] == [1, 2]
     failed = [r for r in caplog.records if "event=translate.store_failed" in r.getMessage()]
     assert len(failed) == 1
     chapter_id = (await _chapter(session_factory, book_id, 1)).id

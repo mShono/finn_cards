@@ -373,6 +373,12 @@ class BookChapter(Base):
     error: Mapped[str | None] = mapped_column(String, nullable=True)
     opened_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
     translated_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    # When the last attempt ended (done or failed) and the OpenAI calls it
+    # made, plus those of an earlier attempt that ended less than 24 hours
+    # before it. Read back on start to seed the translator's daily cap
+    # (plan 2026-11-20-kirjakaveri-reader, М15), which otherwise lives in memory.
+    calls: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
 
     book: Mapped[Book] = relationship(back_populates="chapters")
 

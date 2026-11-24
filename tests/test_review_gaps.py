@@ -163,11 +163,6 @@ async def test_failed_chapter_log_messages_carry_no_book_text(session_factory, c
     assert SECRET not in "\n".join(r.getMessage() for r in caplog.records)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="worker logs an unexpected chapter error with logger.exception: the "
-    "traceback ends in str(exc), which carries book text when the exception quotes it",
-)
 async def test_failed_chapter_traceback_carries_no_book_text(session_factory, caplog):  # noqa: F811
     await _fail_chapter_with_secret(session_factory, caplog)
 
