@@ -43,7 +43,32 @@ h2 { font-size: 1.05rem; margin: 24px 0 8px; }
 
 .text p { margin: 0 0 1em; font-size: 1.1rem; line-height: 1.65; }
 /* Each word is its own span (П3 makes them tappable). */
-.text .w { border-radius: 4px; }
+.text .w { border-radius: 4px; cursor: pointer; }
+.text .w.active { background: var(--accent); color: var(--accent-text); }
+
+/* П3: the word popup, a bottom sheet. It takes at most 45% of the screen,
+   so the tapped line stays visible above it; app.js scrolls the word up
+   if the sheet would cover it, and the padding lets the last lines do so. */
+body.with-popup main { padding-bottom: 50vh; }
+.popup {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 10;
+  max-width: 42rem; margin: 0 auto;
+  max-height: 45vh; overflow-y: auto; overscroll-behavior: contain;
+  padding: 14px 16px calc(14px + env(safe-area-inset-bottom));
+  background: var(--card); color: var(--text);
+  border-radius: 14px 14px 0 0;
+  box-shadow: 0 -2px 12px rgba(0, 0, 0, 0.18);
+  overflow-wrap: anywhere;
+}
+.popup[hidden] { display: none; }
+.popup p { margin: 0 0 6px; }
+.popup .lemma { font-size: 1.15rem; }
+.popup .translation { font-size: 1.05rem; }
+.popup .sentence { margin-top: 8px; }
+.popup .warn { color: var(--text); }
+.popup .actions { display: flex; gap: 8px; margin-top: 10px; }
+.popup .speak { width: auto; min-width: 56px; padding: 8px 14px; font-size: 1.2rem; }
+.popup .speak:disabled { opacity: 0.5; cursor: default; }
 
 .next { margin-top: 32px; }
 button {
