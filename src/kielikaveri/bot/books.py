@@ -11,18 +11,21 @@ The book's text never goes to the log - ids, counts and the hash only.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 
 from aiogram import Bot, F, Router
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
-from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from kielikaveri.config import Settings
 from kielikaveri.db.books import (
     chapter_by_number,
-    delete_book,
+    delete_unstarted_book,
+    detect_lang,
     find_book,
     queue_chapter,
     store_book,
@@ -35,6 +38,7 @@ from kielikaveri.translate.chapters import (
     decode_text,
     split_book,
 )
+from kielikaveri.translate.chapters import Book as SplitBook
 from kielikaveri.translate.worker import ChapterEvent, Translator
 
 logger = logging.getLogger(__name__)
@@ -59,6 +63,33 @@ TOO_LONG_TEXT = (
 )
 # Shorter than this is a note, not a book - and not worth a glossary call.
 MIN_BOOK_CHARS = 1000
+# The translation prompts are written for Russian source text; English goes
+# through the same ones and comes out worse. Said up front, not refused.
+ENGLISH_NOTE = (
+    "Книга на английском: пока перевожу её теми же подсказками, что и русские книги, "
+    "поэтому перевод выйдет хуже."
+)
+
+
+@dataclass(frozen=True)
+class _Parsed:
+    text: str
+    book: SplitBook
+    source_hash: str
+    source_lang: str
+
+
+def _parse(raw: bytes) -> _Parsed:
+    """Everything CPU-bound about an upload, run in one worker thread: a
+    multi-megabyte book would otherwise stall the event loop (every other
+    user's update) for the whole decode and split."""
+    text = decode_text(raw)
+    return _Parsed(text, split_book(text), text_hash(text), detect_lang(text))
+
+
+def _translate_question(source_lang: str) -> str:
+    question = "Перевести на финский?"
+    return f"{ENGLISH_NOTE}\n{question}" if source_lang == "en" else question
 
 
 def _confirm_keyboard(book_id: str) -> InlineKeyboardMarkup:
@@ -150,11 +181,11 @@ async def book_upload(
 
     downloaded = await bot.download(document)
     try:
-        text = decode_text(downloaded.read())
+        parsed = await asyncio.to_thread(_parse, downloaded.read())
     except UndecodableError:
         await message.answer(UNDECODABLE_TEXT)
         return
-    book = split_book(text)
+    book = parsed.book
     chars = sum(c.chars for c in book.chapters)
     if chars < MIN_BOOK_CHARS:
         await message.answer(TOO_SHORT_TEXT)
@@ -167,22 +198,34 @@ async def book_upload(
         return
 
     user_id = message.from_user.id
-    source_hash = text_hash(text)
+    source_hash = parsed.source_hash
     async with session_factory() as session:
         existing = await find_book(session, user_id, source_hash)
         if existing is not None:
-            first = await chapter_by_number(session, existing.id, 1)
-            logger.info("event=book.duplicate book_id=%s", existing.id)
-            if first is not None and first.status is ChapterStatus.pending:
-                await message.answer(
-                    f"Эта книга уже загружена как «{existing.title}». Перевести?",
-                    reply_markup=_confirm_keyboard(existing.id),
-                )
-            else:
-                await message.answer(f"Эта книга уже загружена как «{existing.title}».")
+            await _answer_duplicate(message, session, existing)
             return
-        row = await store_book(session, user_id, _title(document.file_name), text, book)
-        await session.commit()
+        try:
+            row = await store_book(
+                session,
+                user_id,
+                _title(document.file_name),
+                parsed.text,
+                book,
+                source_lang=parsed.source_lang,
+                source_hash=source_hash,
+            )
+            await session.commit()
+        except IntegrityError:
+            # The same file sent twice in a row: both passed find_book, the
+            # other upload committed first and uq_books_user_hash stopped
+            # this one. Anything else is a real error, not a duplicate.
+            await session.rollback()
+            existing = await find_book(session, user_id, source_hash)
+            if existing is None:
+                raise
+            logger.info("event=book.duplicate_race book_id=%s", existing.id)
+            await _answer_duplicate(message, session, existing)
+            return
 
     logger.info(
         "event=book.stored book_id=%s chapters=%d chars=%d lang=%s hash=%s",
@@ -195,10 +238,23 @@ async def book_upload(
     await message.answer(
         f"Книга «{row.title}»: глав - {len(book.chapters)}, "
         f"около {max(1, round(chars / 1000))} тыс. знаков.\n"
-        "Перевести на финский? Сначала переведу главу 1 - это несколько минут, "
-        "следующие главы - по мере чтения.",
+        f"{_translate_question(row.source_lang)} Сначала переведу главу 1 - "
+        "это несколько минут, следующие главы - по мере чтения.",
         reply_markup=_confirm_keyboard(row.id),
     )
+
+
+async def _answer_duplicate(message: Message, session: AsyncSession, existing: Book) -> None:
+    first = await chapter_by_number(session, existing.id, 1)
+    logger.info("event=book.duplicate book_id=%s", existing.id)
+    if first is not None and first.status is ChapterStatus.pending:
+        await message.answer(
+            f"Эта книга уже загружена как «{existing.title}». "
+            f"{_translate_question(existing.source_lang)}",
+            reply_markup=_confirm_keyboard(existing.id),
+        )
+    else:
+        await message.answer(f"Эта книга уже загружена как «{existing.title}».")
 
 
 async def _owned_book(session: AsyncSession, book_id: str, user_id: int) -> Book | None:
@@ -243,18 +299,14 @@ async def book_decline(
         if book is None:
             await callback.answer("Этой книги уже нет.", show_alert=True)
             return
-        started = await session.scalar(
-            select(func.count())
-            .select_from(BookChapter)
-            .where(BookChapter.book_id == book_id, BookChapter.status != ChapterStatus.pending)
-        )
-        if started:
-            # Already confirmed (an old message's button) - its chapters
-            # may be translated and paid for; not deleted by a stray tap.
+        deleted = await delete_unstarted_book(session, book_id, callback.from_user.id)
+        await session.commit()
+        if not deleted:
+            # Already confirmed (an old message's button, or "yes" a moment
+            # ago) - its chapters may be translated and paid for; not
+            # deleted by a stray tap.
             await callback.answer("Эта книга уже переводится.", show_alert=True)
             return
-        await delete_book(session, book_id)
-        await session.commit()
     logger.info("event=book.declined book_id=%s", book_id)
     await callback.answer()
     await callback.message.answer("Хорошо, не перевожу. Книгу удалила.")
