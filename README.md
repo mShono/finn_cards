@@ -343,6 +343,31 @@ to the commands list, so after a deploy the old "📖 Читать" WebApp butto
 switches back automatically (Telegram may need the chat reopened to show it),
 and `/read` appears in the menu after the restart.
 
+### Tap on a word
+
+A tap posts `{"chapter_id", "paragraph", "token"}` to `/api/lookup` (the
+word's place only - the server takes the word, its sentence and the Russian
+original from the database) and, for 🔊, the same body to `/api/tts`
+(`audio/mpeg`, the word as the text spells it).
+
+- **Lookup** (`reader/lookup.py`): one strict-schema call to
+  `OPENAI_TEXT_MODEL` gives the lemma (literary for puhekieli: *mä* →
+  *minä*), part of speech, the form explained in Russian and the word's
+  translation. The sentence's translation is the original's own sentence:
+  the model only names its number. Answers are cached in the `lookup_cache`
+  table (deleted with the book).
+- **🔊** (`reader/speech.py`): mp3 files in `READER_TTS_CACHE_DIR`
+  (`data/tts_cache/` in the repo by default, git-ignored), one per word,
+  model, voice and speed. The directory is created on the first tap, by the
+  service's user. Deleting it is safe: files come back on the next taps.
+- **Limits:** cache misses of both go through the reader's own breaker,
+  `READER_BREAKER_MAX_CALLS` per `READER_BREAKER_WINDOW_MINUTES` and
+  `READER_DAILY_MAX_CALLS` (400) per rolling 24 hours; past them the API
+  answers 503 `{"reason": "rate"|"daily"}`.
+- **Logs:** `event=reader.lookup` and `event=reader.tts` with the chapter
+  id, paragraph and word numbers, `cached`, tokens or bytes and time - never
+  the word or the sentence.
+
 ## Logs
 
 Logs go to stdout (captured by `journalctl -u kielikaveri` under systemd)

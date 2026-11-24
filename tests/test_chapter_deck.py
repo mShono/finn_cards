@@ -12,11 +12,11 @@ from pathlib import Path
 
 import pytest
 from alembic.config import Config
+from conftest import delete_book
 from sqlalchemy import create_engine, select, text
 
 from alembic import command
 from kielikaveri.db import decks
-from kielikaveri.db.books import delete_book
 from kielikaveri.db.decks import create_deck, get_or_create_chapter_deck
 from kielikaveri.db.engine import create_all, make_engine, make_session_factory
 from kielikaveri.db.models import DECK_CHAPTER_UNIQUE_INDEX, Book, BookChapter, Deck, User
