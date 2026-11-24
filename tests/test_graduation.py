@@ -49,6 +49,7 @@ async def _cards_for(session_factory, note_id) -> dict[CardType, Card]:
 async def test_a_note_with_no_cards_gets_a_recognition_card(session_factory):
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         note = make_note("note-1", 1)
         session.add(note)
         await session.flush()
@@ -64,6 +65,7 @@ async def test_a_note_with_no_cards_gets_a_recognition_card(session_factory):
 async def test_calling_ensure_card_types_twice_does_not_duplicate_recognition(session_factory):
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         note = make_note("note-1", 1)
         session.add(note)
         await session.flush()
@@ -81,6 +83,7 @@ async def test_calling_ensure_card_types_twice_does_not_duplicate_recognition(se
 async def test_production_opens_once_recognition_stability_crosses_threshold(session_factory):
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         note = make_note("note-1", 1)
         session.add(note)
         session.add(
@@ -110,6 +113,7 @@ async def test_production_opens_at_exactly_the_threshold_not_only_above_it(sessi
     # on the threshold has earned production, a hair below has not.
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         note = make_note("note-1", 1)
         session.add(note)
         session.add(
@@ -135,6 +139,7 @@ async def test_production_opens_at_exactly_the_threshold_not_only_above_it(sessi
 async def test_inflection_opens_only_when_forms_are_filled_and_verified(session_factory):
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         note = make_note("note-1", 1, forms_verified=False, principal_forms={"preesens_1s": "haen"})
         session.add(note)
         await session.flush()
@@ -156,6 +161,7 @@ async def test_each_principal_form_gets_its_own_card(session_factory):
     forms = {"genetiivi": "kaupan", "illatiivi": "kauppaan", "partitiivi": "kauppaa"}
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         note = make_note("note-1", 1, forms_verified=True, principal_forms=forms)
         session.add(note)
         await session.flush()
@@ -171,6 +177,7 @@ async def test_forms_with_no_task_defined_get_no_card(session_factory):
     # and stored but never turned into a card.
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         note = make_note(
             "note-1",
             1,
@@ -190,6 +197,7 @@ async def test_inflection_cards_are_not_duplicated_on_repeated_calls(session_fac
     forms = {"genetiivi": "kaupan", "illatiivi": "kauppaan"}
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         note = make_note("note-1", 1, forms_verified=True, principal_forms=forms)
         session.add(note)
         await session.flush()
@@ -214,6 +222,7 @@ async def test_a_formless_inflection_card_is_adopted_instead_of_replaced(session
     # they get a form, they don't get thrown away and re-created.
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         note = make_note(
             "note-1",
             1,
@@ -254,6 +263,7 @@ async def test_a_formless_inflection_card_is_adopted_instead_of_replaced(session
 async def test_inflection_stays_closed_without_principal_forms_even_if_verified(session_factory):
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         note = make_note("note-1", 1, forms_verified=True, principal_forms={})
         session.add(note)
         await session.flush()
@@ -267,7 +277,9 @@ async def test_inflection_stays_closed_without_principal_forms_even_if_verified(
 async def test_sync_user_card_types_covers_every_note_for_that_user_only(session_factory):
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(User(id=2))
+        await session.flush()
         session.add(make_note("note-1", 1))
         session.add(make_note("note-2", 1))
         session.add(make_note("note-3", 2))

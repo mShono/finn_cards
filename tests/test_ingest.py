@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from conftest import log_fields
+from conftest import add_users, log_fields
 
 from kielikaveri.db.engine import create_all, make_engine, make_session_factory
 from kielikaveri.db.models import Note, NoteKind
@@ -39,7 +39,10 @@ NOW = datetime(2026, 8, 25, 10, 0, tzinfo=UTC)
 async def session_factory(tmp_path):
     engine = make_engine(f"sqlite+aiosqlite:///{tmp_path}/test.db")
     await create_all(engine)
-    yield make_session_factory(engine)
+    session_factory = make_session_factory(engine)
+    # The users the tests' rows point at (PRAGMA foreign_keys is on).
+    await add_users(session_factory, 1, 2)
+    yield session_factory
     await engine.dispose()
 
 

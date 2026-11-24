@@ -13,6 +13,7 @@ from urllib.parse import urlencode
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 from bot_helpers import make_settings
+from conftest import add_users
 from sqlalchemy import update
 
 from kielikaveri.db.books import chapter_by_number, store_book
@@ -94,7 +95,10 @@ def test_split_words_puts_exactly_the_fst_words_at_odd_indices():
 async def session_factory(tmp_path):
     engine = make_engine(f"sqlite+aiosqlite:///{tmp_path}/test.db")
     await create_all(engine)
-    yield make_session_factory(engine)
+    session_factory = make_session_factory(engine)
+    # The users the tests' rows point at (PRAGMA foreign_keys is on).
+    await add_users(session_factory, 1, 2)
+    yield session_factory
     await engine.dispose()
 
 

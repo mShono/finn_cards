@@ -19,6 +19,7 @@ from bot_helpers import (
     tg_callback_update,
     tg_text_update,
 )
+from conftest import add_users
 from sqlalchemy import select
 
 import kielikaveri.bot.learn as learn_module
@@ -44,6 +45,9 @@ async def routed(tmp_path, monkeypatch):
     engine = make_engine(f"sqlite+aiosqlite:///{tmp_path}/test.db")
     await create_all(engine)
     session_factory = make_session_factory(engine)
+    # Normally WhitelistMiddleware's job, on the first update - the helpers
+    # below insert rows before any update is sent.
+    await add_users(session_factory, 1)
 
     # Any text that reaches the chat must be visible, never a real LLM call
     check = AsyncMock(return_value=("Ответ", False, [], TokenUsage(1, 1, 2)))

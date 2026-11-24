@@ -83,6 +83,7 @@ async def make_db(tmp_path):
 async def seed(session_factory, *deck_names: str) -> list[str]:
     async with session_factory() as session:
         session.add(User(id=USER_ID))
+        await session.flush()
         deck_ids = [(await create_deck(session, USER_ID, name)).id for name in deck_names]
         await session.commit()
     return deck_ids

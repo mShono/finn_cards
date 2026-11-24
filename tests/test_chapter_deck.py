@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 from alembic.config import Config
-from sqlalchemy import create_engine, event, select, text
+from sqlalchemy import create_engine, select, text
 
 from alembic import command
 from kielikaveri.db import decks
@@ -29,17 +29,8 @@ ALEMBIC_DIR = Path(__file__).parent.parent / "alembic"
 async def make_db(tmp_path):
     engines = []
 
-    async def _make(*, foreign_keys: bool = False):
+    async def _make():
         engine = make_engine(f"sqlite+aiosqlite:///{tmp_path}/chapter_deck.db")
-        if foreign_keys:
-            # The project itself never enables this; only to check that the
-            # FK's ON DELETE SET NULL is what the DDL says.
-            @event.listens_for(engine.sync_engine, "connect")
-            def _enable_fks(dbapi_connection, _record):
-                cursor = dbapi_connection.cursor()
-                cursor.execute("PRAGMA foreign_keys=ON")
-                cursor.close()
-
         await create_all(engine)
         engines.append(engine)
         return make_session_factory(engine)
@@ -186,24 +177,10 @@ async def test_decks_with_the_same_name_do_not_interfere(make_db):
     assert sorted(d.chapter_id or "" for d in rows) == ["", "", chapter.id]
 
 
-async def test_deleting_the_book_keeps_the_deck_without_fk_enforcement(make_db):
-    """The project does not enable PRAGMA foreign_keys, so ON DELETE SET NULL
-    does not fire: the deck survives, but its chapter_id is left dangling."""
+async def test_deleting_the_book_keeps_the_deck_and_nulls_its_chapter_id(make_db):
+    """PRAGMA foreign_keys is on (db/engine.py), so the FK's ON DELETE SET
+    NULL fires: the deck survives, no longer tied to a chapter."""
     session_factory = await make_db()
-    book_id, (chapter, _) = await seed(session_factory)
-    async with session_factory() as session:
-        deck = await get_or_create_chapter_deck(session, USER_ID, chapter, "Kirja - гл.1")
-        await session.commit()
-    async with session_factory() as session:
-        await delete_book(session, book_id)
-        await session.commit()
-    (row,) = await all_decks(session_factory)
-    assert row.id == deck.id
-    assert row.chapter_id == chapter.id
-
-
-async def test_deleting_the_book_nulls_chapter_id_with_fk_enforcement(make_db):
-    session_factory = await make_db(foreign_keys=True)
     book_id, (chapter, _) = await seed(session_factory)
     async with session_factory() as session:
         deck = await get_or_create_chapter_deck(session, USER_ID, chapter, "Kirja - гл.1")

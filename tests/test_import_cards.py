@@ -45,6 +45,7 @@ async def test_import_does_not_clash_with_the_same_word_already_in_a_deck(sessio
     # "hakea" in a real deck are two different notes, not a constraint breach.
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         deck = await create_deck(session, 1, "Общая")
         session.add(
             Note(
@@ -148,6 +149,7 @@ async def test_reimport_skips_notes_imported_under_the_raw_file_id(session_facto
     payload = json.loads((DEFAULT_CARDS_DIR / "hakea.json").read_text())
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         deck = await create_deck(session, 1, "Общая")
         session.add(
             Note(
@@ -182,6 +184,7 @@ async def test_another_users_raw_file_id_does_not_block_import(session_factory):
     payload = json.loads((DEFAULT_CARDS_DIR / "hakea.json").read_text())
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(
             Note(
                 id=payload["id"],

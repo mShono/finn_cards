@@ -7,6 +7,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import InlineKeyboardButton
+from conftest import add_users
 from sqlalchemy import text
 
 from kielikaveri.bot.decks import (
@@ -18,7 +19,7 @@ from kielikaveri.bot.decks import (
 )
 from kielikaveri.db.decks import create_deck, get_or_create_default_deck, list_decks
 from kielikaveri.db.engine import create_all, make_engine, make_session_factory
-from kielikaveri.db.models import Card, CardStatus, CardType, Deck, Note, NoteKind, User
+from kielikaveri.db.models import Card, CardStatus, CardType, Deck, Note, NoteKind
 
 NOW = datetime(2026, 8, 26, 10, 0, tzinfo=UTC)
 
@@ -27,7 +28,10 @@ NOW = datetime(2026, 8, 26, 10, 0, tzinfo=UTC)
 async def session_factory(tmp_path):
     engine = make_engine(f"sqlite+aiosqlite:///{tmp_path}/test.db")
     await create_all(engine)
-    yield make_session_factory(engine)
+    session_factory = make_session_factory(engine)
+    # The users the tests' rows point at (PRAGMA foreign_keys is on).
+    await add_users(session_factory, 1, 2)
+    yield session_factory
     await engine.dispose()
 
 
@@ -136,7 +140,6 @@ async def test_list_decks_orders_by_created_at_before_creation_order(session_fac
 
 async def test_decks_list_names_every_deck_and_reports_counts(session_factory):
     async with session_factory() as session:
-        session.add(User(id=1))
         deck = await create_deck(session, 1, "Общая")
         await session.flush()
         session.add(
@@ -304,7 +307,6 @@ async def test_deck_screens_count_only_their_own_deck_cards(session_factory):
     # relative to the real now.
     past = datetime.now(UTC) - timedelta(days=1)
     async with session_factory() as session:
-        session.add(User(id=1))
         deck_a = await create_deck(session, 1, "Общая")
         deck_b = await create_deck(session, 1, "Из книги")
         await session.flush()

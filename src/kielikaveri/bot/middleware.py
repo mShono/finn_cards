@@ -3,12 +3,16 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import weakref
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 from aiogram import BaseMiddleware
 from aiogram.types import TelegramObject, Update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from kielikaveri.db.models import User
 from kielikaveri.logging_context import new_trace_id, trace_id_var
 
 logger = logging.getLogger(__name__)
@@ -143,10 +147,41 @@ class WhitelistMiddleware(BaseMiddleware):
     (i.e. via `dp.update.outer_middleware(...)`, not passed to the
     Dispatcher constructor) so `event_from_user` is already resolved for
     every update type by the time this runs.
+
+    Also creates the whitelisted user's `users` row on their first update,
+    which is why it needs `session_factory` in the dispatcher's data
+    (dp.start_polling(..., session_factory=...)).
     """
 
     def __init__(self, whitelist: set[int]) -> None:
         self._whitelist = whitelist
+        # User ids whose `users` row is known to exist, per database (one
+        # session factory per engine; tests make a fresh one per test).
+        # Saves a write transaction on every update after the first.
+        self._known_users: weakref.WeakKeyDictionary[async_sessionmaker[AsyncSession], set[int]] = (
+            weakref.WeakKeyDictionary()
+        )
+
+    async def _ensure_user_row(
+        self, session_factory: async_sessionmaker[AsyncSession], user_id: int
+    ) -> None:
+        """Creates the `users` row every user_id column references -
+        PRAGMA foreign_keys is on (db/engine.py), so no deck, note, card or
+        book can be saved for a user without one. INSERT OR IGNORE: a second
+        process, a concurrent update or an import_cards.py run may have
+        created it already."""
+        known = self._known_users.setdefault(session_factory, set())
+        if user_id in known:
+            return
+        async with session_factory() as session:
+            await session.execute(
+                sqlite_insert(User)
+                .values(id=user_id)
+                .on_conflict_do_nothing(index_elements=[User.id])
+            )
+            await session.commit()
+        # Only after the commit: a failed insert is retried on the next update.
+        known.add(user_id)
 
     async def __call__(
         self,
@@ -158,6 +193,8 @@ class WhitelistMiddleware(BaseMiddleware):
 
         if user is not None:
             if user.id in self._whitelist:
+                # Strictly after the whitelist check: a stranger gets no row.
+                await self._ensure_user_row(data["session_factory"], user.id)
                 return await handler(event, data)
             logger.warning("event=route.blocked reason=whitelist user_id=%s", user.id)
             data["_route_blocked"] = True

@@ -195,22 +195,22 @@ async def delete_confirm(
         # None-check above (neither has committed yet) - same race class as
         # learn_rate/ingest_cache. There's no FSM state to claim ahead of the
         # first await here (the note to delete isn't known until session.get()
-        # itself returns), so the DELETE's rowcount is the guard instead: only
-        # the invocation that actually removed a row may report success or
-        # touch its cards/reviews.
+        # itself returns), so the note DELETE's rowcount is the guard instead:
+        # only the invocation that actually removed the row may report success.
+        #
+        # Children first: there is no ON DELETE CASCADE (db/models.py) and
+        # PRAGMA foreign_keys is on (db/engine.py), so a note with cards, or a
+        # card with reviews, cannot be deleted before them. SQLite serializes
+        # the writes, so the loser of a double tap runs these after the
+        # winner's commit, finds nothing left and rolls back.
+        card_ids = select(Card.id).where(Card.note_id == note.id)
+        await session.execute(delete(Review).where(Review.card_id.in_(card_ids)))
+        await session.execute(delete(Card).where(Card.note_id == note.id))
         result = await session.execute(delete(Note).where(Note.id == note.id))
         if result.rowcount == 0:
             await session.rollback()
             await callback.answer("Уже удалено.", show_alert=True)
             return
-
-        # No ON DELETE CASCADE anywhere (db/models.py) - a Card left pointing
-        # at a deleted note_id would make learn.py's render_card crash on the
-        # next session.get(Note, ...) returning None.
-        card_ids = (await session.scalars(select(Card.id).where(Card.note_id == note.id))).all()
-        if card_ids:
-            await session.execute(delete(Review).where(Review.card_id.in_(card_ids)))
-            await session.execute(delete(Card).where(Card.id.in_(card_ids)))
         await session.commit()
 
         count = 0

@@ -160,6 +160,7 @@ async def _seed_due_cards(session_factory, count: int, now: datetime) -> None:
     the queue order is deterministic."""
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(make_note())
         await session.flush()
         for i in range(count):
@@ -174,6 +175,7 @@ async def _seed_reviewed_card(session_factory, card_id: str) -> None:
     processed it and moved the queue past it."""
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(make_note())
         await session.flush()
         session.add(make_card(card_id, "note-1", 1, due=NOW, reps=1))
@@ -314,6 +316,7 @@ async def test_concurrent_double_tap_on_the_current_head_card_records_only_one_r
     # card's FSRS stability twice off a single rating.
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(make_note())
         await session.flush()
         session.add(make_card("card-A", "note-1", 1, due=NOW))
@@ -344,6 +347,7 @@ async def test_concurrent_double_tap_on_the_current_head_card_records_only_one_r
 async def test_rating_the_card_at_queue_head_records_exactly_one_review(session_factory):
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(make_note())
         await session.flush()
         session.add(make_card("card-A", "note-1", 1, due=NOW))
@@ -385,6 +389,7 @@ async def test_a_rating_that_lifts_recognition_past_the_threshold_opens_producti
     now = datetime.now(UTC)
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(make_note())
         await session.flush()
         card = make_card("card-A", "note-1", 1, due=now, reps=3)
@@ -421,6 +426,7 @@ async def test_a_rating_that_lifts_recognition_past_the_threshold_opens_producti
 async def test_show_next_card_displays_the_head_of_a_nonempty_queue(session_factory):
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(make_note())
         await session.flush()
         session.add(make_card("card-A", "note-1", 1, due=NOW))
@@ -487,6 +493,7 @@ async def test_the_next_session_picks_up_the_cards_the_cap_left_behind(session_f
 async def test_session_ends_once_the_time_limit_is_reached(session_factory):
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(make_note())
         await session.flush()
         session.add(make_card("card-A", "note-1", 1, due=NOW))
@@ -515,6 +522,7 @@ async def test_session_ends_once_the_time_limit_is_reached(session_factory):
 async def test_learn_reveal_shows_the_back_and_a_rating_keyboard_for_that_card(session_factory):
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(make_note())
         await session.flush()
         session.add(make_card("card-A", "note-1", 1, due=NOW))
@@ -548,6 +556,7 @@ def _fake_response(status_code: int) -> SimpleNamespace:
 async def _seed_listen_card(session_factory) -> None:
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(make_note())
         await session.flush()
         session.add(make_card("card-A", "note-1", 1, due=NOW))
@@ -652,6 +661,7 @@ async def test_learn_listen_reports_a_tts_failure_as_a_message(
 async def test_learn_listen_without_an_openai_key_answers_gracefully(session_factory):
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(make_note())
         await session.flush()
         session.add(make_card("card-A", "note-1", 1, due=NOW))
@@ -674,6 +684,7 @@ async def test_learn_listen_without_an_openai_key_answers_gracefully(session_fac
 async def test_learn_start_offers_debt_choice_when_overdue_exceeds_threshold(session_factory):
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(make_note())
         await session.flush()
         for i in range(3):
@@ -698,6 +709,7 @@ async def test_learn_start_goes_straight_to_reviewing_when_under_the_debt_thresh
 ):
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(make_note())
         await session.flush()
         session.add(make_card("card-A", "note-1", 1, due=NOW - timedelta(days=1)))
@@ -722,6 +734,7 @@ async def test_learn_start_does_not_count_never_reviewed_cards_as_debt(session_f
     # batch of new forms would read as missed reviews and trigger the prompt.
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(make_note())
         await session.flush()
         for i in range(3):
@@ -745,6 +758,7 @@ async def test_learn_start_does_not_count_never_reviewed_cards_as_debt(session_f
 async def test_learn_start_skips_the_picker_with_a_single_deck(session_factory):
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         deck = await create_deck(session, 1, "Общая")
         await session.flush()
         session.add(make_note(deck_id=deck.id))
@@ -770,6 +784,7 @@ async def test_learn_start_skips_the_picker_with_a_single_deck(session_factory):
 async def test_learn_start_asks_which_deck_when_more_than_one_exists(session_factory):
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         await create_deck(session, 1, "Общая")
         await create_deck(session, 1, "Из книги")
         await session.commit()
@@ -792,6 +807,7 @@ async def test_learn_start_asks_which_deck_when_more_than_one_exists(session_fac
 async def test_learn_deck_choice_only_queues_cards_from_the_chosen_deck(session_factory):
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         deck_a = await create_deck(session, 1, "Общая")
         deck_b = await create_deck(session, 1, "Из книги")
         await session.flush()
@@ -818,6 +834,7 @@ async def test_learn_deck_choice_only_queues_cards_from_the_chosen_deck(session_
 async def test_learn_deck_choice_all_queues_cards_from_every_deck(session_factory):
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         deck_a = await create_deck(session, 1, "Общая")
         deck_b = await create_deck(session, 1, "Из книги")
         await session.flush()
@@ -846,6 +863,7 @@ async def _seed_both_sides(session_factory, now: datetime, reps: int = 0) -> Non
     """One due card of every type for one note."""
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(make_note())
         await session.flush()
         for card_type in CardType:
@@ -895,6 +913,7 @@ async def test_learn_side_choice_russian_without_production_cards_explains_why(s
     # Russian session is empty, and that is not a bug.
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(make_note())
         await session.flush()
         session.add(make_card("rec", "note-1", 1, due=NOW - timedelta(days=1)))
@@ -915,6 +934,7 @@ async def test_learn_side_choice_russian_not_due_yet_gives_no_opening_hint(sessi
     # Production cards exist, just none is due - the hint would be wrong.
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(make_note())
         await session.flush()
         session.add(make_card("rec", "note-1", 1, due=NOW - timedelta(days=1)))
@@ -943,6 +963,7 @@ async def test_learn_side_choice_finnish_with_nothing_due_does_not_claim_all_is_
     # learner away from it.
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(make_note())
         await session.flush()
         session.add(
@@ -981,6 +1002,7 @@ async def test_learn_side_choice_opens_forms_only_for_a_side_that_shows_them(
     now = datetime.now(UTC)
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         deck = await create_deck(session, 1, "Общая")
         await session.flush()
         session.add(_noun_with_forms("note-a", "talo", deck.id, now - timedelta(days=20)))
@@ -1140,6 +1162,7 @@ async def test_a_session_whose_first_card_fails_to_show_leaves_no_state_behind(s
 async def test_a_debt_prompt_that_fails_to_send_leaves_no_state_behind(session_factory):
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(make_note())
         await session.flush()
         for i in range(3):
@@ -1204,6 +1227,7 @@ async def test_a_start_ended_while_syncing_shows_no_debt_prompt(session_factory,
     # must not come back as a debt question either.
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(make_note())
         await session.flush()
         for i in range(3):
@@ -1272,6 +1296,7 @@ async def test_learn_side_choice_debt_counts_only_that_side(session_factory):
     now = datetime.now(UTC)
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(make_note())
         await session.flush()
         for i in range(3):
@@ -1306,6 +1331,7 @@ async def test_learn_debt_defer_keeps_the_chosen_side(session_factory):
     now = datetime.now(UTC)
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(make_note())
         await session.flush()
         for i in range(5):
@@ -1361,6 +1387,7 @@ async def _seed_five_overdue_cards(session_factory, now: datetime) -> None:
     # (see tests/test_queue.py).
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(make_note())
         await session.flush()
         for i in range(5):
@@ -1426,6 +1453,7 @@ async def _seed_overdue_in_two_decks(session_factory, now: datetime, a: int, b: 
     oldest cards instead of B's."""
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         deck_a = await create_deck(session, 1, "Общая")
         deck_b = await create_deck(session, 1, "Из книги")
         await session.flush()
@@ -1515,6 +1543,7 @@ async def test_learn_curriculum_opens_forms_only_in_the_chosen_deck(session_fact
     now = datetime.now(UTC)
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         deck_a = await create_deck(session, 1, "Общая")
         deck_b = await create_deck(session, 1, "Из книги")
         await session.flush()
@@ -1572,6 +1601,7 @@ async def test_learn_curriculum_opens_forms_only_in_the_chosen_deck(session_fact
 async def test_learn_start_single_deck_logs_session_start(session_factory, caplog):
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         deck = await create_deck(session, 1, "Общая")
         await session.flush()
         session.add(make_note(deck_id=deck.id))
@@ -1641,6 +1671,7 @@ async def test_show_next_card_logs_session_end_with_reason_and_counts(session_fa
 async def test_learn_reveal_logs_reveal_event(session_factory, caplog):
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(make_note())
         await session.flush()
         session.add(make_card("card-A", "note-1", 1, due=NOW))
@@ -1659,6 +1690,7 @@ async def test_learn_reveal_logs_reveal_event(session_factory, caplog):
 async def test_learn_rate_logs_db_save_with_rating(session_factory, caplog):
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(make_note())
         await session.flush()
         session.add(make_card("card-A", "note-1", 1, due=NOW))
@@ -1736,6 +1768,7 @@ async def test_learn_rate_schedules_off_the_previous_review_not_the_current_one(
 
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(make_note())
         await session.flush()
         session.add(
@@ -1815,6 +1848,7 @@ async def _seed_two_words(session_factory) -> None:
     """note-1 (hakea) with card-A and card-C, note-2 (naapuri) with card-B."""
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(make_note("note-1"))
         doomed = make_note("note-2")
         doomed.lemma = "naapuri"
@@ -1933,6 +1967,7 @@ async def _seed_two_users(session_factory) -> None:
     """User 1 with card-A (hakea), user 2 with card-X (naapuri)."""
     async with session_factory() as session:
         session.add_all([User(id=1), User(id=2)])
+        await session.flush()
         session.add(make_note("note-1"))
         foreign = make_note("note-2", user_id=2)
         foreign.lemma = "naapuri"

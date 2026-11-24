@@ -102,7 +102,9 @@ async def test_due_cards_does_not_leak_another_users_cards(session_factory):
     now = datetime(2026, 8, 24, 10, 0, tzinfo=UTC)
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(User(id=2))
+        await session.flush()
         session.add(make_note("note-1", 1))
         session.add(make_note("note-2", 2))
         await session.flush()
@@ -119,6 +121,7 @@ async def test_overdue_count_ignores_cards_not_yet_due(session_factory):
     now = datetime(2026, 8, 24, 10, 0, tzinfo=UTC)
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(make_note("note-1", 1))
         await session.flush()
         session.add(make_card("card-1", "note-1", 1, due=now - timedelta(days=1)))
@@ -137,6 +140,7 @@ async def test_count_new_cards_today_counts_first_reviews_in_the_window(session_
     now = datetime(2026, 8, 24, 10, 0, tzinfo=UTC)
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(make_note("note-1", 1))
         await session.flush()
         session.add(make_card("card-1", "note-1", 1, due=now, reps=1))
@@ -169,6 +173,7 @@ async def _seed_two_users(session_factory) -> None:
     overdue = CROSS_NOW - timedelta(days=1)
     async with session_factory() as session:
         session.add_all([User(id=1), User(id=2)])
+        await session.flush()
         session.add_all([make_note("note-1", 1), make_note("note-2", 2)])
         await session.flush()
         session.add(make_card("card-1", "note-1", 1, due=overdue, reps=1))
@@ -233,6 +238,7 @@ async def test_count_new_cards_today_window_includes_its_start_and_excludes_its_
     }
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(make_note("note-1", 1))
         await session.flush()
         for card_id, reviewed_at in first_reviews.items():
@@ -253,6 +259,7 @@ async def test_build_session_queue_caps_total_size(session_factory):
     now = datetime(2026, 8, 24, 10, 0, tzinfo=UTC)
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(make_note("note-1", 1))
         await session.flush()
         for i in range(5):
@@ -270,6 +277,7 @@ async def test_build_session_queue_holds_back_new_cards_past_the_daily_limit(ses
     now = datetime(2026, 8, 24, 10, 0, tzinfo=UTC)
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(make_note("note-1", 1))
         await session.flush()
         # 3 never-reviewed cards, all due, daily_new_limit=1.
@@ -299,6 +307,7 @@ async def test_a_new_card_backlog_larger_than_the_old_fetch_window_does_not_star
     now = datetime(2026, 8, 24, 10, 0, tzinfo=UTC)
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(make_note("note-1", 1))
         await session.flush()
         # session_max_cards=3 -> the old window was 15. 20 new cards, all due
@@ -327,6 +336,7 @@ async def test_an_exhausted_new_budget_still_leaves_due_reviews_in_the_queue(
     now = datetime(2026, 8, 24, 10, 0, tzinfo=UTC)
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(make_note("note-1", 1))
         await session.flush()
         for i in range(30):
@@ -367,6 +377,7 @@ async def test_more_reviews_than_the_session_cap_returns_the_first_ones_in_due_o
     tied = now - timedelta(hours=2)
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         # Inserted younger-note-first, so insert order contradicts the order.
         younger = make_note("note-younger", 1)
         younger.created_at = now
@@ -395,6 +406,7 @@ async def test_only_the_remaining_new_budget_is_admitted_oldest_due_first(sessio
     now = datetime(2026, 8, 24, 10, 0, tzinfo=UTC)
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(make_note("note-1", 1))
         await session.flush()
         for i in range(6):
@@ -420,6 +432,7 @@ async def test_reviews_and_new_cards_interleave_by_due_order_not_by_group(sessio
     tied = now - timedelta(hours=2)
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(make_note("note-1", 1))
         await session.flush()
         session.add(make_card("new-early", "note-1", 1, due=now - timedelta(days=1), reps=0))
@@ -453,6 +466,7 @@ async def test_a_zero_new_budget_sends_no_query_for_new_cards(tmp_path):
     try:
         async with make_session_factory(engine)() as session:
             session.add(User(id=1))
+            await session.flush()
             session.add(make_note("note-1", 1))
             await session.flush()
             session.add(make_card("new-1", "note-1", 1, due=now - timedelta(days=1), reps=0))
@@ -511,6 +525,7 @@ async def test_without_starvation_the_order_matches_the_old_single_window(
     tied = now - timedelta(hours=3)
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         for n, age in (("note-a", 2), ("note-b", 1)):
             note = make_note(n, 1)
             note.created_at = now - timedelta(days=age)
@@ -554,6 +569,7 @@ async def test_defer_overdue_tail_postpones_everything_past_keep_n(session_facto
     now = datetime(2026, 8, 24, 10, 0, tzinfo=UTC)
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(make_note("note-1", 1))
         await session.flush()
         for i in range(5):
@@ -578,6 +594,7 @@ async def test_debt_ignores_cards_that_have_never_been_reviewed(session_factory)
     now = datetime(2026, 8, 24, 10, 0, tzinfo=UTC)
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(make_note("note-1", 1))
         await session.flush()
         session.add(make_card("seen", "note-1", 1, due=now - timedelta(days=3), reps=4))
@@ -596,6 +613,7 @@ async def test_defer_overdue_tail_leaves_never_reviewed_cards_alone(session_fact
     now = datetime(2026, 8, 24, 10, 0, tzinfo=UTC)
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(make_note("note-1", 1))
         await session.flush()
         for i in range(3):
@@ -628,6 +646,7 @@ async def _seed_two_decks(session_factory) -> tuple[str, str]:
     """
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(Deck(id="deck-a", user_id=1, name="A"))
         session.add(Deck(id="deck-b", user_id=1, name="B"))
         session.add(make_note("note-a", 1, deck_id="deck-a"))
@@ -742,6 +761,7 @@ async def test_cards_sharing_a_due_second_come_out_in_syllabus_order_not_insert_
     due = now - timedelta(hours=1)
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
 
         younger = make_note("note-younger", 1)
         younger.created_at = now
@@ -790,6 +810,7 @@ async def test_the_fetch_window_cuts_a_tied_batch_at_a_fixed_point(session_facto
     forms = ["genetiivi", "partitiivi", "illatiivi", "inessiivi", "elatiivi", "adessiivi"]
     async with session_factory() as session:
         session.add(User(id=1))
+        await session.flush()
         session.add(make_note("note-1", 1))
         await session.flush()
         # Inserted last-form-first, so insert order is the reverse of the
