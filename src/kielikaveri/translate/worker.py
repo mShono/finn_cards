@@ -34,10 +34,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from kielikaveri.db.books import claim_next, reset_interrupted
 from kielikaveri.db.models import Book, BookChapter, ChapterStatus
-from kielikaveri.llm.breaker import DAY, CallBreaker, CircuitOpenError
+from kielikaveri.llm.breaker import DAY, BudgetExceededError, CallBreaker, CircuitOpenError
 from kielikaveri.translate import chapters as parsed
 from kielikaveri.translate.pipeline import (
     BookGuide,
+    MisalignedError,
     TranslationError,
     Usage,
     prepare_guide,
@@ -114,9 +115,25 @@ class ChapterEvent:
     error: str | None = None
 
 
+# Exceptions whose message is ours and never quotes the book: paragraph ids
+# (MisalignedError), call counts and windows (the breaker's). Exact types, not
+# isinstance: a subclass is a different message, so it has to be listed on its
+# own. Not RefusedError: the model's refusal can quote the text.
+_SAFE_MESSAGE_TYPES: frozenset[type[BaseException]] = frozenset(
+    {MisalignedError, CircuitOpenError, BudgetExceededError, _ChapterGone}
+)
+HIDDEN_DETAILS = "(details hidden)"
+
+
 def _error_text(exc: BaseException) -> str:
-    # Class name first: the bot tells a refusal from a misalignment by it.
-    return f"{type(exc).__name__}: {exc}"[:_ERROR_CHARS]
+    """chapters.error: "Class: message" for the exceptions above, "Class:
+    (details hidden)" for the rest - str() of an API or JSON error, or of a
+    refusal, can quote the book (plan М17).
+
+    Class name first: the bot tells a refusal from a misalignment by it."""
+    cls = type(exc)
+    detail = str(exc) if cls in _SAFE_MESSAGE_TYPES else HIDDEN_DETAILS
+    return f"{cls.__name__}: {detail}"[:_ERROR_CHARS]
 
 
 def _guide(book: Book) -> BookGuide | None:
