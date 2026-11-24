@@ -2,9 +2,9 @@
 aiohttp app inside the bot's process that serves the Mini App's static files
 and its /api. Caddy terminates HTTPS in front of it; it listens on localhost.
 
-Every /api request is checked against initData and the whitelist
-(reader/auth.py). The static files are public - they are code, the book
-only ever comes through /api.
+Every request is checked against initData and the whitelist
+(reader/auth.py), except the few public routes: the page itself and its
+static files - they are code, the book only ever comes through /api.
 
 Logs carry ids, statuses and chapter numbers - never book text or initData.
 """
@@ -40,7 +40,31 @@ TRANSLATOR = web.AppKey("translator", Translator)
 # The reader's own breaker (plan 2026-11-20-kirjakaveri-reader, И6): word
 # lookup and TTS at reading pace must not trip the bot's shared one.
 READER_BREAKER = web.AppKey("reader_breaker", CallBreaker)
+# The routes anyone may fetch without initData (the page and its static
+# files). Matched by the resource routing chose, not by the path string, so
+# no spelling of a path (dot segments, percent-encoding) can reach an /api
+# handler as "public".
+PUBLIC_RESOURCES = web.AppKey("public_resources", frozenset)
 USER_ID = web.RequestKey("user_id", int)
+
+# Only what the page loads: its own files, Telegram's script and its own
+# /api. 'unsafe-inline' in style-src is for telegram-web-app.js: inside
+# web.telegram.org's iframe it fills a <style> element with the theme CSS
+# the client posts to it (event "set_custom_style"). No frame-ancestors:
+# web.telegram.org embeds the app in an iframe, and the full list of
+# Telegram's embedding origins is not documented.
+CSP_DIRECTIVES = (
+    "default-src 'none'",
+    "script-src 'self' https://telegram.org",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self'",
+    "connect-src 'self'",
+    "base-uri 'none'",
+    "form-action 'none'",
+)
+CONTENT_SECURITY_POLICY = "; ".join(CSP_DIRECTIVES)
+# Replaces aiohttp's "Python/3.x aiohttp/3.x": no versions to look up CVEs by.
+SERVER_HEADER = "kirjakaveri"
 
 Handler = Callable[[web.Request], Awaitable[web.StreamResponse]]
 
@@ -72,12 +96,10 @@ async def log_requests(request: web.Request, handler: Handler) -> web.StreamResp
 
 @web.middleware
 async def check_init_data(request: web.Request, handler: Handler) -> web.StreamResponse:
-    if not request.path.startswith("/api/"):
-        response = await handler(request)
-        # Telegram's WebView caches hard: without revalidation a deploy's
-        # new app.js may never reach the phone.
-        response.headers["Cache-Control"] = "no-cache"
-        return response
+    # Runs after routing: an unknown path is refused as 401 before it can
+    # answer 404, so the set of routes is not open to probing.
+    if _is_public(request):
+        return await handler(request)
     settings = request.app[SETTINGS]
     try:
         request[USER_ID] = user_id_from_header(
@@ -90,6 +112,25 @@ async def check_init_data(request: web.Request, handler: Handler) -> web.StreamR
         logger.warning("event=reader.auth_failed reason=%s", exc)
         raise web.HTTPUnauthorized() from None
     return await handler(request)
+
+
+def _is_public(request: web.Request) -> bool:
+    return request.match_info.route.resource in request.app[PUBLIC_RESOURCES]
+
+
+async def set_headers(request: web.Request, response: web.StreamResponse) -> None:
+    """on_response_prepare: every response, error pages included."""
+    if _is_public(request):
+        # Telegram's WebView caches hard: without revalidation a deploy's
+        # new app.js may never reach the phone.
+        response.headers["Cache-Control"] = "no-cache"
+    else:
+        # /api answers carry the user's books: no cache keeps a copy.
+        response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Content-Security-Policy"] = CONTENT_SECURITY_POLICY
+    response.headers["Server"] = SERVER_HEADER
 
 
 async def index(request: web.Request) -> web.FileResponse:
@@ -178,7 +219,12 @@ async def get_chapter(request: web.Request) -> web.Response:
 def make_app(
     session_factory: async_sessionmaker[AsyncSession], settings: Settings, translator: Translator
 ) -> web.Application:
+    # Every initData check would fail anyway, but a misconfigured process
+    # should not start at all: fail loudly here, not with a 401 per request.
+    if not settings.bot_token:
+        raise ValueError("BOT_TOKEN is empty: the reader cannot check initData")
     app = web.Application(middlewares=[log_requests, check_init_data])
+    app.on_response_prepare.append(set_headers)
     app[SESSION_FACTORY] = session_factory
     app[SETTINGS] = settings
     app[TRANSLATOR] = translator
@@ -186,8 +232,9 @@ def make_app(
         settings.reader_breaker_max_calls,
         timedelta(minutes=settings.reader_breaker_window_minutes),
     )
-    app.router.add_get("/", index)
+    index_route = app.router.add_get("/", index)
     app.router.add_get("/api/books", list_books)
     app.router.add_get("/api/chapters/{chapter_id}", get_chapter)
-    app.router.add_static("/static/", STATIC_DIR)
+    static = app.router.add_static("/static/", STATIC_DIR)
+    app[PUBLIC_RESOURCES] = frozenset({index_route.resource, static})
     return app

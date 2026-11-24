@@ -9,12 +9,17 @@ from kielikaveri.llm.breaker import CallBreaker
 from kielikaveri.reader.app import READER_BREAKER, make_app
 
 
+def settings_with(**overrides):
+    # make_app refuses an empty BOT_TOKEN.
+    return make_settings(bot_token="123456:TEST", **overrides)
+
+
 def app_with(settings, translator=None):
     return make_app(MagicMock(), settings, translator or MagicMock())
 
 
 def test_app_has_its_own_breaker_with_default_limits():
-    breaker = app_with(make_settings())[READER_BREAKER]
+    breaker = app_with(settings_with())[READER_BREAKER]
 
     assert isinstance(breaker, CallBreaker)
     assert breaker._max_calls == 150
@@ -23,7 +28,7 @@ def test_app_has_its_own_breaker_with_default_limits():
 
 
 def test_limits_come_from_settings():
-    settings = make_settings(reader_breaker_max_calls=7, reader_breaker_window_minutes=3)
+    settings = settings_with(reader_breaker_max_calls=7, reader_breaker_window_minutes=3)
 
     breaker = app_with(settings)[READER_BREAKER]
 
@@ -32,7 +37,7 @@ def test_limits_come_from_settings():
 
 
 def test_each_app_gets_a_fresh_breaker_not_one_passed_in():
-    settings = make_settings()
+    settings = settings_with()
     session_factory, translator = MagicMock(), MagicMock()
     bot_breaker = CallBreaker(
         settings.breaker_max_calls, timedelta(minutes=settings.breaker_window_minutes)
@@ -47,7 +52,7 @@ def test_each_app_gets_a_fresh_breaker_not_one_passed_in():
 
 
 def test_reader_breaker_trips_independently_of_the_bot_breaker():
-    settings = make_settings(reader_breaker_max_calls=150)
+    settings = settings_with(reader_breaker_max_calls=150)
     bot_breaker = CallBreaker(
         settings.breaker_max_calls, timedelta(minutes=settings.breaker_window_minutes)
     )
