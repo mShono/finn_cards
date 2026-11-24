@@ -8,6 +8,92 @@
 # README.md ("Auto-deploy").
 set -euo pipefail
 
+# The sqlite file the bot uses, resolved like scripts/backup_db.sh does:
+# DB_PATH, else DATABASE_URL (main() has already taken it from .env), else
+# the bot's default from config.py. A relative path is relative to the
+# checkout, which is the current directory here.
+db_file_path() {
+    if [[ -n "${DB_PATH:-}" ]]; then
+        printf '%s\n' "$DB_PATH"
+        return
+    fi
+    local db_url="${DATABASE_URL:-sqlite+aiosqlite:///./kielikaveri.db}"
+    if [[ "$db_url" != sqlite*:///* ]]; then
+        echo "!! DATABASE_URL is not a sqlite URL: $db_url" >&2
+        return 1
+    fi
+    local path="${db_url#*:///}"
+    if [[ "$path" != /* ]]; then
+        path="$PWD/$path"
+    fi
+    printf '%s\n' "$path"
+}
+
+# Refuses to deploy while a chapter is being translated: the stop would cut
+# it off, and on start it goes back to `queued` and is translated - and paid
+# for - again from scratch (db/books.py). Runs before anything changes, so a
+# refusal leaves the bot running on the old code. FORCE_DEPLOY=1 skips it.
+# `queued` chapters are not counted: they lose nothing on a restart. A
+# chapter picked up in the second between this check and the stop is not
+# caught; that's accepted.
+check_no_translating() {
+    local sha="$1" app_dir="$2"
+    local force_hint="To deploy anyway, on the server as kielikaveri:
+     cd $app_dir && FORCE_DEPLOY=1 SSH_ORIGINAL_COMMAND=$sha scripts/deploy_entry.sh"
+
+    if [[ "${FORCE_DEPLOY:-}" == 1 ]]; then
+        echo "==> FORCE_DEPLOY=1: not checking for chapters being translated"
+        return
+    fi
+
+    echo "==> Checking for chapters being translated"
+    # A missing sqlite3 or database is an error, not a warning: backup_db.sh
+    # needs both a few steps later and would fail anyway - only after the
+    # bot was already stopped.
+    if ! command -v sqlite3 >/dev/null; then
+        echo "!! sqlite3 not found (apt install sqlite3). Not deploying, the bot keeps running." >&2
+        echo "   backup_db.sh needs it too, so FORCE_DEPLOY=1 would only fail later." >&2
+        exit 1
+    fi
+    local db_path
+    if ! db_path="$(db_file_path)"; then
+        echo "!! Not deploying, the bot keeps running." >&2
+        exit 1
+    fi
+    if [[ ! -f "$db_path" ]]; then
+        echo "!! database not found: $db_path. Not deploying, the bot keeps running." >&2
+        echo "   Check DATABASE_URL in $app_dir/.env (backup_db.sh needs the file too)." >&2
+        exit 1
+    fi
+
+    # Read-only; waits up to 5s if the bot holds a write lock right now.
+    local sql=(sqlite3 -readonly -cmd ".timeout 5000" "$db_path")
+    local has_table count
+    if ! has_table="$("${sql[@]}" "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'chapters'")"; then
+        echo "!! could not read $db_path. Not deploying, the bot keeps running." >&2
+        echo "   $force_hint" >&2
+        exit 1
+    fi
+    if [[ "$has_table" == 0 ]]; then
+        # A database from before the books migration: nothing to lose.
+        echo "==> No chapters table yet"
+        return
+    fi
+    if ! count="$("${sql[@]}" "SELECT count(*) FROM chapters WHERE status = 'translating'")"; then
+        echo "!! could not read the chapters table in $db_path. Not deploying, the bot keeps running." >&2
+        echo "   $force_hint" >&2
+        exit 1
+    fi
+    if [[ "$count" != 0 ]]; then
+        echo "!! $count chapter(s) being translated right now. Not deploying, the bot keeps running:" >&2
+        echo "   a stop would throw that paid translation away, and the chapter would start over." >&2
+        echo "   Wait until the bot reports the chapter ready (or failed), then run the deploy again." >&2
+        echo "   $force_hint" >&2
+        exit 1
+    fi
+    echo "==> No chapters being translated"
+}
+
 main() {
     local sha="$1"
     local app_dir="${APP_DIR:-/opt/kielikaveri/finn_cards}"
@@ -17,6 +103,24 @@ main() {
     local uv="${UV:-$HOME/.local/bin/uv}"
 
     cd "$app_dir"
+
+    # The bot reads DATABASE_URL from .env itself (pydantic), but alembic only
+    # sees the environment - without this it would fall back to alembic.ini
+    # and could migrate (or create) a different database than the bot uses.
+    # Only this one value: sourcing the whole .env would break on any value
+    # with spaces or shell metacharacters. Read before the stop: the
+    # translation check below needs it too.
+    local db_url
+    db_url="$(sed -n 's/^DATABASE_URL=//p' .env | tail -n 1)"
+    db_url="${db_url#\"}"
+    db_url="${db_url%\"}"
+    if [[ -n "$db_url" ]]; then
+        export DATABASE_URL="$db_url"
+    fi
+
+    # Nothing has changed yet (deploy_entry.sh only fetched): a refusal here
+    # leaves the old code on disk and the bot running.
+    check_no_translating "$sha" "$app_dir"
 
     # Stop first, before the code on disk changes: if any later step fails,
     # the bot stays stopped on purpose. Otherwise a failed install would leave
@@ -42,19 +146,6 @@ main() {
     if ! .venv/bin/python -c 'import sys; from uralicNLP import uralicApi; sys.exit(0 if uralicApi.is_language_installed("fin") else 1)'; then
         echo "==> Finnish FST model missing, downloading (~370MB)"
         .venv/bin/python -c 'from uralicNLP import uralicApi; uralicApi.download("fin")'
-    fi
-
-    # The bot reads DATABASE_URL from .env itself (pydantic), but alembic only
-    # sees the environment - without this it would fall back to alembic.ini
-    # and could migrate (or create) a different database than the bot uses.
-    # Only this one value: sourcing the whole .env would break on any value
-    # with spaces or shell metacharacters.
-    local db_url
-    db_url="$(sed -n 's/^DATABASE_URL=//p' .env | tail -n 1)"
-    db_url="${db_url#\"}"
-    db_url="${db_url%\"}"
-    if [[ -n "$db_url" ]]; then
-        export DATABASE_URL="$db_url"
     fi
 
     echo "==> Backing up the database"
