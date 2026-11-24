@@ -287,36 +287,97 @@ function renderLookup(data, address) {
   keepVisible(current.span);
 }
 
-// 🔊: the mp3 comes through fetch (an <audio src> can't send Authorization),
-// plays from a blob: URL, and the URL is revoked once it has played.
-async function playWord(address, button, errorNode) {
+// 🔊: the mp3 comes through fetch (an <audio src> can't send Authorization)
+// and plays through Web Audio. An Audio element on a blob: URL, played after
+// an awaited fetch, stayed silent in Telegram (Android and web): the tap's user activation is
+// gone by then. An AudioContext resumed synchronously inside the tap stays
+// unlocked, so the sound may start whenever the fetch ends.
+let audioContext = null;
+let audioSource = null;
+
+function unlockAudio() {
+  const Context = window.AudioContext || window.webkitAudioContext;
+  if (!Context) return null;
+  if (!audioContext) audioContext = new Context();
+  // Must run in the tap itself, before any await.
+  if (audioContext.state !== "running") audioContext.resume().catch(() => {});
+  return audioContext;
+}
+
+function stopSound() {
+  if (audioSource) {
+    try {
+      audioSource.stop();
+    } catch (_) {
+      // Already stopped.
+    }
+    audioSource = null;
+  }
+}
+
+function soundErrorText(error) {
+  // The error's name only (NotAllowedError, EncodingError, ...): it helps to
+  // tell an autoplay block from a broken file, and carries no book text.
+  return error && error.name ? `Не получилось воспроизвести (${error.name}).` : TRY_AGAIN;
+}
+
+function playWord(address, button, errorNode) {
   if (button.disabled) return;
+  const context = unlockAudio();
+  if (!context) {
+    errorNode.textContent = "Этот браузер не умеет воспроизводить звук.";
+    return;
+  }
   button.disabled = true;
   errorNode.textContent = "";
+  stopSound();
   const controller = new AbortController();
   audioController = controller;
-  let blob;
+  fetchAndPlay(context, address, controller, button, errorNode);
+}
+
+async function fetchAndPlay(context, address, controller, button, errorNode) {
+  let data;
   try {
-    blob = await (await request("api/tts", { body: address, signal: controller.signal })).blob();
+    const response = await request("api/tts", { body: address, signal: controller.signal });
+    data = await response.arrayBuffer();
   } catch (error) {
     if (error.name !== "AbortError") errorNode.textContent = errorText(error);
     button.disabled = false;
     return;
   }
   if (controller.signal.aborted) return;
-  const url = URL.createObjectURL(blob);
-  const audio = new Audio(url);
-  const done = () => {
-    URL.revokeObjectURL(url);
-    button.disabled = false;
-  };
-  audio.addEventListener("ended", done, { once: true });
-  audio.addEventListener("error", done, { once: true });
   try {
-    await audio.play();
-  } catch (_) {
-    done();
-    errorNode.textContent = TRY_AGAIN;
+    // The callback form: older Safari has no promise-returning decodeAudioData.
+    const buffer = await new Promise((resolve, reject) =>
+      context.decodeAudioData(data, resolve, reject));
+    if (controller.signal.aborted) return;
+    // The tap's resume() may still be settling: wait for it, but at most a
+    // second - when the browser refused the unlock it can stay pending forever.
+    if (context.state !== "running") {
+      await Promise.race([
+        context.resume().catch(() => {}),
+        new Promise((resolve) => setTimeout(resolve, 1000)),
+      ]);
+    }
+    if (controller.signal.aborted) return;
+    if (context.state !== "running") {
+      button.disabled = false;
+      errorNode.textContent = `Не получилось воспроизвести (AudioContext: ${context.state}).`;
+      return;
+    }
+    const source = context.createBufferSource();
+    source.buffer = buffer;
+    source.connect(context.destination);
+    source.onended = () => {
+      if (audioSource === source) audioSource = null;
+      button.disabled = false;
+    };
+    audioSource = source;
+    source.start();
+  } catch (error) {
+    button.disabled = false;
+    errorNode.textContent = soundErrorText(error);
   }
 }
 
@@ -330,6 +391,7 @@ function closePopup() {
     audioController.abort();
     audioController = null;
   }
+  stopSound();
   if (popup.hidden) return;
   popup.hidden = true;
   popup.replaceChildren();
