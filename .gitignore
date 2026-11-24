@@ -8,3 +8,5 @@ __pycache__/
 *.db-journal
 .ruff_cache/
 logs/
+*.db-wal
+*.db-shm
