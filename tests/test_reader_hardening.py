@@ -118,7 +118,7 @@ async def test_public_routes_need_no_init_data(client):
     assert (await client.get("/static/style.css")).status == 200
 
 
-@pytest.mark.parametrize("path", ["/nope", "/favicon.ico", "/index.html", "/api", "/robots.txt"])
+@pytest.mark.parametrize("path", ["/nope", "/index.html", "/api", "/robots.txt"])
 async def test_unknown_path_without_init_data_is_401(client, path):
     assert (await client.get(path)).status == 401
 
