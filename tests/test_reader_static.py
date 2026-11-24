@@ -85,8 +85,15 @@ def test_lookup_and_tts_are_posts():
         assert calls.get(path) == {"POST"}, path
 
 
-def test_audio_plays_from_a_revoked_blob_url():
-    assert "URL.createObjectURL" in APP_JS
-    assert "URL.revokeObjectURL" in APP_JS
-    assert "new Audio(" in APP_JS
+def test_audio_is_unlocked_inside_the_tap():
+    # An Audio element played after an awaited fetch stayed silent in
+    # Telegram: the AudioContext must be resumed in the click handler itself,
+    # i.e. in a synchronous playWord, before the first await.
+    assert "AudioContext" in APP_JS
+    assert "decodeAudioData" in APP_JS
     assert "AbortController" in APP_JS
+    assert "new Audio(" not in APP_JS
+    assert "async function playWord" not in APP_JS
+    body = APP_JS.split("function playWord", 1)[1].split("\n}\n", 1)[0]
+    assert "unlockAudio()" in body
+    assert "await" not in body
