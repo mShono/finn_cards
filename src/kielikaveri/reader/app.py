@@ -3,8 +3,8 @@ aiohttp app inside the bot's process that serves the Mini App's static files
 and its /api. Caddy terminates HTTPS in front of it; it listens on localhost.
 
 Every request is checked against initData and the whitelist
-(reader/auth.py), except the few public routes: the page itself and its
-static files - they are code, the book only ever comes through /api.
+(reader/auth.py), except the few public routes: the page itself, its
+static files and /favicon.ico - they are code, the book only ever comes through /api.
 
 Logs carry ids, statuses and chapter numbers - never book text or initData.
 """
@@ -40,8 +40,8 @@ TRANSLATOR = web.AppKey("translator", Translator)
 # The reader's own breaker (plan 2026-11-20-kirjakaveri-reader, И6): word
 # lookup and TTS at reading pace must not trip the bot's shared one.
 READER_BREAKER = web.AppKey("reader_breaker", CallBreaker)
-# The routes anyone may fetch without initData (the page and its static
-# files). Matched by the resource routing chose, not by the path string, so
+# The routes anyone may fetch without initData (the page, its static
+# files and /favicon.ico). Matched by the resource routing chose, not by the path string, so
 # no spelling of a path (dot segments, percent-encoding) can reach an /api
 # handler as "public".
 PUBLIC_RESOURCES = web.AppKey("public_resources", frozenset)
@@ -135,6 +135,12 @@ async def set_headers(request: web.Request, response: web.StreamResponse) -> Non
 
 async def index(request: web.Request) -> web.FileResponse:
     return web.FileResponse(STATIC_DIR / "index.html")
+
+
+async def favicon(request: web.Request) -> web.FileResponse:
+    # Browsers ask for /favicon.ico on their own, without initData: answered
+    # here so it is not a 401 and a reader.auth_failed warning on every open.
+    return web.FileResponse(STATIC_DIR / "favicon.svg", headers={"Content-Type": "image/svg+xml"})
 
 
 async def list_books(request: web.Request) -> web.Response:
@@ -233,8 +239,9 @@ def make_app(
         timedelta(minutes=settings.reader_breaker_window_minutes),
     )
     index_route = app.router.add_get("/", index)
+    favicon_route = app.router.add_get("/favicon.ico", favicon)
     app.router.add_get("/api/books", list_books)
     app.router.add_get("/api/chapters/{chapter_id}", get_chapter)
     static = app.router.add_static("/static/", STATIC_DIR)
-    app[PUBLIC_RESOURCES] = frozenset({index_route.resource, static})
+    app[PUBLIC_RESOURCES] = frozenset({index_route.resource, favicon_route.resource, static})
     return app
