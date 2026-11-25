@@ -2,9 +2,17 @@
 
 The word is spoken as the text spells it (decided 24.11.2026). The mp3
 lands in a file cache - READER_TTS_CACHE_DIR, named by the hash of model,
-voice, speed and text - so the same word costs one OpenAI call ever. A file
-is written to a temporary name and renamed into place: a reader never sees
-half an mp3, even if the process dies mid-write.
+voice, speed, instructions and text - so the same word costs one OpenAI call
+ever. A file is written to a temporary name and renamed into place: a reader
+never sees half an mp3, even if the process dies mid-write.
+
+OpenAI sometimes answers with a clip that holds no speech: valid mp3 frames,
+about a second of near-silence (peak -45..-55 dBFS; Android's WebView plays
+it as loud white noise). Seen 25.11.2026 on tts-1 for short inputs - 4 of 5
+tries of one word, 5 of 6 of a short sentence - and once in 15 on tts-1-hd;
+gpt-4o-mini-tts gave none in 15. Cached, such a clip would silence the word
+for good, so every fresh clip goes through has_speech first: an empty one is
+retried once and never written.
 
 Logs carry ids, cache hits, sizes and time - never the word.
 """
@@ -28,9 +36,89 @@ from kielikaveri.tts import TTS_VOICE, synthesize_speech
 
 logger = logging.getLogger(__name__)
 
+# For gpt-4o-mini-tts: one clear reading, without the tts-1 dropouts above.
+INSTRUCTIONS = "Speak the Finnish text clearly, once, in a neutral tone, at a natural pace."
+# A fresh clip without speech is asked for once more, then given up on.
+SPEECH_ATTEMPTS = 2
+
+# MPEG audio frame header fields, by version (3 = MPEG-1, 2 = MPEG-2,
+# 0 = MPEG-2.5; 1 is reserved). Layer III only: that is what OpenAI sends.
+_BITRATES_KBPS = {
+    3: (0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320),
+    2: (0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160),
+}
+_SAMPLE_RATES = {3: (44100, 48000, 32000), 2: (22050, 24000, 16000), 0: (11025, 12000, 8000)}
+# The loudest frame's global_gain (the quantizer step, so the overall level)
+# in OpenAI's clips, 25.11.2026: 127-133 in all 13 empty ones, 152-162 in
+# all 47 with speech, on tts-1, tts-1-hd and gpt-4o-mini-tts alike.
+_SPEECH_MIN_GAIN = 145
+
+
+def _frame_gains(audio: bytes) -> list[int]:
+    """global_gain of granule 0, channel 0, of every Layer III frame that
+    carries audio; ID3 tags and stray bytes are skipped."""
+    gains = []
+    i = 0
+    if audio[:3] == b"ID3" and len(audio) >= 10:
+        i = 10 + ((audio[6] << 21) | (audio[7] << 14) | (audio[8] << 7) | audio[9])
+    while i + 4 <= len(audio):
+        header = int.from_bytes(audio[i : i + 4], "big")
+        version = (header >> 19) & 3
+        layer = (header >> 17) & 3
+        bitrate_index = (header >> 12) & 15
+        rate_index = (header >> 10) & 3
+        if (
+            header >> 21 != 0x7FF
+            or version == 1
+            or layer != 1
+            or bitrate_index in (0, 15)
+            or rate_index == 3
+        ):
+            i += 1
+            continue
+        mpeg1 = version == 3
+        bitrate = _BITRATES_KBPS[3 if mpeg1 else 2][bitrate_index] * 1000
+        rate = _SAMPLE_RATES[version][rate_index]
+        size = (144 if mpeg1 else 72) * bitrate // rate + ((header >> 9) & 1)
+        mono = (header >> 6) & 3 == 3
+        side = i + 4 + (0 if header & 0x10000 else 2)  # protection bit 0: a CRC follows
+        if side + 9 > len(audio):
+            break
+        bits = int.from_bytes(audio[side : side + 9], "big")
+        # Side info up to granule 0, channel 0: main_data_begin, private bits
+        # (and scfsi for MPEG-1), then part2_3_length (12), big_values (9),
+        # global_gain (8).
+        if mpeg1:
+            skip = 9 + (5 if mono else 3) + (4 if mono else 8)
+        else:
+            skip = 8 + (1 if mono else 2)
+        part2_3_length = (bits >> (72 - skip - 12)) & 0xFFF
+        gain = (bits >> (72 - skip - 12 - 9 - 8)) & 0xFF
+        # An all-zero frame (digital silence) has no level to speak of.
+        if part2_3_length:
+            gains.append(gain)
+        i += size
+    return gains
+
+
+def has_speech(audio: bytes) -> bool:
+    """False for OpenAI's empty clips (see the module docstring) and for
+    anything that isn't an mp3 with audio in it."""
+    gains = _frame_gains(audio)
+    return bool(gains) and max(gains) >= _SPEECH_MIN_GAIN
+
+
+class EmptySpeechError(Exception):
+    """OpenAI gave no speech in SPEECH_ATTEMPTS tries."""
+
+
+def instructions_for(model: str) -> str | None:
+    # The API: instructions don't work with tts-1 and tts-1-hd.
+    return None if model.startswith("tts-1") else INSTRUCTIONS
+
 
 def cache_path(cache_dir: Path, model: str, speed: float, text: str) -> Path:
-    composite = f"{model}\n{TTS_VOICE}\n{speed!r}\n{text}"
+    composite = f"{model}\n{TTS_VOICE}\n{speed!r}\n{instructions_for(model)}\n{text}"
     return cache_dir / (hashlib.sha256(composite.encode("utf-8")).hexdigest() + ".mp3")
 
 
@@ -63,15 +151,15 @@ async def speak(
     target: Target,
 ) -> bytes:
     """The mp3 of target.surface. Raises CircuitOpenError (and
-    BudgetExceededError) and OpenAI's errors on a cache miss."""
+    BudgetExceededError), OpenAI's errors and EmptySpeechError on a cache
+    miss."""
     path = cache_path(cache_dir, model, speed, target.surface)
     started = time.monotonic()
     async with locks.hold(path.name):
         audio = await asyncio.to_thread(_read, path)
         cached = audio is not None
         if audio is None:
-            breaker.check(datetime.now(UTC))
-            audio = await synthesize_speech(client, model, target.surface, speed)
+            audio = await _synthesize(client, breaker, model, speed, target)
             await asyncio.to_thread(_write_atomically, path, audio)
     logger.info(
         "event=reader.tts chapter_id=%s paragraph=%d token=%d cached=%s bytes=%d duration_ms=%d",
@@ -83,3 +171,25 @@ async def speak(
         (time.monotonic() - started) * 1000,
     )
     return audio
+
+
+async def _synthesize(
+    client: AsyncOpenAI, breaker: CallBreaker, model: str, speed: float, target: Target
+) -> bytes:
+    for attempt in range(1, SPEECH_ATTEMPTS + 1):
+        # Every try is an OpenAI call: each one goes through the breaker.
+        breaker.check(datetime.now(UTC))
+        audio = await synthesize_speech(
+            client, model, target.surface, speed, instructions=instructions_for(model)
+        )
+        if has_speech(audio):
+            return audio
+        logger.warning(
+            "event=reader.tts_empty chapter_id=%s paragraph=%d token=%d attempt=%d bytes=%d",
+            target.chapter_id,
+            target.paragraph,
+            target.token,
+            attempt,
+            len(audio),
+        )
+    raise EmptySpeechError

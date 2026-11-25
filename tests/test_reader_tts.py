@@ -6,6 +6,7 @@ word as mp3, cached on disk. OpenAI is a fake: no network."""
 # ruff: noqa: F811
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -28,15 +29,28 @@ from test_reader_lookup import (  # noqa: F401 - fixtures among them
 )
 
 from kielikaveri.reader.app import LOOKUP_CLIENT, TTS_CLIENT, TTS_LOCKS, make_app
-from kielikaveri.reader.speech import cache_path
+from kielikaveri.reader.speech import INSTRUCTIONS, cache_path, has_speech
 
-MP3 = b"ID3fake-mp3"
+DATA = Path(__file__).parent / "data"
+# Real OpenAI answers (25.11.2026, words picked for the test, not book text):
+# gpt-4o-mini-tts saying "kirja", and tts-1's empty clip for "talossa" -
+# valid mp3, near-silence, the reason for has_speech.
+MP3 = (DATA / "tts_speech.mp3").read_bytes()
+EMPTY_MP3 = (DATA / "tts_empty.mp3").read_bytes()
+MODEL = "gpt-4o-mini-tts"
 
 
 class FakeTTS:
-    def __init__(self, delay: float = 0.0, error: Exception | None = None):
+    def __init__(
+        self,
+        delay: float = 0.0,
+        error: Exception | None = None,
+        answers: list[bytes] | None = None,
+    ):
         self.delay = delay
         self.error = error
+        # Answers in turn; past the list (or without one), MP3.
+        self.answers = list(answers or [])
         self.calls: list[dict] = []
         self.audio = SimpleNamespace(speech=SimpleNamespace(create=self._create))
         self.close = AsyncMock()
@@ -47,7 +61,8 @@ class FakeTTS:
             await asyncio.sleep(self.delay)
         if self.error is not None:
             raise self.error
-        return SimpleNamespace(aread=AsyncMock(return_value=MP3))
+        audio = self.answers.pop(0) if self.answers else MP3
+        return SimpleNamespace(aread=AsyncMock(return_value=audio))
 
 
 def build_app(session_factory, tts, cache_dir, **overrides):
@@ -93,8 +108,14 @@ async def test_tts_speaks_the_word_as_the_text_spells_it(client, book, tts, cach
     assert r.headers["Cache-Control"] == "no-store"
     assert await r.read() == MP3
     [call] = tts.calls
-    assert call == {"model": "tts-1", "voice": "alloy", "input": "talossa", "speed": 0.8}
-    path = cache_path(cache_dir, "tts-1", 0.8, "talossa")
+    assert call == {
+        "model": MODEL,
+        "voice": "alloy",
+        "input": "talossa",
+        "speed": 1.0,
+        "instructions": INSTRUCTIONS,
+    }
+    path = cache_path(cache_dir, MODEL, 1.0, "talossa")
     assert path.read_bytes() == MP3
     # Written atomically: no temporary file left next to it.
     assert [p.name for p in cache_dir.iterdir()] == [path.name]
@@ -113,7 +134,7 @@ async def test_second_tts_comes_from_the_disk(client, book, tts):
 async def test_an_existing_file_is_served_without_openai(client, book, tts, cache_dir):
     _, chapter_id, _ = book
     cache_dir.mkdir(parents=True)
-    cache_path(cache_dir, "tts-1", 0.8, "Mä").write_bytes(b"from-disk")
+    cache_path(cache_dir, MODEL, 1.0, "Mä").write_bytes(b"from-disk")
 
     r = await post(client, body(chapter_id, token=MA))
 
@@ -127,9 +148,88 @@ def test_file_name_depends_on_model_speed_and_text(tmp_path):
         cache_path(tmp_path, "tts-2", 0.8, "talo").name,
         cache_path(tmp_path, "tts-1", 1.0, "talo").name,
         cache_path(tmp_path, "tts-1", 0.8, "Talo").name,
+        cache_path(tmp_path, MODEL, 0.8, "talo").name,
     }
-    assert len(names) == 4
+    assert len(names) == 5
     assert all(name.endswith(".mp3") and "talo" not in name.lower() for name in names)
+
+
+async def test_reader_settings_choose_the_model_not_learns(session_factory, book, cache_dir):
+    _, chapter_id, _ = book
+    tts = FakeTTS()
+    app = build_app(
+        session_factory,
+        tts,
+        cache_dir,
+        reader_tts_model="tts-1-hd",
+        reader_tts_speed=0.9,
+        openai_tts_model="tts-1",
+    )
+    async with TestClient(TestServer(app)) as client:
+        assert (await post(client, body(chapter_id, token=TALOSSA))).status == 200
+
+    # tts-1 models take no instructions (the API says they don't work there).
+    [call] = tts.calls
+    assert call == {"model": "tts-1-hd", "voice": "alloy", "input": "talossa", "speed": 0.9}
+    assert cache_path(cache_dir, "tts-1-hd", 0.9, "talossa").read_bytes() == MP3
+
+
+def test_has_speech_tells_openais_empty_clip_from_a_word():
+    assert has_speech(MP3)
+    assert not has_speech(EMPTY_MP3)
+    # An ID3 tag in front changes nothing.
+    tag = b"ID3\x04\x00\x00\x00\x00\x00\x05" + b"\x00" * 5
+    assert has_speech(tag + MP3)
+    assert not has_speech(tag + EMPTY_MP3)
+    # Not an mp3, or no audio at all.
+    for junk in (b"", b"ID3fake-mp3", b'{"error": "x"}', MP3[:200], b"\xff" * 64):
+        assert not has_speech(junk), junk[:16]
+
+
+async def test_an_empty_clip_is_retried_and_never_cached(
+    session_factory, book, cache_dir, debug_logs
+):
+    _, chapter_id, _ = book
+    tts = FakeTTS(answers=[EMPTY_MP3, MP3])
+    async with TestClient(TestServer(build_app(session_factory, tts, cache_dir))) as client:
+        r = await post(client, body(chapter_id, token=TALOSSA))
+        assert r.status == 200
+        assert await r.read() == MP3
+
+    assert len(tts.calls) == 2
+    assert cache_path(cache_dir, MODEL, 1.0, "talossa").read_bytes() == MP3
+    assert "event=reader.tts_empty " in debug_logs.text
+    assert "attempt=1 " in debug_logs.text
+
+
+async def test_twice_empty_is_502_and_leaves_no_file(session_factory, book, cache_dir, debug_logs):
+    _, chapter_id, _ = book
+    tts = FakeTTS(answers=[EMPTY_MP3, EMPTY_MP3])
+    async with TestClient(TestServer(build_app(session_factory, tts, cache_dir))) as client:
+        r = await post(client, body(chapter_id, token=TALOSSA))
+        assert r.status == 502
+        assert await r.json() == {"reason": "openai"}
+        # The next tap asks OpenAI again instead of serving silence.
+        again = await post(client, body(chapter_id, token=TALOSSA))
+        assert await again.read() == MP3
+
+    assert len(tts.calls) == 3
+    assert "error=EmptySpeechError" in debug_logs.text
+    for piece in BOOK_TEXT_PIECES:
+        assert piece not in debug_logs.text, piece
+
+
+async def test_each_retry_goes_through_the_breaker(session_factory, book, cache_dir):
+    _, chapter_id, _ = book
+    tts = FakeTTS(answers=[EMPTY_MP3, MP3])
+    app = build_app(session_factory, tts, cache_dir, reader_breaker_max_calls=1)
+    async with TestClient(TestServer(app)) as client:
+        r = await post(client, body(chapter_id, token=TALOSSA))
+        assert r.status == 503
+        assert await r.json() == {"reason": "rate"}
+
+    assert len(tts.calls) == 1
+    assert not cache_dir.exists() or list(cache_dir.iterdir()) == []
 
 
 async def test_double_tap_makes_one_tts_call(session_factory, book, cache_dir):

@@ -59,6 +59,11 @@ class Settings(BaseSettings):
     # voice and speed. Relative to the working directory (the repo root
     # under deploy/kielikaveri.service); git-ignored.
     reader_tts_cache_dir: str = "data/tts_cache"
+    # 🔊 of a tapped word: its own model, not /learn's OPENAI_TTS_MODEL. tts-1
+    # often answers a short input with an empty clip (reader/speech.py);
+    # gpt-4o-mini-tts didn't in a test. One word at 1.0 is slow enough.
+    reader_tts_model: str = "gpt-4o-mini-tts"
+    reader_tts_speed: float = 1.0
     # Telegram lets bots download up to 20 MB; a long novel is ~1-2 MB.
     max_book_bytes: int = 5_000_000
 

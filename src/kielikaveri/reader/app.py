@@ -42,7 +42,7 @@ from kielikaveri.reader.lookup import (
     lookup,
     resolve_target,
 )
-from kielikaveri.reader.speech import speak
+from kielikaveri.reader.speech import EmptySpeechError, speak
 from kielikaveri.translate.fst_check import split_words
 from kielikaveri.translate.worker import Translator
 from kielikaveri.tts import make_tts_client
@@ -335,13 +335,13 @@ async def speak_word(request: web.Request) -> web.Response:
         audio = await speak(
             app[TTS_CLIENT],
             app[READER_BREAKER],
-            settings.openai_tts_model,
-            settings.openai_tts_speed,
+            settings.reader_tts_model,
+            settings.reader_tts_speed,
             Path(settings.reader_tts_cache_dir),
             app[TTS_LOCKS],
             target,
         )
-    except (CircuitOpenError, OpenAIError) as exc:
+    except (CircuitOpenError, OpenAIError, EmptySpeechError) as exc:
         return _call_failed("reader.tts_failed", target, exc)
     return web.Response(body=audio, content_type="audio/mpeg")
 

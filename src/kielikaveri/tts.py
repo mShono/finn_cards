@@ -26,12 +26,18 @@ def make_tts_client(api_key: str, timeout_seconds: float) -> AsyncOpenAI:
 
 
 async def synthesize_speech(
-    client: AsyncOpenAI, model: str, text: str, speed: float = 1.0
+    client: AsyncOpenAI,
+    model: str,
+    text: str,
+    speed: float = 1.0,
+    instructions: str | None = None,
 ) -> bytes:
+    """instructions only work with gpt-4o-mini-tts and later, not tts-1."""
     logger.debug("event=tts.request model=%s speed=%s", model, speed)
     start = time.monotonic()
+    extra = {} if instructions is None else {"instructions": instructions}
     response = await client.audio.speech.create(
-        model=model, voice=TTS_VOICE, input=text, speed=speed
+        model=model, voice=TTS_VOICE, input=text, speed=speed, **extra
     )
     audio = await response.aread()
     duration_ms = int((time.monotonic() - start) * 1000)
