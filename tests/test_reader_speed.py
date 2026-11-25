@@ -249,6 +249,7 @@ async def test_a_warmup_in_flight_is_cancelled_on_shutdown(session_factory, book
 
     fake.models.retrieve.side_effect = slow
     app = build_app(session_factory, fake, tmp_path)
+    app[WARMUP] = Warmup()
     async with TestClient(TestServer(app)) as client:
         await client.get(f"/api/chapters/{chapter_id}", headers=header())
         await asyncio.sleep(0.05)

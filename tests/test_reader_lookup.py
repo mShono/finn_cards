@@ -200,6 +200,7 @@ async def test_lookup_answers_the_contract(client, book, fake):
         "sentence_ru": "— Я в доме, — сказал он.",
         "puhekieli": None,
         "cached": False,
+        "in_deck": False,
     }
 
 
