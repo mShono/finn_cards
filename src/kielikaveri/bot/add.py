@@ -28,7 +28,6 @@ import time
 import uuid
 from datetime import UTC, datetime
 
-import jsonschema
 import openai
 from aiogram import F, Router
 from aiogram.dispatcher.event.bases import SkipHandler
@@ -44,6 +43,13 @@ from kielikaveri.bot.decks import NEW_DECK_PROMPT
 from kielikaveri.bot.edit import CANCEL_WORDS
 from kielikaveri.bot.learn import LearnStates
 from kielikaveri.bot.text import split_message
+from kielikaveri.cards_save import (
+    DedupState,
+    SaveStatus,
+    SettledCandidate,
+    settle_lemma,
+    store_note,
+)
 from kielikaveri.config import Settings
 from kielikaveri.db.decks import create_deck, get_or_create_default_deck, list_decks
 from kielikaveri.db.models import (
@@ -51,19 +57,14 @@ from kielikaveri.db.models import (
     Deck,
     Note,
     Review,
-    is_note_duplicate_error,
 )
-from kielikaveri.import_cards import load_validator
 from kielikaveri.ingest import (
-    SURFACE_FIELD,
     build_chat_input,
-    build_full_note,
     check_and_suggest,
     existing_note_keys,
     get_cached_chat,
     hash_text,
     resolve_note_forms,
-    resolve_note_lemma,
     store_cached_chat,
 )
 from kielikaveri.llm.breaker import CallBreaker, CircuitOpenError
@@ -557,42 +558,20 @@ async def _save_candidates_and_report(
         existing = await existing_note_keys(session, user_id, deck_id=deck_id)
 
     client = make_client(settings.openai_api_key, settings.openai_timeout_seconds)
-    seen: set[tuple[str, str | None]] = set()
-    # (candidate, in_dictionary) - see ingest.ResolvedLemma.
-    to_add: list[tuple[dict, bool]] = []
+    dedup = DedupState(existing)
+    to_add: list[SettledCandidate] = []
     duplicate_lemmas: list[str] = []
     failed: list[tuple[str, str]] = []
     for candidate in candidates:
-        # Settle the lemma before the dedup check - the FST's, not the LLM's
-        # raw string, which may be an inflected form ("töitä") or made up
-        # entirely ("riensiä"). Without this the check would compare one
-        # lemma and the saved card would still get the other.
-        try:
-            resolved_lemma, _usage = await resolve_note_lemma(
-                client,
-                breaker,
-                settings.openai_text_model,
-                candidate["lemma"],
-                candidate.get("pos"),
-                candidate.get(SURFACE_FIELD),
-                candidate.get("example_fi"),
-                now,
-            )
-        except CircuitOpenError:
-            failed.append((candidate["lemma"], "предохранитель сработал"))
-            continue
-        except openai.APIError:
-            logger.exception("event=llm.error op=resolve_note_lemma lemma=%s", candidate["lemma"])
-            failed.append((candidate["lemma"], "OpenAI недоступен"))
-            continue
-        key = (resolved_lemma.lemma, candidate.get("pos"))
-        if key in existing or key in seen:
-            duplicate_lemmas.append(key[0])
-            continue
-        seen.add(key)
-        if key[0] != candidate["lemma"]:
-            candidate = {**candidate, "lemma": key[0]}
-        to_add.append((candidate, resolved_lemma.in_dictionary))
+        settled = await settle_lemma(
+            client, breaker, settings.openai_text_model, candidate, dedup, now
+        )
+        if isinstance(settled, SettledCandidate):
+            to_add.append(settled)
+        elif settled.status is SaveStatus.duplicate:
+            duplicate_lemmas.append(settled.lemma)
+        else:
+            failed.append((settled.lemma, settled.reason or ""))
 
     logger.info(
         "event=add.dedup deck=%s candidates=%d to_add=%d duplicates=%d",
@@ -603,94 +582,26 @@ async def _save_candidates_and_report(
     )
 
     saved: list[tuple[str, str, bool]] = []
-    for candidate, in_dictionary in to_add:
-        logger.debug("event=add.candidate lemma=%s kind=%s", candidate["lemma"], candidate["kind"])
-        resolved = None
-        if candidate["kind"] == "word":
-            try:
-                resolved, _usage = await resolve_note_forms(
-                    client,
-                    breaker,
-                    settings.openai_text_model,
-                    candidate["lemma"],
-                    candidate.get("pos"),
-                    now,
-                    context=candidate.get("example_fi"),
-                )
-            except CircuitOpenError:
-                failed.append((candidate["lemma"], "предохранитель сработал"))
-                continue
-            except openai.APIError:
-                logger.exception(
-                    "event=llm.error op=resolve_note_forms lemma=%s", candidate["lemma"]
-                )
-                failed.append((candidate["lemma"], "OpenAI недоступен"))
-                continue
-
-        # The FST may have corrected the part of speech the LLM guessed (see
-        # ingest.resolve_note_pos: "tuli" is a noun, never the verb "tulla").
-        # Save the corrected one - and re-run the dedup check with it, because
-        # the key computed above still carried the LLM's answer.
-        if (
-            resolved is not None
-            and resolved.pos is not None
-            and resolved.pos != candidate.get("pos")
-        ):
-            candidate = {**candidate, "pos": resolved.pos}
-            key = (candidate["lemma"], resolved.pos)
-            if key in existing or key in seen:
-                logger.info(
-                    "event=add.duplicate_after_pos_fix deck=%s lemma=%s pos=%s",
-                    deck_id,
-                    key[0],
-                    key[1],
-                )
-                duplicate_lemmas.append(key[0])
-                continue
-            seen.add(key)
-
-        full_note = build_full_note(candidate, resolved)
-        try:
-            load_validator().validate(full_note)
-        except jsonschema.ValidationError:
-            logger.exception("event=ingest.schema_invalid lemma=%s", candidate.get("lemma"))
-            failed.append((candidate["lemma"], "невалидные данные от модели"))
-            continue
-
-        async with session_factory() as session:
-            session.add(
-                Note(
-                    id=full_note["id"],
-                    user_id=user_id,
-                    lemma=full_note["lemma"],
-                    pos=full_note.get("pos"),
-                    translation_ru=full_note["translation_ru"],
-                    example_fi=full_note["example_fi"],
-                    example_ru=full_note["example_ru"],
-                    kind=full_note["kind"],
-                    deck_id=deck_id,
-                    meta=full_note["meta"],
-                )
-            )
-            try:
-                await session.commit()
-            except IntegrityError as error:
-                # Lost the race: another /add turn for the same word in the
-                # same deck committed between our dedup lookup above and this
-                # insert. The other turn's note is just as good, so this is
-                # the same outcome as the lookup having caught it - report it
-                # as a duplicate, never as a crash.
-                if not is_note_duplicate_error(error):
-                    raise
-                await session.rollback()
-                logger.info(
-                    "event=add.duplicate_race deck=%s lemma=%s",
-                    deck_id,
-                    full_note["lemma"],
-                )
-                duplicate_lemmas.append(full_note["lemma"])
-                continue
-        saved.append((full_note["lemma"], full_note["translation_ru"], in_dictionary))
+    for settled in to_add:
+        outcome = await store_note(
+            session_factory,
+            client,
+            breaker,
+            settings.openai_text_model,
+            user_id,
+            deck_id,
+            settled,
+            dedup,
+            now,
+            # This module's name, not ingest's: the one /add's tests replace.
+            resolve_forms=resolve_note_forms,
+        )
+        if outcome.status is SaveStatus.saved:
+            saved.append((outcome.lemma, outcome.translation_ru or "", outcome.in_dictionary))
+        elif outcome.status is SaveStatus.duplicate:
+            duplicate_lemmas.append(outcome.lemma)
+        else:
+            failed.append((outcome.lemma, outcome.reason or ""))
 
     duration_ms = int((time.monotonic() - start) * 1000)
     logger.info(

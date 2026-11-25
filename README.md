@@ -371,9 +371,50 @@ original from the database) and, for 🔊, the same body to `/api/tts`
   `READER_BREAKER_MAX_CALLS` per `READER_BREAKER_WINDOW_MINUTES` and
   `READER_DAILY_MAX_CALLS` (400) per rolling 24 hours; past them the API
   answers 503 `{"reason": "rate"|"daily"}`.
+- **Lemma first** (`/api/lemma`, same body): the FST's lemmas of the word,
+  `{"surface", "lemmas", "fst_flagged"}`, in milliseconds - no OpenAI, no
+  breaker. The popup shows them while `/api/lookup` is on its way.
+- **In the deck:** `/api/lookup` also answers `in_deck` - whether the
+  chapter's deck already has this lemma and part of speech (asked on every
+  lookup, cached or not).
+- **Warm-up** (`reader/warmup.py`): opening a chapter and `/api/lemma` send
+  a free `models.retrieve` on the lookup's client in the background, so the
+  first tap after a pause doesn't pay for a cold connection. At most one in
+  flight and one a minute, and none within a minute of a real OpenAI call;
+  not through the breaker (`event=reader.warmup ms=… ok=0|1`).
 - **Logs:** `event=reader.lookup` and `event=reader.tts` with the chapter
   id, paragraph and word numbers, `cached`, tokens or bytes and time - never
-  the word or the sentence.
+  the word or the sentence. The lookup line also splits the time:
+  `llm_ms` (the main call), `resolve_ms` (the FST lemma, with a possible
+  second call, `choose_lemma=1`), `idle_s` (seconds since the reader's last
+  OpenAI call, `-1` for none since start) and `warm` (a warm-up within the
+  last minute). `event=reader.lemma` carries the number of lemmas.
+
+### ➕ To the deck
+
+`/api/cards` (same body) saves the tapped word as a card and answers
+`{"status": "saved"|"duplicate", "deck": "<book> - гл.N"}`.
+
+- Everything comes from the server: the lookup's answer from
+  `lookup_cache` (a fresh lookup on a miss, same breaker and errors), the
+  chapter's deck (found by `decks.chapter_id`, created on the first ➕) and
+  `/add`'s own saving (`kielikaveri/cards_save.py`): the FST's lemma and
+  forms, the schema, the dedup. `origin` is `text`; a puhekieli word gets
+  the literary lemma and its spelling in `meta.puhekieli`. Cards appear in
+  `/learn` as for `/add`.
+- **The example** (`reader/excerpt.py`) is a piece of the book, shorter
+  than its sentence: one small call to `OPENAI_TEXT_MODEL` picks a Finnish
+  fragment with the word and the matching piece of the original, and the
+  code accepts them only if both are verbatim and the Finnish one holds the
+  word. Otherwise the sentence is cut at `, ; : – —` and the part with the
+  word is taken (with a neighbour if under 3 words), the Russian example
+  being the whole original sentence. A word already in the deck costs no
+  example call.
+- A double tap gives one card (a lock per word, then the unique note
+  index): the second answer is `duplicate`.
+- Errors as for the lookup, plus 422 `{"reason": "save_failed"}` when the
+  card can't be built. Log: `event=reader.card … status=… input_tokens=…
+  output_tokens=… duration_ms=…`, no text.
 
 ## Logs
 
