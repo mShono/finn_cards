@@ -10,10 +10,17 @@ Logs carry ids, statuses and chapter numbers - never book text or initData.
 
 П3 adds the word lookup and 🔊 (reader/lookup.py, reader/speech.py): POST
 /api/lookup and /api/tts, both with {"chapter_id", "paragraph", "token"}.
+
+П4 adds, with the same body: POST /api/lemma (the FST's lemmas at once,
+before the lookup's answer comes; no OpenAI) and POST /api/cards (➕,
+reader/cards.py); /api/lookup says whether the word is already in the
+chapter's deck (in_deck). Opening a chapter and /api/lemma warm the OpenAI
+connection up in the background (reader/warmup.py).
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -26,6 +33,8 @@ from openai import AsyncOpenAI, OpenAIError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from finn_cards.morphology import lemmatize
+from kielikaveri.cards_save import SaveStatus
 from kielikaveri.config import Settings
 from kielikaveri.db.books import chapter_by_number, mark_opened
 from kielikaveri.db.models import Book, BookChapter, ChapterStatus
@@ -33,16 +42,19 @@ from kielikaveri.llm.breaker import BudgetExceededError, CallBreaker, CircuitOpe
 from kielikaveri.llm.client import make_client
 from kielikaveri.logging_context import new_trace_id, trace_id_var
 from kielikaveri.reader.auth import AuthError, user_id_from_header
+from kielikaveri.reader.cards import add_card, in_chapter_deck
 from kielikaveri.reader.lookup import (
     KeyedLocks,
     LookupFailedError,
     NoSuchWordError,
     Target,
+    _book_text_in_flight,
     install_log_redaction,
     lookup,
     resolve_target,
 )
 from kielikaveri.reader.speech import EmptySpeechError, speak
+from kielikaveri.reader.warmup import Warmup
 from kielikaveri.translate.fst_check import split_words
 from kielikaveri.translate.worker import Translator
 from kielikaveri.tts import make_tts_client
@@ -68,6 +80,9 @@ TTS_CLIENT = web.AppKey("tts_client", AsyncOpenAI)
 # Double-tap guards (reader/lookup.py KeyedLocks), one per endpoint.
 LOOKUP_LOCKS = web.AppKey("lookup_locks", KeyedLocks)
 TTS_LOCKS = web.AppKey("tts_locks", KeyedLocks)
+CARD_LOCKS = web.AppKey("card_locks", KeyedLocks)
+# The time of the reader's OpenAI calls and the connection's warm-up.
+WARMUP = web.AppKey("warmup", Warmup)
 USER_ID = web.RequestKey("user_id", int)
 
 # Only what the page loads: its own files, Telegram's script and its own
@@ -256,7 +271,12 @@ async def get_chapter(request: web.Request) -> web.Response:
     if queued is not None:
         logger.info("event=reader.next_queued book_id=%s chapter=%d", book.id, queued.number)
         request.app[TRANSLATOR].wake()
+    _warm_up(request.app)
     return web.json_response(body)
+
+
+def _warm_up(app: web.Application) -> None:
+    app[WARMUP].maybe_start(app[LOOKUP_CLIENT], app[SETTINGS].openai_text_model)
 
 
 def _is_index(value: object) -> bool:
@@ -266,6 +286,12 @@ def _is_index(value: object) -> bool:
 async def _word_target(request: web.Request) -> Target:
     """The body's word, checked: 400 for a bad body, 404/409 for the
     chapter (user_chapter), 422 for a paragraph or word that isn't there."""
+    target, _chapter, _book = await _word_in_chapter(request)
+    return target
+
+
+async def _word_in_chapter(request: web.Request) -> tuple[Target, BookChapter, Book]:
+    """_word_target with the chapter and its book."""
     try:
         body = await request.json()
     except (json.JSONDecodeError, UnicodeDecodeError):
@@ -278,11 +304,12 @@ async def _word_target(request: web.Request) -> Target:
     ):
         raise web.HTTPBadRequest()
     async with request.app[SESSION_FACTORY]() as session:
-        chapter, _book = await user_chapter(session, body["chapter_id"], request[USER_ID])
+        chapter, book = await user_chapter(session, body["chapter_id"], request[USER_ID])
         try:
-            return resolve_target(chapter, body["paragraph"], body["token"])
+            target = resolve_target(chapter, body["paragraph"], body["token"])
         except NoSuchWordError:
             raise web.HTTPUnprocessableEntity() from None
+    return target, chapter, book
 
 
 def _call_failed(event: str, target: Target, exc: Exception) -> web.Response:
@@ -321,10 +348,81 @@ async def lookup_word(request: web.Request) -> web.Response:
             app[SETTINGS].openai_text_model,
             app[LOOKUP_LOCKS],
             target,
+            app[WARMUP],
         )
     except (CircuitOpenError, LookupFailedError, OpenAIError) as exc:
         return _call_failed("reader.lookup_failed", target, exc)
+    # Asked every time, cached answer or not: ➕ changes it.
+    body["in_deck"] = await in_chapter_deck(
+        app[SESSION_FACTORY], target.chapter_id, body["lemma"], body["pos"]
+    )
     return web.json_response(body)
+
+
+async def lemma_word(request: web.Request) -> web.Response:
+    """The FST's lemmas of the tapped word, in milliseconds: the popup
+    shows them while the lookup is on its way. No OpenAI, no breaker."""
+    target = await _word_target(request)
+    started = time.monotonic()
+    # Nothing on this path logs the word today; should morphology ever
+    # start to, its lines are cut like the lookup's (the thread gets a copy
+    # of this context).
+    flag = _book_text_in_flight.set(True)
+    try:
+        lemmas = await asyncio.to_thread(lemmatize, target.surface)
+    finally:
+        _book_text_in_flight.reset(flag)
+    logger.info(
+        "event=reader.lemma chapter_id=%s paragraph=%d token=%d count=%d duration_ms=%d",
+        target.chapter_id,
+        target.paragraph,
+        target.token,
+        len(lemmas),
+        (time.monotonic() - started) * 1000,
+    )
+    _warm_up(request.app)
+    return web.json_response(
+        {"surface": target.surface, "lemmas": lemmas, "fst_flagged": target.fst_flagged}
+    )
+
+
+async def save_word(request: web.Request) -> web.Response:
+    """➕: {"status": "saved" | "duplicate", "deck": name}; 422
+    {"reason": "save_failed"} when the card can't be built."""
+    target, chapter, book = await _word_in_chapter(request)
+    app = request.app
+    try:
+        result = await add_card(
+            app[SESSION_FACTORY],
+            app[LOOKUP_CLIENT],
+            app[READER_BREAKER],
+            app[SETTINGS].openai_text_model,
+            app[LOOKUP_LOCKS],
+            app[CARD_LOCKS],
+            app[WARMUP],
+            request[USER_ID],
+            chapter,
+            book,
+            target,
+        )
+    except (CircuitOpenError, LookupFailedError, OpenAIError) as exc:
+        return _call_failed("reader.card_failed", target, exc)
+    except Exception as exc:  # noqa: BLE001 - logged by class, then 500
+        # Not aiohttp's own handler: its traceback would carry the book's
+        # text (an IntegrityError quotes its parameters). The class only.
+        logger.error(
+            "event=reader.card_failed chapter_id=%s paragraph=%d token=%d error=%s",
+            target.chapter_id,
+            target.paragraph,
+            target.token,
+            type(exc).__name__,
+        )
+        raise web.HTTPInternalServerError() from None
+    if result.status is SaveStatus.failed:
+        if isinstance(result.error, CircuitOpenError | OpenAIError):
+            return _call_failed("reader.card_failed", target, result.error)
+        return web.json_response({"reason": "save_failed"}, status=422)
+    return web.json_response({"status": result.status.value, "deck": result.deck})
 
 
 async def speak_word(request: web.Request) -> web.Response:
@@ -344,6 +442,10 @@ async def speak_word(request: web.Request) -> web.Response:
     except (CircuitOpenError, OpenAIError, EmptySpeechError) as exc:
         return _call_failed("reader.tts_failed", target, exc)
     return web.Response(body=audio, content_type="audio/wav")
+
+
+async def _stop_warmup(app: web.Application) -> None:
+    await app[WARMUP].stop()
 
 
 async def _close_clients(app: web.Application) -> None:
@@ -376,6 +478,9 @@ def make_app(
     app[TTS_CLIENT] = make_tts_client(settings.openai_api_key, settings.openai_tts_timeout_seconds)
     app[LOOKUP_LOCKS] = KeyedLocks()
     app[TTS_LOCKS] = KeyedLocks()
+    app[CARD_LOCKS] = KeyedLocks()
+    app[WARMUP] = Warmup()
+    app.on_shutdown.append(_stop_warmup)
     app.on_cleanup.append(_close_clients)
     install_log_redaction()
     index_route = app.router.add_get("/", index)
@@ -384,6 +489,8 @@ def make_app(
     app.router.add_get("/api/chapters/{chapter_id}", get_chapter)
     app.router.add_post("/api/lookup", lookup_word)
     app.router.add_post("/api/tts", speak_word)
+    app.router.add_post("/api/lemma", lemma_word)
+    app.router.add_post("/api/cards", save_word)
     static = app.router.add_static("/static/", STATIC_DIR)
     app[PUBLIC_RESOURCES] = frozenset({index_route.resource, favicon_route.resource, static})
     return app

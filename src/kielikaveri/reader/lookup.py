@@ -43,11 +43,13 @@ from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from kielikaveri.cards_save import Usage
 from kielikaveri.db.models import BookChapter, LookupCache
 from kielikaveri.import_cards import SCHEMA_PATH
 from kielikaveri.ingest import resolve_note_lemma
-from kielikaveri.llm.breaker import CallBreaker
+from kielikaveri.llm.breaker import CallBreaker, CircuitOpenError
 from kielikaveri.reader.sentences import sentence_of_word, split_sentences, word_span
+from kielikaveri.reader.warmup import Warmup
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +59,7 @@ MARK_OPEN = "⟦"
 MARK_CLOSE = "⟧"
 
 # Loggers of the shared code a lookup calls whose lines quote the word.
-_REDACTED_LOGGERS = ("kielikaveri.ingest", "finn_cards.morphology")
+_REDACTED_LOGGERS = ("kielikaveri.ingest", "finn_cards.morphology", "kielikaveri.cards_save")
 _book_text_in_flight: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "reader_book_text_in_flight", default=False
 )
@@ -231,6 +233,11 @@ def lookup_key(model: str, target: Target) -> str:
 class _Tokens:
     input: int = 0
     output: int = 0
+    # Where a lookup's time went (event=reader.lookup): the main call, and
+    # resolve_note_lemma with its possible second call (choose_lemma).
+    llm_ms: int = 0
+    resolve_ms: int = 0
+    choose_lemma: bool = False
 
 
 async def _ask_model(
@@ -283,9 +290,26 @@ def _sentence_ru(target: Target, numbers: list) -> tuple[str, bool]:
 
 
 async def _explain(
-    client: AsyncOpenAI, breaker: CallBreaker, model: str, target: Target, tokens: _Tokens
+    client: AsyncOpenAI,
+    breaker: CallBreaker,
+    model: str,
+    target: Target,
+    tokens: _Tokens,
+    warmup: Warmup | None = None,
 ) -> dict:
-    answer = await _ask_model(client, breaker, model, target, tokens)
+    started = time.monotonic()
+    try:
+        answer = await _ask_model(client, breaker, model, target, tokens)
+    except CircuitOpenError:
+        raise  # refused before any call went out
+    except BaseException:
+        if warmup is not None:
+            warmup.touch()
+        raise
+    finally:
+        tokens.llm_ms = int((time.monotonic() - started) * 1000)
+    if warmup is not None:
+        warmup.touch()
     puhekieli = answer["puhekieli"] or None
     sentence_ru, fallback = _sentence_ru(target, answer["source_sentences"])
     if fallback:
@@ -300,6 +324,7 @@ async def _explain(
         )
     plain_sentence = target.marked_sentence.replace(MARK_OPEN, "").replace(MARK_CLOSE, "")
     flag = _book_text_in_flight.set(True)
+    started = time.monotonic()
     try:
         # A colloquial spelling says nothing to the FST (or something
         # wrong): the literary lemma alone is resolved then.
@@ -315,9 +340,13 @@ async def _explain(
         )
     finally:
         _book_text_in_flight.reset(flag)
+        tokens.resolve_ms = int((time.monotonic() - started) * 1000)
     if usage is not None:
+        tokens.choose_lemma = True
         tokens.input += usage.input_tokens
         tokens.output += usage.output_tokens
+        if warmup is not None:
+            warmup.touch()
     return {
         "lemma": resolved.lemma,
         "pos": answer["pos"],
@@ -361,25 +390,39 @@ async def lookup(
     model: str,
     locks: KeyedLocks,
     target: Target,
+    warmup: Warmup | None = None,
+    *,
+    usage: Usage | None = None,
 ) -> dict:
-    """The /api/lookup answer for `target`. Raises CircuitOpenError (and
-    BudgetExceededError), LookupFailedError and OpenAI's errors."""
+    """The /api/lookup answer for `target` (without in_deck, which the app
+    adds). Raises CircuitOpenError (and BudgetExceededError),
+    LookupFailedError and OpenAI's errors.
+
+    `warmup` keeps the time of the reader's OpenAI calls (reader/warmup.py)
+    and gives the log its idle_s (seconds since the last one before this
+    lookup, -1 for none since start) and warm (a warm-up within a minute).
+    `usage` gets this lookup's tokens added (➕ logs them with its own)."""
     key = lookup_key(model, target)
     started = time.monotonic()
     tokens = _Tokens()
+    idle = warmup.idle_seconds() if warmup is not None else None
+    warm = warmup.warm() if warmup is not None else False
     async with locks.hold(key):
         async with session_factory() as session:
             row = await session.get(LookupCache, key)
             cached = row.result if row is not None else None
         if cached is None:
-            result = await _explain(client, breaker, model, target, tokens)
+            result = await _explain(client, breaker, model, target, tokens, warmup)
             await _store(session_factory, key, target, model, result)
         else:
             result = cached
+    if usage is not None:
+        usage.input += tokens.input
+        usage.output += tokens.output
     logger.info(
         "event=reader.lookup chapter_id=%s paragraph=%d token=%d cached=%s "
         "input_tokens=%d output_tokens=%d in_dictionary=%s fst_flagged=%s puhekieli=%s "
-        "duration_ms=%d",
+        "llm_ms=%d resolve_ms=%d choose_lemma=%d idle_s=%d warm=%d duration_ms=%d",
         target.chapter_id,
         target.paragraph,
         target.token,
@@ -389,6 +432,11 @@ async def lookup(
         result["in_dictionary"],
         target.fst_flagged,
         result["puhekieli"] is not None,
+        tokens.llm_ms,
+        tokens.resolve_ms,
+        tokens.choose_lemma,
+        -1 if idle is None else idle,
+        warm,
         (time.monotonic() - started) * 1000,
     )
     return {
