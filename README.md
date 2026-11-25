@@ -348,7 +348,7 @@ and `/read` appears in the menu after the restart.
 A tap posts `{"chapter_id", "paragraph", "token"}` to `/api/lookup` (the
 word's place only - the server takes the word, its sentence and the Russian
 original from the database) and, for 🔊, the same body to `/api/tts`
-(`audio/mpeg`, the word as the text spells it).
+(`audio/wav`, the word as the text spells it).
 
 - **Lookup** (`reader/lookup.py`): one strict-schema call to
   `OPENAI_TEXT_MODEL` gives the lemma (literary for puhekieli: *mä* →
@@ -356,10 +356,17 @@ original from the database) and, for 🔊, the same body to `/api/tts`
   translation. The sentence's translation is the original's own sentence:
   the model only names its number. Answers are cached in the `lookup_cache`
   table (deleted with the book).
-- **🔊** (`reader/speech.py`): mp3 files in `READER_TTS_CACHE_DIR`
+- **🔊** (`reader/speech.py`): `READER_TTS_MODEL` (`gpt-4o-mini-tts`) at
+  `READER_TTS_SPEED` (1.0), not `/learn`'s `tts-1`: on a single word `tts-1`
+  and `tts-1-hd` give empty, cut-off or garbled clips. OpenAI sends raw PCM;
+  the silence before and after the word (up to 1.6 s and 2.4 s) is cut off
+  and the rest is saved as WAV. A clip with nothing loud in it is asked for
+  again, up to three tries, and never cached (`event=reader.tts_empty`;
+  three empty is a 502). Files live in `READER_TTS_CACHE_DIR`
   (`data/tts_cache/` in the repo by default, git-ignored), one per word,
-  model, voice and speed. The directory is created on the first tap, by the
-  service's user. Deleting it is safe: files come back on the next taps.
+  model, voice, speed and instructions. The directory is created on the
+  first tap, by the service's user. Deleting it is safe: files come back on
+  the next taps.
 - **Limits:** cache misses of both go through the reader's own breaker,
   `READER_BREAKER_MAX_CALLS` per `READER_BREAKER_WINDOW_MINUTES` and
   `READER_DAILY_MAX_CALLS` (400) per rolling 24 hours; past them the API

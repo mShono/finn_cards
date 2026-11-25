@@ -35,6 +35,26 @@ async def test_synthesize_speech_passes_custom_speed():
     )
 
 
+async def test_synthesize_speech_passes_instructions_only_when_given():
+    client = make_client()
+
+    await synthesize_speech(client, "gpt-4o-mini-tts", "kirja", instructions="Clearly.")
+
+    client.audio.speech.create.assert_awaited_once_with(
+        model="gpt-4o-mini-tts", voice="alloy", input="kirja", speed=1.0, instructions="Clearly."
+    )
+
+
+async def test_synthesize_speech_asks_for_another_format_only_when_given():
+    client = make_client()
+
+    await synthesize_speech(client, "gpt-4o-mini-tts", "kirja", response_format="pcm")
+
+    client.audio.speech.create.assert_awaited_once_with(
+        model="gpt-4o-mini-tts", voice="alloy", input="kirja", speed=1.0, response_format="pcm"
+    )
+
+
 async def test_synthesize_speech_logs_request_and_response_with_duration(caplog):
     client = make_client()
 
