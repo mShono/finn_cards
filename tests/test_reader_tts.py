@@ -29,7 +29,7 @@ from test_reader_lookup import (  # noqa: F401 - fixtures among them
 )
 
 from kielikaveri.reader.app import LOOKUP_CLIENT, TTS_CLIENT, TTS_LOCKS, make_app
-from kielikaveri.reader.speech import INSTRUCTIONS, cache_path, has_speech
+from kielikaveri.reader.speech import INSTRUCTIONS, SPEECH_ATTEMPTS, cache_path, has_speech
 
 DATA = Path(__file__).parent / "data"
 # Real OpenAI answers (25.11.2026, words picked for the test, not book text):
@@ -37,7 +37,7 @@ DATA = Path(__file__).parent / "data"
 # valid mp3, near-silence, the reason for has_speech.
 MP3 = (DATA / "tts_speech.mp3").read_bytes()
 EMPTY_MP3 = (DATA / "tts_empty.mp3").read_bytes()
-MODEL = "gpt-4o-mini-tts"
+MODEL = "tts-1-hd"
 
 
 class FakeTTS:
@@ -108,13 +108,8 @@ async def test_tts_speaks_the_word_as_the_text_spells_it(client, book, tts, cach
     assert r.headers["Cache-Control"] == "no-store"
     assert await r.read() == MP3
     [call] = tts.calls
-    assert call == {
-        "model": MODEL,
-        "voice": "alloy",
-        "input": "talossa",
-        "speed": 1.0,
-        "instructions": INSTRUCTIONS,
-    }
+    # tts-1 models take no instructions (the API says they don't work there).
+    assert call == {"model": MODEL, "voice": "alloy", "input": "talossa", "speed": 1.0}
     path = cache_path(cache_dir, MODEL, 1.0, "talossa")
     assert path.read_bytes() == MP3
     # Written atomically: no temporary file left next to it.
@@ -161,17 +156,22 @@ async def test_reader_settings_choose_the_model_not_learns(session_factory, book
         session_factory,
         tts,
         cache_dir,
-        reader_tts_model="tts-1-hd",
+        reader_tts_model="gpt-4o-mini-tts",
         reader_tts_speed=0.9,
         openai_tts_model="tts-1",
     )
     async with TestClient(TestServer(app)) as client:
         assert (await post(client, body(chapter_id, token=TALOSSA))).status == 200
 
-    # tts-1 models take no instructions (the API says they don't work there).
     [call] = tts.calls
-    assert call == {"model": "tts-1-hd", "voice": "alloy", "input": "talossa", "speed": 0.9}
-    assert cache_path(cache_dir, "tts-1-hd", 0.9, "talossa").read_bytes() == MP3
+    assert call == {
+        "model": "gpt-4o-mini-tts",
+        "voice": "alloy",
+        "input": "talossa",
+        "speed": 0.9,
+        "instructions": INSTRUCTIONS,
+    }
+    assert cache_path(cache_dir, "gpt-4o-mini-tts", 0.9, "talossa").read_bytes() == MP3
 
 
 def test_has_speech_tells_openais_empty_clip_from_a_word():
@@ -202,9 +202,11 @@ async def test_an_empty_clip_is_retried_and_never_cached(
     assert "attempt=1 " in debug_logs.text
 
 
-async def test_twice_empty_is_502_and_leaves_no_file(session_factory, book, cache_dir, debug_logs):
+async def test_every_try_empty_is_502_and_leaves_no_file(
+    session_factory, book, cache_dir, debug_logs
+):
     _, chapter_id, _ = book
-    tts = FakeTTS(answers=[EMPTY_MP3, EMPTY_MP3])
+    tts = FakeTTS(answers=[EMPTY_MP3] * SPEECH_ATTEMPTS)
     async with TestClient(TestServer(build_app(session_factory, tts, cache_dir))) as client:
         r = await post(client, body(chapter_id, token=TALOSSA))
         assert r.status == 502
@@ -213,7 +215,9 @@ async def test_twice_empty_is_502_and_leaves_no_file(session_factory, book, cach
         again = await post(client, body(chapter_id, token=TALOSSA))
         assert await again.read() == MP3
 
-    assert len(tts.calls) == 3
+    assert SPEECH_ATTEMPTS == 3
+    assert len(tts.calls) == SPEECH_ATTEMPTS + 1
+    assert f"attempt={SPEECH_ATTEMPTS} " in debug_logs.text
     assert "error=EmptySpeechError" in debug_logs.text
     for piece in BOOK_TEXT_PIECES:
         assert piece not in debug_logs.text, piece

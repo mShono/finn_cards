@@ -356,10 +356,12 @@ original from the database) and, for 🔊, the same body to `/api/tts`
   translation. The sentence's translation is the original's own sentence:
   the model only names its number. Answers are cached in the `lookup_cache`
   table (deleted with the book).
-- **🔊** (`reader/speech.py`): `READER_TTS_MODEL` (`gpt-4o-mini-tts`) at
+- **🔊** (`reader/speech.py`): `READER_TTS_MODEL` (`tts-1-hd`) at
   `READER_TTS_SPEED` (1.0), not `/learn`'s `tts-1`: that one often answers a
-  single word with an empty clip. A clip without speech is retried once and
-  never cached (`event=reader.tts_empty`; twice empty is a 502). mp3 files
+  single word with an empty clip (`tts-1-hd` less often; `gpt-4o-mini-tts`
+  puts a long pause before the word). A clip without speech is asked for
+  again, up to three tries, and never cached (`event=reader.tts_empty`;
+  three empty is a 502). mp3 files
   live in `READER_TTS_CACHE_DIR` (`data/tts_cache/` in the repo by default,
   git-ignored), one per word, model, voice, speed and instructions. The
   directory is created on the first tap, by the service's user. Deleting it

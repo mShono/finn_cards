@@ -8,11 +8,11 @@ never sees half an mp3, even if the process dies mid-write.
 
 OpenAI sometimes answers with a clip that holds no speech: valid mp3 frames,
 about a second of near-silence (peak -45..-55 dBFS; Android's WebView plays
-it as loud white noise). Seen 25.11.2026 on tts-1 for short inputs - 4 of 5
-tries of one word, 5 of 6 of a short sentence - and once in 15 on tts-1-hd;
-gpt-4o-mini-tts gave none in 15. Cached, such a clip would silence the word
-for good, so every fresh clip goes through has_speech first: an empty one is
-retried once and never written.
+it as loud white noise). Seen 25.11.2026 on short inputs: tts-1 4 of 15,
+tts-1-hd 6 of 45, gpt-4o-mini-tts 0 of 15 - but that one puts up to 1.6 s
+of silence before the word, so the reader uses tts-1-hd. Cached, an empty
+clip would silence the word for good, so every fresh clip goes through
+has_speech first: an empty one is asked for again and never written.
 
 Logs carry ids, cache hits, sizes and time - never the word.
 """
@@ -36,10 +36,11 @@ from kielikaveri.tts import TTS_VOICE, synthesize_speech
 
 logger = logging.getLogger(__name__)
 
-# For gpt-4o-mini-tts: one clear reading, without the tts-1 dropouts above.
+# For gpt-4o-mini-tts and later, should READER_TTS_MODEL name one.
 INSTRUCTIONS = "Speak the Finnish text clearly, once, in a neutral tone, at a natural pace."
-# A fresh clip without speech is asked for once more, then given up on.
-SPEECH_ATTEMPTS = 2
+# Tries for a clip with speech. At tts-1-hd's ~13% empty answers, three
+# leave about 1 new word in 450 without sound (two: 1 in 60).
+SPEECH_ATTEMPTS = 3
 
 # MPEG audio frame header fields, by version (3 = MPEG-1, 2 = MPEG-2,
 # 0 = MPEG-2.5; 1 is reserved). Layer III only: that is what OpenAI sends.
@@ -50,7 +51,8 @@ _BITRATES_KBPS = {
 _SAMPLE_RATES = {3: (44100, 48000, 32000), 2: (22050, 24000, 16000), 0: (11025, 12000, 8000)}
 # The loudest frame's global_gain (the quantizer step, so the overall level)
 # in OpenAI's clips, 25.11.2026: 127-133 in all 13 empty ones, 152-162 in
-# all 47 with speech, on tts-1, tts-1-hd and gpt-4o-mini-tts alike.
+# all 47 with speech, on tts-1, tts-1-hd and gpt-4o-mini-tts alike; a
+# second tts-1-hd run of 30 matched a decoder on every clip.
 _SPEECH_MIN_GAIN = 145
 
 
