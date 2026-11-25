@@ -1,6 +1,6 @@
-// The reader Mini App (plan 2026-11-20-kirjakaveri-reader, "П2", "П3"): the
-// list of books and chapters, one chapter as paragraphs of word spans, and a
-// bottom popup with the tapped word's lookup and 🔊.
+// The reader Mini App (plan 2026-11-20-kirjakaveri-reader, "П2", "П3", "П4"):
+// the list of books and chapters, one chapter as paragraphs of word spans, and
+// a bottom popup with the tapped word's lookup, 🔊 and ➕.
 // No build step. Book text is only ever set through textContent.
 "use strict";
 
@@ -21,7 +21,8 @@ class ApiError extends Error {
   constructor(status, reason) {
     super(`HTTP ${status}`);
     this.status = status;
-    // A 503 from the reader's breaker says why: "rate" or "daily".
+    // The JSON body's reason, if any: a 503 from the reader's breaker says
+    // "rate" or "daily", a 422 from /api/cards may say "save_failed".
     this.reason = reason || null;
   }
 }
@@ -41,11 +42,11 @@ async function request(path, { body, signal } = {}) {
   const response = await fetch(path, options);
   if (!response.ok) {
     let reason = null;
-    if (response.status === 503) {
+    if (response.status === 503 || response.status === 422) {
       try {
         reason = (await response.json()).reason;
       } catch (_) {
-        // No JSON body: shown as "rate".
+        // No JSON body: a 503 is shown as "rate", a 422 as TRY_AGAIN.
       }
     }
     throw new ApiError(response.status, reason);
@@ -211,8 +212,10 @@ async function showChapter(chapterId) {
 const popup = el("div", { class: "popup", role: "dialog", hidden: "" });
 document.body.append(popup);
 
-// The word the popup is about: {key, span, controller}. key is null after a
-// failed lookup, so tapping the same word again retries.
+// The word the popup is about: {key, span, controller, looked}. key is null
+// after a failed lookup, so tapping the same word again retries. looked is set
+// once the lookup has answered or failed: a later /api/lemma is then ignored.
+// The controller aborts both the lemma and the lookup request.
 let current = null;
 let audioController = null;
 
@@ -231,6 +234,9 @@ function errorText(error) {
       ? "Слишком много запросов, попробуй завтра."
       : "Слишком много запросов, попробуй через несколько минут.";
   }
+  if (error instanceof ApiError && error.status === 422 && error.reason === "save_failed") {
+    return "Не получилось сохранить карточку.";
+  }
   return TRY_AGAIN;
 }
 
@@ -241,7 +247,7 @@ function openWord(chapterId, span) {
   if (current && current.key === key) return;
   // Another word: the previous lookup (and its sound) is aborted.
   closePopup();
-  const mine = { key, span, controller: new AbortController() };
+  const mine = { key, span, controller: new AbortController(), looked: false };
   current = mine;
   span.classList.add("active");
   popup.replaceChildren(el("p", { class: "muted" }, "загружаю…"));
@@ -249,15 +255,39 @@ function openWord(chapterId, span) {
   document.body.classList.add("with-popup");
   setBack(closePopup);
   keepVisible(span);
+  // Both at once: the FST lemma answers in milliseconds and fills the first
+  // line while the lookup (a model call, seconds) is still running.
+  api("api/lemma", { body: address, signal: mine.controller.signal })
+    .then((data) => {
+      if (current === mine && !mine.looked) renderLemma(data);
+    })
+    .catch(() => {
+      // Silently: the lookup shows the lemma, or its own error, anyway.
+    });
   api("api/lookup", { body: address, signal: mine.controller.signal })
     .then((data) => {
-      if (current === mine) renderLookup(data, address);
+      if (current !== mine) return;
+      mine.looked = true;
+      renderLookup(data, address);
     })
     .catch((error) => {
       if (current !== mine || error.name === "AbortError") return;
+      mine.looked = true;
       mine.key = null;
       popup.replaceChildren(el("p", { class: "muted" }, errorText(error)));
     });
+}
+
+// The popup's first line before the lookup answers: the FST lemma (several
+// readings joined by " / "). No lemma: the popup stays at "загружаю…".
+function renderLemma(data) {
+  const lemmas = [...new Set((data.lemmas || []).filter(Boolean))];
+  if (lemmas.length === 0) return;
+  popup.replaceChildren(
+    el("p", { class: "lemma" }, el("b", { lang: "fi" }, lemmas.join(" / "))),
+    el("p", { class: "muted" }, "загружаю…"),
+  );
+  keepVisible(current.span);
 }
 
 function renderLookup(data, address) {
@@ -282,9 +312,37 @@ function renderLookup(data, address) {
   const speak = el("button", { class: "speak", type: "button", "aria-label": "Произнести" }, "🔊");
   const speakError = el("p", { class: "muted small" });
   speak.addEventListener("click", () => playWord(address, speak, speakError));
-  nodes.push(el("div", { class: "actions" }, speak), speakError);
+  const add = el("button", { class: "add", type: "button", "aria-label": "В колоду" }, "➕");
+  const addError = el("p", { class: "muted small" });
+  if (data.in_deck) markAdded(add, "duplicate");
+  else add.addEventListener("click", () => addCard(address, add, addError));
+  nodes.push(el("div", { class: "actions" }, speak, add), speakError, addError);
   popup.replaceChildren(...nodes);
   keepVisible(current.span);
+}
+
+// ➕: saves the word as a card in the chapter's deck. The request is not
+// aborted when the popup closes (the card is saved or it is not). Its answer
+// only touches this button and this error line: they belong to the popup they
+// were made for and are detached once another word is shown.
+function addCard(address, button, errorNode) {
+  if (button.disabled) return;
+  button.disabled = true;
+  button.textContent = "…";
+  errorNode.textContent = "";
+  api("api/cards", { body: address })
+    .then((data) => markAdded(button, data.status))
+    .catch((error) => {
+      button.disabled = false;
+      button.textContent = "➕";
+      errorNode.textContent = errorText(error);
+    });
+}
+
+function markAdded(button, status) {
+  button.disabled = true;
+  button.classList.add("done");
+  button.textContent = status === "duplicate" ? "✓ уже в колоде" : "✓ в колоде";
 }
 
 // 🔊: the WAV comes through fetch (an <audio src> can't send Authorization)
