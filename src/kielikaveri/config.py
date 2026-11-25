@@ -60,11 +60,9 @@ class Settings(BaseSettings):
     # under deploy/kielikaveri.service); git-ignored.
     reader_tts_cache_dir: str = "data/tts_cache"
     # 🔊 of a tapped word: its own model, not /learn's OPENAI_TTS_MODEL. tts-1
-    # often answers a short input with an empty clip; tts-1-hd less often,
-    # and the retries in reader/speech.py catch it. gpt-4o-mini-tts gave no
-    # empty clips but up to 1.6 s of silence before the word. One word at 1.0
-    # is slow enough.
-    reader_tts_model: str = "tts-1-hd"
+    # and tts-1-hd give empty, cut-off or garbled clips of a single word
+    # (reader/speech.py); gpt-4o-mini-tts speaks it whole. 1.0 checked by ear.
+    reader_tts_model: str = "gpt-4o-mini-tts"
     reader_tts_speed: float = 1.0
     # Telegram lets bots download up to 20 MB; a long novel is ~1-2 MB.
     max_book_bytes: int = 5_000_000

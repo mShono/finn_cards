@@ -287,7 +287,7 @@ function renderLookup(data, address) {
   keepVisible(current.span);
 }
 
-// 🔊: the mp3 comes through fetch (an <audio src> can't send Authorization)
+// 🔊: the WAV comes through fetch (an <audio src> can't send Authorization)
 // and plays through Web Audio. An Audio element on a blob: URL, played after
 // an awaited fetch, stayed silent in Telegram (Android and web): the tap's user activation is
 // gone by then. An AudioContext resumed synchronously inside the tap stays

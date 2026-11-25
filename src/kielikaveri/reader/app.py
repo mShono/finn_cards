@@ -71,7 +71,7 @@ TTS_LOCKS = web.AppKey("tts_locks", KeyedLocks)
 USER_ID = web.RequestKey("user_id", int)
 
 # Only what the page loads: its own files, Telegram's script and its own
-# /api, and the 🔊 mp3: fetched with the Authorization header (an <audio
+# /api, and the 🔊 WAV: fetched with the Authorization header (an <audio
 # src> can't send it) and played from a blob: URL. 'unsafe-inline' in style-src is for telegram-web-app.js: inside
 # web.telegram.org's iframe it fills a <style> element with the theme CSS
 # the client posts to it (event "set_custom_style"). No frame-ancestors:
@@ -343,7 +343,7 @@ async def speak_word(request: web.Request) -> web.Response:
         )
     except (CircuitOpenError, OpenAIError, EmptySpeechError) as exc:
         return _call_failed("reader.tts_failed", target, exc)
-    return web.Response(body=audio, content_type="audio/mpeg")
+    return web.Response(body=audio, content_type="audio/wav")
 
 
 async def _close_clients(app: web.Application) -> None:
