@@ -113,7 +113,7 @@ DECK_CHAPTER_FK = "fk_decks_chapter_id_chapters"
 class Deck(Base):
     """A user-named grouping of notes (plan: "колоды", chosen deliberately
     manual - the learner decides what goes where, not an automatic
-    new-vs-mature split). Purely organizational: it narrows /learn's queue
+    new-vs-mature split). Purely organizational: it narrows learning's queue
     and /add's save target, it does not change FSRS scheduling itself.
     """
 
@@ -257,9 +257,9 @@ class Card(Base):
     note: Mapped[Note] = relationship(back_populates="cards")
 
     # SQLite indexes no foreign key on its own, so every "this note's cards"
-    # lookup was a full scan of `cards`. /learn asks for exactly that on the
+    # lookup was a full scan of `cards`. Learning asks for exactly that on the
     # hot path - once per user in graduation.cards_by_note (joined to notes)
-    # and once per rating in learn_rate's ensure_card_types.
+    # and once per rating in learn_core.record_review's ensure_card_types.
     __table_args__ = (Index("ix_cards_note_id", "note_id"),)
 
 

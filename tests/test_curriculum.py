@@ -80,7 +80,7 @@ async def answer(
     ratings: Sequence[Rating],
     at: datetime = FIRST_SEEN,
 ) -> None:
-    """Review a card for real, the way bot/learn.py's rating handler does:
+    """Review a card for real, the way learn_core.record_review does:
     FSRS moves the schedule and every answer is written to `reviews`, which
     is the history the curriculum reads."""
     async with session_factory() as session:
@@ -91,7 +91,7 @@ async def answer(
             # seeing it would hand FSRS a near-perfect recall and a wildly
             # long interval, which is not what a learner's history looks like.
             when = at if i == 0 else card.due
-            # Same order as bot/learn.py: the previous answer's timestamp is
+            # Same order as learn_core: the previous answer's timestamp is
             # read before this answer's row exists, so it can't count itself.
             last_review = await session.scalar(
                 select(func.max(Review.reviewed_at)).where(Review.card_id == card.id)
@@ -167,13 +167,13 @@ def _form_cards(*names: str) -> list[Card]:
     ]
 
 
-# --- 0: the SRS write-back shared with bot/learn.py ---------------------------
+# --- 0: the SRS write-back shared with learn_core ------------------------------
 
 SRS_COLUMNS = ("state", "due", "stability", "difficulty", "reps", "lapses", "step")
 
 
 async def test_answering_persists_every_srs_column_including_step(session_factory):
-    """`answer` above and bot/learn.py's rating handler write a review through
+    """`answer` above and learn_core.record_review write a review through
     the same srs.scheduler.apply_review, so this pins down what that writes.
     A column dropped from the write-back would still leave most of these
     tests green - `step` especially: losing it reads back as None and FSRS
@@ -440,7 +440,7 @@ async def test_tightening_the_unlock_rule_does_not_close_a_form_already_open(ses
     assert before["due"] != NOW
 
     async with session_factory() as session:
-        # The /learn path in full (bot/learn.py's _proceed_past_deck_choice):
+        # A session start in full (learn_core.prepare_session):
         # cards are synced first, then the curriculum runs.
         await sync_user_card_types(session, 1, NOW)
         introduced = await introduce_due_forms(session, 1, NOW, daily_new_forms=4, boundary_hour=4)
@@ -523,7 +523,7 @@ async def test_the_form_budget_is_spent_once_per_study_day(session_factory):
     async with session_factory() as session:
         first = await introduce_due_forms(session, 1, NOW, daily_new_forms=3, boundary_hour=4)
         await session.commit()
-        # Same study day, a second /learn - the budget is already gone.
+        # Same study day, a second session - the budget is already gone.
         again = await introduce_due_forms(session, 1, NOW, daily_new_forms=3, boundary_hour=4)
         await session.commit()
         # Next study day it refills.
