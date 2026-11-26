@@ -1,4 +1,5 @@
-"""🔊 for a tapped word (plan 2026-11-20-kirjakaveri-reader, "П3").
+"""🔊 for a tapped word (plan 2026-11-20-kirjakaveri-reader, "П3") and for
+a card's example in the Mini App's learning ("П5", speak_text).
 
 The word is spoken as the text spells it (decided 24.11.2026). OpenAI sends
 raw PCM; the silence around the word is cut off here and the rest becomes a
@@ -132,22 +133,35 @@ async def speak(
     locks: KeyedLocks,
     target: Target,
 ) -> bytes:
-    """The WAV of target.surface. Raises CircuitOpenError (and
-    BudgetExceededError), OpenAI's errors and EmptySpeechError on a cache
-    miss."""
-    path = cache_path(cache_dir, model, speed, target.surface)
+    """The WAV of target.surface (speak_text)."""
+    ids = f"chapter_id={target.chapter_id} paragraph={target.paragraph} token={target.token}"
+    return await speak_text(client, breaker, model, speed, cache_dir, locks, target.surface, ids)
+
+
+async def speak_text(
+    client: AsyncOpenAI,
+    breaker: CallBreaker,
+    model: str,
+    speed: float,
+    cache_dir: Path,
+    locks: KeyedLocks,
+    text: str,
+    ids: str,
+) -> bytes:
+    """The WAV of `text`; `ids` say in the logs what it is ("key=value ...",
+    never the text). Raises CircuitOpenError (and BudgetExceededError),
+    OpenAI's errors and EmptySpeechError on a cache miss."""
+    path = cache_path(cache_dir, model, speed, text)
     started = time.monotonic()
     async with locks.hold(path.name):
         audio = await asyncio.to_thread(_read, path)
         cached = audio is not None
         if audio is None:
-            audio = await _synthesize(client, breaker, model, speed, target)
+            audio = await _synthesize(client, breaker, model, speed, text, ids)
             await asyncio.to_thread(_write_atomically, path, audio)
     logger.info(
-        "event=reader.tts chapter_id=%s paragraph=%d token=%d cached=%s bytes=%d duration_ms=%d",
-        target.chapter_id,
-        target.paragraph,
-        target.token,
+        "event=reader.tts %s cached=%s bytes=%d duration_ms=%d",
+        ids,
         cached,
         len(audio),
         (time.monotonic() - started) * 1000,
@@ -156,7 +170,7 @@ async def speak(
 
 
 async def _synthesize(
-    client: AsyncOpenAI, breaker: CallBreaker, model: str, speed: float, target: Target
+    client: AsyncOpenAI, breaker: CallBreaker, model: str, speed: float, text: str, ids: str
 ) -> bytes:
     for attempt in range(1, SPEECH_ATTEMPTS + 1):
         # Every try is an OpenAI call: each one goes through the breaker.
@@ -164,7 +178,7 @@ async def _synthesize(
         pcm = await synthesize_speech(
             client,
             model,
-            target.surface,
+            text,
             speed,
             instructions=instructions_for(model),
             response_format="pcm",
@@ -172,12 +186,5 @@ async def _synthesize(
         audio = await asyncio.to_thread(trim_silence, pcm)
         if audio is not None:
             return audio
-        logger.warning(
-            "event=reader.tts_empty chapter_id=%s paragraph=%d token=%d attempt=%d bytes=%d",
-            target.chapter_id,
-            target.paragraph,
-            target.token,
-            attempt,
-            len(pcm),
-        )
+        logger.warning("event=reader.tts_empty %s attempt=%d bytes=%d", ids, attempt, len(pcm))
     raise EmptySpeechError
