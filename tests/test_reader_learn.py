@@ -720,6 +720,36 @@ async def test_debt_defer_postpones_the_tail(make_client, session_factory):
     assert all(due > NOW + timedelta(days=6) for due in dues[1:])
 
 
+async def test_debt_defer_keeps_to_the_chosen_deck_and_side(make_client, session_factory):
+    # The deck and the side travel from the start to the debt answer in the
+    # session only: a defer must not postpone what this session doesn't show.
+    srs = {"state": CardState.review, "stability": 5.0, "difficulty": 5.0, "reps": 2}
+    other_deck = await add_deck(session_factory, name="Muu")
+    elsewhere = await add_words(session_factory, 3, deck_id=other_deck, **srs)
+    deck = await add_deck(session_factory, name="Kirja")
+    finnish, russian = [], []
+    for i in range(3):
+        note = await add_note(
+            session_factory, deck, f"d{i}", created_at=NOW - timedelta(days=20 - i)
+        )
+        due = PAST - timedelta(hours=3 - i)
+        finnish.append(await add_card(session_factory, f"fi{i}", note, due=due, **srs))
+        russian.append(
+            await add_card(
+                session_factory, f"ru{i}", note, type=CardType.production, due=due, **srs
+            )
+        )
+    client = await make_client(debt_threshold=2, session_max_cards=1, debt_postpone_days=7)
+    body = await start(client, side="ru", deck_id=deck)
+    assert (body["state"], body["overdue"]) == ("debt", 3)
+
+    await post(client, "debt", {"session": body["session"], "action": "defer"})
+
+    async with session_factory() as db:
+        dues = {i: (await db.get(Card, i)).due for i in [*elsewhere, *finnish, *russian]}
+    assert [i for i, due in dues.items() if due > NOW] == russian[1:]
+
+
 async def test_a_second_debt_answer_is_stale(make_client, session_factory):
     ids = await overdue_words(session_factory, 3)
     client = await make_client(debt_threshold=2, session_max_cards=1)
