@@ -17,8 +17,8 @@ reader's ➕ (reader/cards.py, one word and a JSON answer). The steps are
 counts the batch in between); the reader runs both for its one word
 (save_candidate).
 
-Cards are not created here: learning in the reader creates them
-(sync_user_card_types, learn_core.prepare_session), as for /add's notes.
+Cards are not created here: /learn creates them (sync_user_card_types), as
+it always has for /add's notes.
 
 The log lines quote the lemma, as /add's always have. On the reader's path
 they are cut to their event name (reader.lookup.RedactBookText covers this

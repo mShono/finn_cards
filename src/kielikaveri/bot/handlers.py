@@ -92,15 +92,14 @@ async def read(message: Message, settings: Settings) -> None:
     )
 
 
-# Learning lives in the Mini App (plan 2026-11-20-kirjakaveri-reader, П5):
+# Learning moved to the Mini App (plan 2026-11-20-kirjakaveri-reader, П5/У3):
 # the menu button and a typed /learn only hand out the button that opens it.
-# The bot's own review sessions are gone (У4).
+# bot/learn.py's session handlers are no longer routed.
 @router.message(Command("learn"))
 @router.message(F.text == "📚 Учить")
 async def learn_entry(message: Message, state: FSMContext, settings: Settings) -> None:
-    # Whatever the bot waited for is dropped, as the bot's own /learn used
-    # to - the deck picker's words included (PICKER_BREAKERS warns about
-    # those first).
+    # Whatever the bot waited for is dropped, as /learn used to - the deck
+    # picker's words included (PICKER_BREAKERS warns about those first).
     await state.clear()
     if not settings.reader_url:
         await message.answer(READER_NOT_CONFIGURED_TEXT)

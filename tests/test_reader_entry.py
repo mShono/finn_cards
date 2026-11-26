@@ -165,17 +165,15 @@ async def test_learn_entry_url_keeps_a_query_already_in_reader_url(routed):
     assert parse_qs(urlsplit(url).query) == {"v": ["2"], "screen": ["learn"]}
 
 
-async def test_learn_entry_drops_whatever_the_bot_waited_for(routed):
-    # A state no router knows (say, of a flow since removed): no input state
-    # for InputEscapeMiddleware to drop - learn_entry clears it itself.
-    await routed["storage"].set_state(routed["key"], "OldStates:waiting")
-    await routed["storage"].set_data(routed["key"], {"queue": ["c1"]})
+async def test_learn_entry_drops_an_old_bot_session(routed):
+    # A bot/learn.py session state left from before the move (raw, so this
+    # outlives that module) - only the button now, and the state is gone.
+    await routed["storage"].set_state(routed["key"], "LearnStates:reviewing")
 
     sent = await routed["send"]("📚 Учить")
 
     assert web_app_urls(sent[-1]) == [READER_URL + "?screen=learn"]
     assert await routed["storage"].get_state(routed["key"]) is None
-    assert await routed["storage"].get_data(routed["key"]) == {}
 
 
 async def test_learn_entry_during_deck_pick_warns_and_drops_the_words(routed):
@@ -202,13 +200,16 @@ async def test_help_does_not_mention_learn():
     assert "/learn" not in message.answer.await_args.args[0]
 
 
-def test_no_learn_router_is_in_the_dispatcher():
+def test_learn_router_is_not_in_the_dispatcher():
     # A fresh process: the shared test Dispatcher can't be rebuilt (aiogram
-    # attaches a router once).
+    # attaches a router once), and test_routing.py mounts the learn router
+    # into it for its legacy tests.
     script = (
+        "from kielikaveri.bot.learn import router\n"
         "from kielikaveri.bot.main import build_dispatcher\n"
         "dp = build_dispatcher({1})\n"
-        "assert 'learn' not in [r.name for r in dp.sub_routers], 'learn router is routed'\n"
+        "assert router.parent_router is None, 'learn router is routed'\n"
+        "assert router not in dp.sub_routers\n"
     )
     subprocess.run([sys.executable, "-c", script], check=True)
 

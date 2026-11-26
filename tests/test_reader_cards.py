@@ -147,7 +147,7 @@ async def test_plus_saves_the_word_to_the_chapter_deck(client, book, fake, sessi
         deck = await session.get(Deck, note.deck_id)
         assert deck.chapter_id == chapter_id
         assert deck.user_id == OWNER
-        # Learning makes the cards (sync_user_card_types), as for /add.
+        # /learn makes the cards (sync_user_card_types), as for /add.
         assert await session.scalar(select(func.count()).select_from(Card)) == 0
     assert fake.calls(LOOKUP_SCHEMA_NAME) == 1
     assert fake.calls(EXCERPT_SCHEMA_NAME) == 1

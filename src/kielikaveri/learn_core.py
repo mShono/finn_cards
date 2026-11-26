@@ -1,11 +1,11 @@
-"""Review sessions without Telegram: the database side of learning in the
-reader (plan 2026-11-20-kirjakaveri-reader, "П5"; reader/learn.py runs the
-session on top of it).
+"""Review sessions without Telegram: what /learn in the bot and the
+reader's swipe cards (plan 2026-11-20-kirjakaveri-reader, "П5") share.
 
-No aiogram or HTTP here and no UI text beyond the few sentences the reader
-shows as is. The caller owns the session state (the reader's in-memory
-LearnSession) and the logs of its own steps; this module owns preparing a
-session, building its queue, applying one rating, and the card as data.
+No aiogram here and no UI text beyond the few sentences both sides show
+as is. The callers own the session state (the bot's FSM, the reader's
+in-memory LearnSession) and the logs of their own steps; this module owns
+the database side of a session: preparing it, building its queue, applying
+one rating, and the card as data.
 
 Logs: card ids and numbers only, never a card's text.
 """
@@ -13,6 +13,7 @@ Logs: card ids and numbers only, never a card's text.
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
@@ -65,6 +66,9 @@ class LearnSide(StrEnum):
         return self.card_types is None or CardType.inflection in self.card_types
 
 
+SyncCardTypes = Callable[[AsyncSession, int, datetime], Awaitable[object]]
+
+
 async def prepare_session(
     session: AsyncSession,
     settings: Settings,
@@ -72,10 +76,17 @@ async def prepare_session(
     now: datetime,
     deck_id: str | None,
     side: LearnSide,
+    *,
+    sync: SyncCardTypes = sync_user_card_types,
 ) -> int:
     """Bring the user's cards up to date and return how many reviewed cards
-    of this side are overdue (the debt). Commits."""
-    await sync_user_card_types(session, user_id, now)
+    of this side are overdue (the debt). Commits.
+
+    `sync` is the card sync to run - sync_user_card_types; the bot passes
+    its own module's name for it, so its tests can still hold or fail the
+    sync where they always did.
+    """
+    await sync(session, user_id, now)
     # Cards first, then the curriculum decides which of the new forms
     # the learner actually meets today - see srs/curriculum.py. Not for
     # a session that shows no forms: opening them there would spend the
@@ -158,7 +169,7 @@ def empty_session_text(side: LearnSide, no_production: bool) -> str:
 
 def session_end_text(reviewed: int, remaining: int, side: LearnSide, continue_hint: str) -> str:
     """The end-of-session line; `continue_hint` follows the count of cards
-    left (the reader's end screen has its own "start again" button)."""
+    left (the bot names /learn, the reader its own button)."""
     text = f"Сессия окончена: {reviewed} карточек пройдено"
     if remaining:
         text += f", осталось {remaining}{continue_hint}"
@@ -176,7 +187,7 @@ async def drop_deleted_head(
     """The queue without deleted cards at its head. A word deleted
     mid-session (/delete, 🗑 in a deck) leaves its card ids in the session's
     queue - deleting knows nothing about sessions. `source` goes into the
-    log line (the reader's "reader"; None leaves it out)."""
+    log line (the reader's "reader"; the bot's line has none)."""
     suffix = "" if source is None else f" source={source}"
     while queue and await session.get(Card, queue[0]) is None:
         logger.info("event=learn.skip_deleted card_id=%s%s", queue[0], suffix)
@@ -263,7 +274,7 @@ async def undo_review(session: AsyncSession, record: ReviewRecord) -> bool:
     """Take `record` back: the card's SRS columns, its `reviews` row, and
     the cards that rating created - those that have no reviews of their
     own yet. Commits. False, changing nothing, when the card is gone
-    (deleted since) or was rated again after `record` (somewhere else):
+    (deleted since) or was rated again after `record` (say, in the bot):
     putting the old columns back would erase that newer answer."""
     card = await session.get(Card, record.card_id)
     if card is None or await _rated_since(session, card, record):
@@ -294,8 +305,8 @@ async def _rated_since(session: AsyncSession, card: Card, record: ReviewRecord) 
 
 @dataclass(frozen=True)
 class CardView:
-    """A card's content by its type - the data behind the reader's card
-    JSON."""
+    """A card's content by its type - the data behind both the bot's
+    render_card text and the reader's card JSON."""
 
     id: str
     type: CardType

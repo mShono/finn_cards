@@ -16,8 +16,10 @@ class Settings(BaseSettings):
     # Finnish morphology and give a useless error breakdown.
     openai_text_model: str = "gpt-5.6-terra"
     openai_stt_model: str = "whisper-1"
-    # The reader's 🔊 (word and card example): a button the user is waiting
-    # on - past this, failing fast beats waiting.
+    openai_tts_model: str = "tts-1"
+    # tts-1 at 1.0 reads short sentences too fast to follow at B2 level.
+    openai_tts_speed: float = 0.8
+    # A button the user is waiting on - past this, failing fast beats waiting.
     openai_tts_timeout_seconds: float = 15.0
     openai_timeout_seconds: float = 60.0
 
@@ -57,8 +59,8 @@ class Settings(BaseSettings):
     # voice and speed. Relative to the working directory (the repo root
     # under deploy/kielikaveri.service); git-ignored.
     reader_tts_cache_dir: str = "data/tts_cache"
-    # 🔊 in the reader (a tapped word, a card's example). tts-1 and tts-1-hd
-    # give empty, cut-off or garbled clips of a single word
+    # 🔊 of a tapped word: its own model, not /learn's OPENAI_TTS_MODEL. tts-1
+    # and tts-1-hd give empty, cut-off or garbled clips of a single word
     # (reader/speech.py); gpt-4o-mini-tts speaks it whole. 1.0 checked by ear.
     reader_tts_model: str = "gpt-4o-mini-tts"
     reader_tts_speed: float = 1.0
@@ -88,7 +90,7 @@ class Settings(BaseSettings):
     # scheduling and the daily new-card limit - see srs/queue.py.
     day_boundary_hour: int = 4
 
-    # Learning session shape (the reader's 📚).
+    # /learn session shape.
     session_max_cards: int = 20
     session_max_minutes: int = 10
     # Defensive cap: never-reviewed cards of any type admitted per study day.
@@ -99,7 +101,7 @@ class Settings(BaseSettings):
     # (see srs/curriculum.py).
     daily_new_forms: int = 4
 
-    # Above this many overdue cards, learning offers to postpone the backlog
+    # Above this many overdue cards, /learn offers to postpone the backlog
     # instead of dumping it all into one session.
     debt_threshold: int = 100
     debt_postpone_days: int = 7

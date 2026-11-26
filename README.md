@@ -357,8 +357,8 @@ original from the database) and, for 🔊, the same body to `/api/tts`
   the model only names its number. Answers are cached in the `lookup_cache`
   table (deleted with the book).
 - **🔊** (`reader/speech.py`): `READER_TTS_MODEL` (`gpt-4o-mini-tts`) at
-  `READER_TTS_SPEED` (1.0): on a single word `tts-1` and `tts-1-hd` give
-  empty, cut-off or garbled clips. OpenAI sends raw PCM;
+  `READER_TTS_SPEED` (1.0), not `/learn`'s `tts-1`: on a single word `tts-1`
+  and `tts-1-hd` give empty, cut-off or garbled clips. OpenAI sends raw PCM;
   the silence before and after the word (up to 1.6 s and 2.4 s) is cut off
   and the rest is saved as WAV. A clip with nothing loud in it is asked for
   again, up to three tries, and never cached (`event=reader.tts_empty`;
@@ -401,7 +401,7 @@ original from the database) and, for 🔊, the same body to `/api/tts`
   `/add`'s own saving (`kielikaveri/cards_save.py`): the FST's lemma and
   forms, the schema, the dedup. `origin` is `text`; a puhekieli word gets
   the literary lemma and its spelling in `meta.puhekieli`. Cards appear in
-  learning (📚 in the reader) as for `/add`.
+  `/learn` as for `/add`.
 - **The example** (`reader/excerpt.py`) is a piece of the book, shorter
   than its sentence: one small call to `OPENAI_TEXT_MODEL` picks a Finnish
   fragment with the word and the matching piece of the original, and the

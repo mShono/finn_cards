@@ -3,8 +3,8 @@
 /edit rewrites meta.principal_forms wholesale when the lemma changes - and
 with it the part of speech, when the new lemma can't carry the stored one
 (ingest.resolve_note_pos). The cards are keyed by form name, so a rewritten
-form set leaves cards quizzing forms the note no longer has: card_view
-falls back to the bare lemma for them, and they still sit in the queue,
+form set leaves cards quizzing forms the note no longer has: render_card
+falls back to (lemma, lemma) for them, and they still sit in the queue,
 spend the daily form budget and hold up the curriculum's level gate.
 
 graduation.resync_inflection_cards is what /edit now runs inside the same
@@ -14,7 +14,7 @@ _ensure_inflection_cards path, and a form set that did not change is left
 completely alone (puhua -> hakea keeps every card and its FSRS history).
 
 Real SQLite, real FST, real resolve_note_forms, real queue/curriculum/
-learn_core; OpenAI is replaced at the client boundary only.
+handlers; OpenAI is replaced at the client boundary only.
 """
 
 import json
@@ -31,20 +31,18 @@ from sqlalchemy import func, select
 
 from finn_cards.morphology import NOMINAL_FORMS, VERB_FORMS
 from kielikaveri.bot.edit import EditStates, note_edit_apply
+from kielikaveri.bot.learn import (
+    learn_rate,
+    learn_reveal,
+    learn_side_choice,
+    learn_start,
+    render_card,
+)
 from kielikaveri.config import Settings
 from kielikaveri.db.engine import create_all, make_engine, make_session_factory
 from kielikaveri.db.models import Card, CardStatus, CardType, Note, NoteKind, Review, User
 from kielikaveri.grammar import FORM_TASKS
 from kielikaveri.ingest import resolve_note_forms
-from kielikaveri.learn_core import (
-    CardView,
-    LearnSide,
-    build_queue,
-    card_view,
-    drop_deleted_head,
-    prepare_session,
-    record_review,
-)
 from kielikaveri.llm.breaker import CallBreaker
 from kielikaveri.srs.curriculum import introduce_due_forms
 from kielikaveri.srs.graduation import sync_user_card_types
@@ -100,8 +98,7 @@ def make_fsm() -> FSMContext:
 
 
 async def answer(session_factory, card_id: str, rating: Rating, at: datetime) -> None:
-    """One real review: FSRS moves the card, the answer goes to `reviews`
-    (learn_core.record_review's order, without its card-type sync)."""
+    """One real review, as learn_rate records it."""
     async with session_factory() as session:
         card = await session.get(Card, card_id)
         last = await session.scalar(
@@ -230,28 +227,41 @@ async def orphan_reviews(session_factory) -> set[str]:
         )
 
 
-async def run_learn(session_factory) -> list[CardView]:
-    """A full learning session through learn_core, every card rated Good -
-    what the reader's /api/learn/* does with it.
+async def run_learn(session_factory) -> list[tuple[str, str, str]]:
+    """A full /learn session through the real handlers, every card rated Good.
 
-    Returns the view of each card the learner was shown.
+    Returns (card id, front, back) for each card the learner was shown.
     """
-    settings = make_settings()
-    now = datetime.now(UTC)
-    async with session_factory() as session:
-        await prepare_session(session, settings, 1, now, None, LearnSide.mix)
-        queue = (await build_queue(session, settings, 1, now, None, LearnSide.mix)).queue
+    state = make_fsm()
+    message = SimpleNamespace(from_user=SimpleNamespace(id=1), answer=AsyncMock())
+    await learn_start(message, state, session_factory, make_settings())
+    side = SimpleNamespace(
+        data="learn:side:mix", from_user=SimpleNamespace(id=1), answer=AsyncMock(), message=message
+    )
+    await learn_side_choice(side, state, session_factory, make_settings())
     shown = []
     for _ in range(100):
-        async with session_factory() as session:
-            queue = await drop_deleted_head(session, queue)
-            if not queue:
-                break
-            card = await session.get(Card, queue[0])
-            note = await session.get(Note, card.note_id)
-            shown.append(card_view(card, note))
-            await record_review(session, card, Rating.Good, datetime.now(UTC))
-        queue = queue[1:]
+        markup = message.answer.call_args.kwargs.get("reply_markup")
+        if markup is None:
+            break
+        card_id = markup.inline_keyboard[0][0].callback_data.split(":", 2)[2]
+        front = message.answer.call_args.args[0]
+        reveal = SimpleNamespace(
+            data=f"learn:reveal:{card_id}",
+            from_user=SimpleNamespace(id=1),
+            answer=AsyncMock(),
+            message=message,
+        )
+        await learn_reveal(reveal, session_factory, state)
+        back = message.answer.call_args.args[0]
+        rate = SimpleNamespace(
+            data=f"learn:rate:{card_id}:{Rating.Good.value}",
+            from_user=SimpleNamespace(id=1),
+            answer=AsyncMock(),
+            message=message,
+        )
+        await learn_rate(rate, state, session_factory)
+        shown.append((card_id, front, back))
     else:
         pytest.fail("session did not end")
     return shown
@@ -309,8 +319,8 @@ async def test_verb_to_noun_replaces_the_verb_cards_with_the_noun_ones(
         (c.reps, c.stability, c.introduced_at) == (0, None, None) for c in noun_cards.values()
     )
     for card in noun_cards.values():
-        # A real question, not the bare-lemma fallback.
-        assert card_view(card, note).cue is not None
+        front, back = render_card(card, note)
+        assert (front, back) != (note.lemma, note.lemma)
 
     # The word card is untouched, history and all.
     assert after[word.id] == before[word.id]
@@ -384,10 +394,10 @@ async def test_lemma_change_without_recompute_deletes_the_cards_and_creates_none
     assert await orphan_reviews(session_factory) == set()
     assert await review_owners(session_factory) == {word.id}
 
-    # Learning sees the word card and nothing else: no unanswerable leftovers,
+    # /learn sees the word card and nothing else: no unanswerable leftovers,
     # and no verified forms for the sync to build new cards from.
     shown = await run_learn(session_factory)
-    assert [view.id for view in shown] == [word.id]
+    assert [card_id for card_id, _front, _back in shown] == [word.id]
     _note, cards_after = await load(session_factory)
     assert by_form(cards_after) == {}
 
@@ -462,7 +472,7 @@ async def test_forms_the_note_gained_get_cards_while_the_shared_ones_keep_their_
     for name in kept_forms:
         assert after[cards_by_form[name].id] == before[cards_by_form[name].id]
     assert cards_by_form["genetiivi"].id == genetiivi.id
-    assert card_view(cards_by_form["genetiivi"], note).form_answer.startswith("kissan")
+    assert render_card(cards_by_form["genetiivi"], note)[1].startswith("kissan")
     # New keys: new cards, waiting for the curriculum.
     for name in NOUN_CARD_FORMS - set(kept_forms):
         card = cards_by_form[name]
@@ -497,17 +507,14 @@ async def test_an_unchanged_form_set_keeps_every_card_and_its_history(
     first = by_form(cards)["preesens_1s"]
     assert before[first.id][5] == 2  # reps survived the edit
     expected = "haen" if new_lemma == "hakea" else "puhun"
-    view = card_view(first, note)
-    task = FORM_TASKS["preesens_1s"]
-    assert (view.lemma, view.cue, view.form_answer, view.form_label) == (
-        new_lemma,
-        task.cue,
-        expected,
-        task.label,
+    assert render_card(first, note) == (
+        f"{new_lemma} → minä, nyt → ?",
+        f"{expected}\n\n✅ {FORM_TASKS['preesens_1s'].label}",
     )
 
     shown = await run_learn(session_factory)
-    assert expected in {view.form_answer for view in shown}
+    backs = {back.split("\n")[0] for _id, _front, back in shown}
+    assert expected in backs
 
 
 async def test_same_lemma_with_a_pos_the_fst_rules_out_builds_the_new_tables_cards(
@@ -537,7 +544,7 @@ async def test_same_lemma_with_a_pos_the_fst_rules_out_builds_the_new_tables_car
     assert set(by_form(cards)) == NOUN_CARD_FORMS
 
 
-# --- F: what learning, the queue and the curriculum see afterwards --------------------
+# --- F: what /learn, the queue and the curriculum see afterwards --------------------
 
 
 async def test_learn_never_serves_a_card_of_the_previous_part_of_speech(
@@ -566,15 +573,15 @@ async def test_learn_never_serves_a_card_of_the_previous_part_of_speech(
     assert (counters.due, counters.overdue) == (1, 1)
 
     shown = await run_learn(session_factory)
-    _note, cards = await load(session_factory)
-    assert {view.id for view in shown} & verb_ids == set()
-    # Every form the learner met is a real question, not the bare-lemma fallback.
-    for view in shown:
-        assert view.type != CardType.inflection or view.cue is not None
+    note, cards = await load(session_factory)
+    assert {card_id for card_id, _f, _b in shown} & verb_ids == set()
+    # Everything the learner met renders as a real question, not (lemma, lemma).
+    for _card_id, front, back in shown:
+        assert (front, back) != (note.lemma, note.lemma)
     # The curriculum opened the new table's core forms, out of today's budget.
     opened = {c.form for c in cards if c.status == CardStatus.introduced and c.form}
     assert opened == {"genetiivi", "partitiivi", "illatiivi", "monikon_genetiivi"}
-    assert ("talo", FORM_TASKS["illatiivi"].cue) in [(view.lemma, view.cue) for view in shown]
+    assert "talo → mihin?" in [front for _id, front, _back in shown]
 
 
 async def test_the_level_gate_counts_only_the_new_parts_of_speech_forms(

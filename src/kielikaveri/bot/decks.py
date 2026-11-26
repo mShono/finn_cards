@@ -6,7 +6,7 @@ automatic new-vs-mature split - the learner decides what's grouped with
 what). This module manages the deck list and the per-deck card list;
 editing a card itself lives in bot/edit.py - this module only links to it
 via the noteedit: callback. Which deck a save goes to is asked per batch in
-bot/add.py; learning picks its deck in the reader (reader/learn.py).
+bot/add.py, and /learn's own deck picker lives in bot/learn.py.
 """
 
 from __future__ import annotations

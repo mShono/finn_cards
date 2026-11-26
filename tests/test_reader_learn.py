@@ -599,7 +599,7 @@ async def test_undo_refuses_a_card_rated_again_elsewhere(client, session_factory
     ids = await add_words(session_factory, 2)
     session = (await start(client))["session"]
     await rate(client, session, ids[0], 1)
-    # Meanwhile the same card is rated again elsewhere.
+    # Meanwhile the bot rates the same card.
     async with session_factory() as db:
         card = await db.get(Card, ids[0])
         await record_review(db, card, Rating.Good, datetime.now(UTC))
@@ -718,36 +718,6 @@ async def test_debt_defer_postpones_the_tail(make_client, session_factory):
         dues = [(await db.get(Card, i)).due for i in ids]
     assert dues[0] < NOW
     assert all(due > NOW + timedelta(days=6) for due in dues[1:])
-
-
-async def test_debt_defer_keeps_to_the_chosen_deck_and_side(make_client, session_factory):
-    # The deck and the side travel from the start to the debt answer in the
-    # session only: a defer must not postpone what this session doesn't show.
-    srs = {"state": CardState.review, "stability": 5.0, "difficulty": 5.0, "reps": 2}
-    other_deck = await add_deck(session_factory, name="Muu")
-    elsewhere = await add_words(session_factory, 3, deck_id=other_deck, **srs)
-    deck = await add_deck(session_factory, name="Kirja")
-    finnish, russian = [], []
-    for i in range(3):
-        note = await add_note(
-            session_factory, deck, f"d{i}", created_at=NOW - timedelta(days=20 - i)
-        )
-        due = PAST - timedelta(hours=3 - i)
-        finnish.append(await add_card(session_factory, f"fi{i}", note, due=due, **srs))
-        russian.append(
-            await add_card(
-                session_factory, f"ru{i}", note, type=CardType.production, due=due, **srs
-            )
-        )
-    client = await make_client(debt_threshold=2, session_max_cards=1, debt_postpone_days=7)
-    body = await start(client, side="ru", deck_id=deck)
-    assert (body["state"], body["overdue"]) == ("debt", 3)
-
-    await post(client, "debt", {"session": body["session"], "action": "defer"})
-
-    async with session_factory() as db:
-        dues = {i: (await db.get(Card, i)).due for i in [*elsewhere, *finnish, *russian]}
-    assert [i for i, due in dues.items() if due > NOW] == russian[1:]
 
 
 async def test_a_second_debt_answer_is_stale(make_client, session_factory):
@@ -898,28 +868,3 @@ async def test_logs_carry_ids_and_never_card_text(make_client, session_factory, 
     } <= learn_events
     undo = next(f for f in events if f.get("event") == "learn.undo")
     assert undo["card_id"] == ids[0]
-
-
-async def test_an_empty_start_is_logged_without_card_text(client, session_factory, caplog):
-    caplog.set_level(logging.DEBUG)
-    logging.getLogger("aiosqlite").setLevel(logging.INFO)
-    deck = await add_deck(session_factory)
-    # Words exist, so their text could leak - the Russian side just has none yet.
-    await add_words(session_factory, 2, deck_id=deck)
-
-    assert (await start(client, side="ru", deck_id=deck))["state"] == "empty"
-
-    async with session_factory() as db:
-        notes = (await db.scalars(select(Note))).all()
-    texts = [t for n in notes for t in (n.lemma, n.translation_ru, n.example_fi, n.example_ru)]
-    messages = [r.getMessage() for r in caplog.records]
-    for message in messages:
-        for piece in texts:
-            assert piece not in message
-    [empty] = [f for f in map(log_fields, messages) if f.get("event") == "learn.session_empty"]
-    assert empty == {
-        "event": "learn.session_empty",
-        "deck_id": deck,
-        "side": "ru",
-        "source": "reader",
-    }

@@ -183,7 +183,7 @@ def test_file_name_depends_on_model_speed_and_text(tmp_path):
     assert all(name.endswith(".wav") and "talo" not in name.lower() for name in names)
 
 
-async def test_reader_settings_choose_the_model_and_speed(session_factory, book, cache_dir):
+async def test_reader_settings_choose_the_model_not_learns(session_factory, book, cache_dir):
     _, chapter_id, _ = book
     tts = FakeTTS()
     app = build_app(
@@ -192,6 +192,7 @@ async def test_reader_settings_choose_the_model_and_speed(session_factory, book,
         cache_dir,
         reader_tts_model="tts-1-hd",
         reader_tts_speed=0.9,
+        openai_tts_model="tts-1",
     )
     async with TestClient(TestServer(app)) as client:
         assert (await post(client, body(chapter_id, token=TALOSSA))).status == 200
