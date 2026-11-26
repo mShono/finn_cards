@@ -287,7 +287,18 @@ async def get_chapter(request: web.Request) -> web.Response:
     return web.json_response(body)
 
 
+def _no_openai(app: web.Application) -> web.Response | None:
+    """503 {"reason": "no_openai"} when OPENAI_API_KEY is empty: the
+    clients hold a stand-in key (make_app), a call would only fail as a 401
+    and spend the reader's breaker."""
+    if app[SETTINGS].openai_api_key:
+        return None
+    return web.json_response({"reason": "no_openai"}, status=503)
+
+
 def _warm_up(app: web.Application) -> None:
+    if not app[SETTINGS].openai_api_key:
+        return
     app[WARMUP].maybe_start(app[LOOKUP_CLIENT], app[SETTINGS].openai_text_model)
 
 
@@ -344,6 +355,8 @@ def _call_failed(event: str, target: Target | str, exc: Exception) -> web.Respon
 async def lookup_word(request: web.Request) -> web.Response:
     target = await _word_target(request)
     app = request.app
+    if (refused := _no_openai(app)) is not None:
+        return refused
     try:
         body = await lookup(
             app[SESSION_FACTORY],
@@ -395,6 +408,8 @@ async def save_word(request: web.Request) -> web.Response:
     {"reason": "save_failed"} when the card can't be built."""
     target, chapter, book = await _word_in_chapter(request)
     app = request.app
+    if (refused := _no_openai(app)) is not None:
+        return refused
     try:
         result = await add_card(
             app[SESSION_FACTORY],
@@ -432,6 +447,8 @@ async def save_word(request: web.Request) -> web.Response:
 async def speak_word(request: web.Request) -> web.Response:
     target = await _word_target(request)
     app = request.app
+    if (refused := _no_openai(app)) is not None:
+        return refused
     settings = app[SETTINGS]
     try:
         audio = await speak(
@@ -588,8 +605,8 @@ async def learn_tts(request: web.Request) -> web.Response:
         raise web.HTTPNotFound() from None
     except learn.SessionGoneError:
         return _conflict("session_gone")
-    if not settings.openai_api_key:
-        return web.json_response({"reason": "no_openai"}, status=503)
+    if (refused := _no_openai(app)) is not None:
+        return refused
     ids = f"card_id={card_id} source=learn"
     try:
         audio = await speak_text(
@@ -636,8 +653,8 @@ def make_app(
         daily_max_calls=settings.reader_daily_max_calls,
     )
     # The SDK refuses to build a client without a key, and learning must
-    # still work then (П5): the clients get a stand-in. /api/learn/tts
-    # answers 503 without calling; the lookup's calls fail as OpenAI's (502).
+    # still work then (П5): the clients get a stand-in nobody calls with -
+    # lookup, ➕ and both TTS answer 503 no_openai, the warm-up is skipped.
     api_key = settings.openai_api_key or NO_API_KEY
     app[LOOKUP_CLIENT] = make_client(api_key, settings.openai_timeout_seconds, LOOKUP_MAX_RETRIES)
     app[TTS_CLIENT] = make_tts_client(api_key, settings.openai_tts_timeout_seconds)

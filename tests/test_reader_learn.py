@@ -16,13 +16,19 @@ from bot_helpers import make_settings
 from conftest import log_fields
 from sqlalchemy import delete, func, select, text
 from test_reader import OWNER, STRANGER, TOKEN, header
-from test_reader_lookup import FakeOpenAI, session_factory  # noqa: F401 - the fixture
+from test_reader_lookup import (  # noqa: F401 - fixtures among them
+    FakeOpenAI,
+    book,
+    session_factory,
+)
+from test_reader_lookup import body as word_body
 from test_reader_tts import WAV, FakeTTS
 
 from kielikaveri.db.models import Card, CardState, CardType, Deck, Note, NoteKind, Review
 from kielikaveri.grammar import FORM_TASKS
-from kielikaveri.learn_core import EMPTY_ALL_TEXT, NO_PRODUCTION_TEXT
-from kielikaveri.reader.app import LEARN_SESSIONS, LOOKUP_CLIENT, TTS_CLIENT, make_app
+from kielikaveri.learn_core import EMPTY_ALL_TEXT, NO_PRODUCTION_TEXT, record_review
+from kielikaveri.reader.app import LEARN_SESSIONS, LOOKUP_CLIENT, TTS_CLIENT, WARMUP, make_app
+from kielikaveri.srs.scheduler import Rating
 
 NOW = datetime.now(UTC)
 PAST = NOW - timedelta(days=1)
@@ -491,6 +497,24 @@ async def test_a_card_deleted_mid_session_is_skipped(client, session_factory):
     assert await review_rows(session_factory) == []
 
 
+async def test_a_skipped_card_is_logged_as_the_readers(client, session_factory, caplog):
+    caplog.set_level(logging.INFO)
+    ids = await add_words(session_factory, 2)
+    session = (await start(client))["session"]
+    await rate(client, session, ids[0])
+    async with session_factory() as db:
+        await db.execute(delete(Card).where(Card.id == ids[1]))
+        await db.commit()
+
+    await rate(client, session, ids[0])
+
+    skipped = [
+        log_fields(r.getMessage()) for r in caplog.records if "learn.skip_deleted" in r.getMessage()
+    ]
+    assert skipped and all(f["source"] == "reader" for f in skipped)
+    assert {f["card_id"] for f in skipped} == {ids[1]}
+
+
 async def test_a_deleted_last_card_ends_the_session(client, session_factory):
     ids = await add_words(session_factory, 2)
     session = (await start(client))["session"]
@@ -569,6 +593,40 @@ async def test_undo_from_the_end_screen(client, session_factory):
     assert body["progress"] == {"done": 0, "total": 1}
     assert await review_rows(session_factory) == []
     assert (await rate(client, session, card)).status == 200
+
+
+async def test_undo_refuses_a_card_rated_again_elsewhere(client, session_factory):
+    ids = await add_words(session_factory, 2)
+    session = (await start(client))["session"]
+    await rate(client, session, ids[0], 1)
+    # Meanwhile the bot rates the same card.
+    async with session_factory() as db:
+        card = await db.get(Card, ids[0])
+        await record_review(db, card, Rating.Good, datetime.now(UTC))
+    after_bot = await raw_srs(session_factory, ids[0])
+
+    r = await post(client, "undo", {"session": session})
+
+    assert (r.status, await r.json()) == (409, {"reason": "nothing_to_undo"})
+    assert await raw_srs(session_factory, ids[0]) == after_bot
+    assert len(await review_rows(session_factory)) == 2
+    # The session goes on where it was.
+    body = await (await rate(client, session, ids[1])).json()
+    assert body["state"] == "end"
+
+
+async def test_undo_refuses_when_a_newer_review_exists(client, session_factory):
+    ids = await add_words(session_factory, 2)
+    session = (await start(client))["session"]
+    await rate(client, session, ids[0])
+    async with session_factory() as db:
+        db.add(Review(card_id=ids[0], user_id=OWNER, rating=3, reviewed_at=datetime.now(UTC)))
+        await db.commit()
+
+    r = await post(client, "undo", {"session": session})
+
+    assert (r.status, await r.json()) == (409, {"reason": "nothing_to_undo"})
+    assert len(await review_rows(session_factory)) == 2
 
 
 async def test_undo_deletes_the_production_card_that_rating_opened(client, session_factory):
@@ -747,6 +805,29 @@ async def test_learning_works_without_openai(make_client, session_factory, tts):
     r = await post(client, "tts", {"session": session, "card_id": ids[0]})
     assert (r.status, await r.json()) == (503, {"reason": "no_openai"})
     assert tts.calls == []
+
+
+async def test_without_openai_the_reader_calls_nothing(make_client, book, tts):
+    _, chapter_id, _ = book
+    client = await make_client(openai_api_key="")
+    lookup_client = client.server.app[LOOKUP_CLIENT]
+    warmup = client.server.app[WARMUP]
+    warmup.maybe_start = MagicMock()
+
+    for path in ("/api/lookup", "/api/tts", "/api/cards"):
+        r = await client.post(path, json=word_body(chapter_id), headers=header())
+        assert (r.status, await r.json()) == (503, {"reason": "no_openai"}), path
+    # The body is still checked first.
+    r = await client.post("/api/lookup", json={"chapter_id": 1}, headers=header())
+    assert r.status == 400
+    assert (await client.get(f"/api/chapters/{chapter_id}", headers=header())).status == 200
+    assert (
+        await client.post("/api/lemma", json=word_body(chapter_id), headers=header())
+    ).status == 200
+
+    assert lookup_client.requests == []
+    assert tts.calls == []
+    warmup.maybe_start.assert_not_called()
 
 
 # --- logs ----------------------------------------------------------------------------

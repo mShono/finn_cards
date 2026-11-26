@@ -139,7 +139,7 @@ async def _state(db: AsyncSession, current: LearnSession, *, check_time: bool) -
     `check_time` - the session_max_minutes limit, applied after a rating
     (as the bot's _show_next_card does), not when the state is only
     re-read."""
-    current.queue = await drop_deleted_head(db, current.queue)
+    current.queue = await drop_deleted_head(db, current.queue, source="reader")
     if not current.ended:
         elapsed = (datetime.now(UTC) - current.started_at).total_seconds() / 60
         timed_out = check_time and elapsed >= current.max_minutes
@@ -350,7 +350,8 @@ async def undo(
         restored = await undo_review(db, record)
         current.last = None
         if not restored:
-            # The card was deleted since: nothing left to take back.
+            # The card was deleted or rated again since (e.g. in the bot):
+            # taking this rating back would undo the newer one too.
             raise NothingToUndoError
         current.queue = [record.card_id, *current.queue]
         current.reviewed_count -= 1
