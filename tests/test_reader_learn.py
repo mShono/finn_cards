@@ -599,7 +599,7 @@ async def test_undo_refuses_a_card_rated_again_elsewhere(client, session_factory
     ids = await add_words(session_factory, 2)
     session = (await start(client))["session"]
     await rate(client, session, ids[0], 1)
-    # Meanwhile the bot rates the same card.
+    # Meanwhile the same card is rated again elsewhere.
     async with session_factory() as db:
         card = await db.get(Card, ids[0])
         await record_review(db, card, Rating.Good, datetime.now(UTC))
