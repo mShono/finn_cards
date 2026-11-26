@@ -16,7 +16,8 @@ class Settings(BaseSettings):
     # Finnish morphology and give a useless error breakdown.
     openai_text_model: str = "gpt-5.6-terra"
     openai_stt_model: str = "whisper-1"
-    # The reader's 🔊 (word and card example) - a button the user is waiting on - past this, failing fast beats waiting.
+    # The reader's 🔊 (word and card example): a button the user is waiting
+    # on - past this, failing fast beats waiting.
     openai_tts_timeout_seconds: float = 15.0
     openai_timeout_seconds: float = 60.0
 

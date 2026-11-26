@@ -898,3 +898,28 @@ async def test_logs_carry_ids_and_never_card_text(make_client, session_factory, 
     } <= learn_events
     undo = next(f for f in events if f.get("event") == "learn.undo")
     assert undo["card_id"] == ids[0]
+
+
+async def test_an_empty_start_is_logged_without_card_text(client, session_factory, caplog):
+    caplog.set_level(logging.DEBUG)
+    logging.getLogger("aiosqlite").setLevel(logging.INFO)
+    deck = await add_deck(session_factory)
+    # Words exist, so their text could leak - the Russian side just has none yet.
+    await add_words(session_factory, 2, deck_id=deck)
+
+    assert (await start(client, side="ru", deck_id=deck))["state"] == "empty"
+
+    async with session_factory() as db:
+        notes = (await db.scalars(select(Note))).all()
+    texts = [t for n in notes for t in (n.lemma, n.translation_ru, n.example_fi, n.example_ru)]
+    messages = [r.getMessage() for r in caplog.records]
+    for message in messages:
+        for piece in texts:
+            assert piece not in message
+    [empty] = [f for f in map(log_fields, messages) if f.get("event") == "learn.session_empty"]
+    assert empty == {
+        "event": "learn.session_empty",
+        "deck_id": deck,
+        "side": "ru",
+        "source": "reader",
+    }

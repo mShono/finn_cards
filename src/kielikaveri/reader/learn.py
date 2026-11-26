@@ -7,7 +7,7 @@ reader/app.py): a new start replaces the old one, and after a restart there
 is none - the client is told `session_gone` and starts again. The ratings
 are in the database already, only the place in the queue is lost.
 
-Every call takes the user's lock (KeyedLocks), so a double swipe rates the
+Every call takes the user's lock (KeyedLocks), so a double tap rates the
 card once: the second call finds another card at the head and is `stale`.
 
 Only the last rating can be undone, while the session lives: the card's SRS
