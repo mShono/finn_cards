@@ -1,7 +1,8 @@
-// The reader Mini App (plan 2026-11-20-kirjakaveri-reader, "П2"-"П5"):
+// The reader Mini App (plan 2026-11-20-kirjakaveri-reader, "П2"-"П6"):
 // the list of books and chapters, one chapter as paragraphs of word spans, a
-// bottom popup with the tapped word's lookup, 🔊 and ➕, and the learning
-// screens (flashcards rated by buttons).
+// bottom popup with the tapped word's lookup, 🔊 and ➕, the learning
+// screens (flashcards rated by buttons) and the decks (lists, search, a
+// word's card with its edits).
 // No build step. Book and card text is only ever set through textContent.
 "use strict";
 
@@ -32,14 +33,15 @@ class ApiError extends Error {
 }
 
 // Every API call goes through here: initData rides in the Authorization
-// header (the server checks it). With a body the call is a JSON POST.
-async function request(path, { body, signal } = {}) {
+// header (the server checks it). With a body the call is a JSON POST unless
+// method says otherwise (PATCH, DELETE: the decks, П6).
+async function request(path, { method, body, signal } = {}) {
   const options = {
+    method: method || (body !== undefined ? "POST" : "GET"),
     headers: { Authorization: "tma " + (tg ? tg.initData : "") },
     signal,
   };
   if (body !== undefined) {
-    options.method = "POST";
     options.headers["Content-Type"] = "application/json";
     options.body = JSON.stringify(body);
   }
@@ -125,7 +127,7 @@ function navigate(back) {
   return navigation;
 }
 
-// "📖 Книги | 📚 Учить" on top of the two root screens.
+// "📖 Книги | 📚 Учить | 🗂 Колоды" on top of the three root screens.
 function switcher(active) {
   const tab = (name, label, go) =>
     el(
@@ -140,7 +142,13 @@ function switcher(active) {
       },
       label,
     );
-  return el("nav", { class: "switch" }, tab("books", "📖 Книги", showBooks), tab("learn", "📚 Учить", showLearn));
+  return el(
+    "nav",
+    { class: "switch" },
+    tab("books", "📖 Книги", showBooks),
+    tab("learn", "📚 Учить", showLearn),
+    tab("decks", "🗂 Колоды", showDeckList),
+  );
 }
 
 // --- list of books ------------------------------------------------------------
@@ -224,8 +232,9 @@ function textBlock(chapter) {
   return text;
 }
 
-async function showChapter(chapterId) {
-  const view = navigate(showBooks);
+// back: where the BackButton goes - the books, or the chapter's deck (П6).
+async function showChapter(chapterId, back = showBooks) {
+  const view = navigate(back);
   let chapter;
   try {
     chapter = await api(`api/chapters/${encodeURIComponent(chapterId)}`);
@@ -534,7 +543,9 @@ const RATING = { again: 1, hard: 2, good: 3, easy: 4 };
 const SESSION_GONE_TEXT = "Сессия прервалась.";
 
 // deckId: null means all decks. session: the server's id of the session.
-const learn = { decks: [], deckId: null, side: null, session: null };
+// fromDeck: the deck screen "📚 Учить эту колоду" was tapped on (П6), where
+// the side choice goes back to; null when learning started from the tab.
+const learn = { decks: [], deckId: null, side: null, session: null, fromDeck: null };
 
 function loading() {
   return el("p", { class: "muted" }, "загружаю…");
@@ -561,6 +572,7 @@ function showLearnError(error) {
 
 async function showLearn() {
   const view = navigate(null);
+  learn.fromDeck = null;
   show(switcher("learn"), loading());
   let data;
   try {
@@ -596,8 +608,10 @@ function pickDeck(deckId) {
 }
 
 function showSides() {
-  // The deck picker is one step back only when there was a choice.
-  navigate(learn.decks.length > 1 ? showDecks : null);
+  // From a deck screen back goes to that deck. Otherwise the deck picker is
+  // one step back only when there was a choice.
+  const fromDeck = learn.fromDeck;
+  navigate(fromDeck ? () => showDeck(fromDeck) : learn.decks.length > 1 ? showDecks : null);
   const buttons = SIDES.map(([side, label]) =>
     el("button", { type: "button", onclick: () => startSession(side) }, label));
   show(
@@ -868,6 +882,713 @@ function undoLast(button, errorNode, ui) {
     });
 }
 
+// --- decks (П6) ---------------------------------------------------------------
+// Screens: the deck list (and the search over all decks) -> a deck -> a
+// word. Nothing is cached: every screen asks the server again, so the lists
+// and counters are fresh after an edit, a move or a delete.
+
+const NOTES_PAGE = 50;
+const SEARCH_DELAY_MS = 250;
+const DECK_NAME_MAX = 64;
+const MONTHS = ["янв", "фев", "мар", "апр", "мая", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"];
+// A card's line on the word screen; an inflection card shows its form.
+const CARD_SIDE = { recognition: "🇫🇮→🇷🇺", production: "🇷🇺→🇫🇮" };
+const DECK_GONE_TEXT = "Колода уже удалена.";
+const NOTE_GONE_TEXT = "Слово уже удалено.";
+const DECK_NAME_TEXT = `Название - от 1 до ${DECK_NAME_MAX} символов.`;
+const EMPTY_VALUE_TEXT = "Пустое значение не сохраню - напиши текст ещё раз.";
+
+function isNotFound(error) {
+  return error instanceof ApiError && error.status === 404;
+}
+
+// One request at a time on a screen: from the tap until the answer every
+// action button of the screen is disabled, as the rating buttons are.
+function makeGuard() {
+  return { busy: false, buttons: [] };
+}
+
+function guardButton(guard, button) {
+  guard.buttons.push(button);
+  return button;
+}
+
+function setGuard(guard, busy) {
+  guard.busy = busy;
+  for (const button of guard.buttons) button.disabled = busy;
+}
+
+// tg.showConfirm (Telegram 6.2+), else the browser's confirm. A second tap
+// while the dialog is open asks nothing: Telegram throws on a second popup.
+let confirmOpen = false;
+
+function askConfirm(text, onYes) {
+  if (confirmOpen) return;
+  const telegramConfirm =
+    tg && typeof tg.showConfirm === "function" && (!tg.isVersionAtLeast || tg.isVersionAtLeast("6.2"));
+  if (telegramConfirm) {
+    confirmOpen = true;
+    try {
+      tg.showConfirm(text, (ok) => {
+        confirmOpen = false;
+        if (ok) onYes();
+      });
+      return;
+    } catch (_) {
+      confirmOpen = false;
+    }
+  }
+  if (window.confirm(text)) onYes();
+}
+
+// A screen with one message and a way back: a deck or word deleted
+// elsewhere, or a load that failed.
+function showNotice(text, back) {
+  navigate(back);
+  show(
+    el("p", { class: "message" }, text),
+    el("button", { type: "button", class: "secondary", onclick: back }, "Назад"),
+  );
+}
+
+function deckCounters(deck) {
+  return `слов ${deck.notes} · к повторению ${deck.due}`;
+}
+
+function deckCaption(chapter) {
+  return `📖 ${chapter.book_title}, гл. ${chapter.number}`;
+}
+
+function searchField(placeholder, value) {
+  const input = el("input", {
+    type: "search",
+    class: "search",
+    placeholder,
+    autocomplete: "off",
+    enterkeyhint: "search",
+    "aria-label": placeholder,
+  });
+  input.value = value;
+  return input;
+}
+
+// Asks /api/notes/search a moment after the last keystroke. An answer to an
+// older query, or one that comes after the user has left the screen, is
+// dropped. on.results(notes, q), on.empty(), on.error(error).
+function liveSearch(input, view, on) {
+  let timer = null;
+  let asked = 0;
+  const run = () => {
+    clearTimeout(timer);
+    asked += 1;
+    const mine = asked;
+    const q = input.value.trim();
+    if (!q) {
+      on.empty();
+      return;
+    }
+    timer = setTimeout(() => {
+      api(`api/notes/search?q=${encodeURIComponent(q)}`)
+        .then((data) => {
+          if (mine === asked && view === navigation) on.results(data.notes || [], q);
+        })
+        .catch((error) => {
+          if (mine === asked && view === navigation) on.error(error);
+        });
+    }, SEARCH_DELAY_MS);
+  };
+  input.addEventListener("input", run);
+  return run;
+}
+
+// "лемма — перевод"; in the search the deck's name under it (null: a note
+// from before decks, in no deck).
+function noteItem(note, back, withDeck) {
+  const text = el("span", {}, el("b", { lang: "fi" }, note.lemma), ` — ${note.translation_ru}`);
+  if (withDeck) {
+    text.append(el("br"), el("span", { class: "muted small" },
+      note.deck ? `🗂 ${note.deck.name}` : "без колоды"));
+  }
+  return el("li", { class: "ready", onclick: () => showNote(note.id, back) }, text);
+}
+
+// An input with "Сохранить" and "Отмена" under it and the error line under
+// those. onSubmit(value, editor) gets the trimmed value; while its request
+// runs the screen's guard keeps every button disabled and the save button
+// reads "…".
+function inlineEditor(guard, { value = "", placeholder = "", maxLength = 0, label = "Сохранить",
+  onSubmit, onCancel }) {
+  const input = el("input", { type: "text", class: "field", placeholder, autocomplete: "off",
+    "aria-label": placeholder || label });
+  if (maxLength) input.maxLength = maxLength;
+  input.value = value;
+  const save = guardButton(guard, el("button", { type: "button" }, label));
+  const cancel = guardButton(guard, el("button", { type: "button", class: "secondary" }, "Отмена"));
+  const error = el("p", { class: "error small" });
+  const editor = { input, save, error, label, guard };
+  const submit = () => {
+    if (!guard.busy) onSubmit(input.value.trim(), editor);
+  };
+  save.addEventListener("click", submit);
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      submit();
+    }
+  });
+  cancel.addEventListener("click", () => {
+    if (!guard.busy) onCancel();
+  });
+  editor.node = el("div", { class: "editor" }, input, el("div", { class: "pair" }, save, cancel), error);
+  return editor;
+}
+
+function editorBusy(editor, busy) {
+  setGuard(editor.guard, busy);
+  editor.input.readOnly = busy;
+  editor.save.textContent = busy ? "…" : editor.label;
+  if (busy) editor.error.textContent = "";
+}
+
+// One edit from an editor: send() makes the request, done() runs on
+// success (it always moves on: the screen is asked for again), a failure
+// goes under the field through errorFor(error).
+function submitEdit(editor, view, send, done, errorFor) {
+  if (editor.guard.busy) return;
+  editorBusy(editor, true);
+  send()
+    .then((data) => {
+      if (view === navigation) done(data);
+    })
+    .catch((error) => {
+      if (view !== navigation) return;
+      editorBusy(editor, false);
+      editor.error.textContent = errorFor(error);
+    });
+}
+
+function deckNameErrorText(error) {
+  if (error instanceof ApiError && error.status === 422) return DECK_NAME_TEXT;
+  if (isNotFound(error)) return DECK_GONE_TEXT;
+  return errorText(error);
+}
+
+// --- the deck list ------------------------------------------------------------
+
+async function showDeckList() {
+  const view = navigate(null);
+  show(switcher("decks"), loading());
+  let data;
+  try {
+    data = await api("api/decks");
+  } catch (error) {
+    if (view === navigation) show(switcher("decks"), el("p", { class: "muted" }, errorText(error)));
+    return;
+  }
+  if (view !== navigation) return;
+  const search = searchField("Поиск по всем колодам", "");
+  // The first letter typed moves on to the search screen with it.
+  search.addEventListener("input", () => {
+    if (search.value.trim()) showSearch(search.value);
+  });
+  const list = el("ul", { class: "chapters decks" });
+  for (const deck of data.decks) list.append(deckItem(deck));
+  show(switcher("decks"), search, list, newDeckBlock(view));
+}
+
+function deckItem(deck) {
+  const text = el("span", {}, deck.name, el("br"), el("span", { class: "muted small" }, deckCounters(deck)));
+  if (deck.chapter) text.append(el("br"), el("span", { class: "muted small" }, deckCaption(deck.chapter)));
+  return el("li", { class: "ready", onclick: () => showDeck(deck.id) }, text);
+}
+
+// "➕ Новая колода": the name is typed right under the list.
+function newDeckBlock(view) {
+  const block = el("div", { class: "new-deck" });
+  const open = el("button", { type: "button", class: "secondary" }, "➕ Новая колода");
+  open.addEventListener("click", () => {
+    const editor = inlineEditor(makeGuard(), {
+      placeholder: "Название колоды",
+      maxLength: DECK_NAME_MAX,
+      label: "Создать",
+      onCancel: () => block.replaceChildren(open),
+      onSubmit: (name, ed) => {
+        if (!name) {
+          ed.error.textContent = DECK_NAME_TEXT;
+          return;
+        }
+        submitEdit(ed, view, () => api("api/decks", { body: { name } }), () => showDeckList(),
+          deckNameErrorText);
+      },
+    });
+    block.replaceChildren(editor.node);
+    editor.input.focus();
+  });
+  block.append(open);
+  return block;
+}
+
+// --- search over all decks ----------------------------------------------------
+
+// focus: false when coming back from a word - the keyboard would cover the
+// results.
+function showSearch(query, focus = true) {
+  const view = navigate(showDeckList);
+  const input = searchField("Поиск по всем колодам", query);
+  const status = el("p", { class: "muted small" });
+  const list = el("ul", { class: "chapters words" });
+  const run = liveSearch(input, view, {
+    results: (notes, q) => {
+      list.replaceChildren(...notes.map((note) => noteItem(note, () => showSearch(q, false), true)));
+      status.textContent = notes.length ? "" : "Ничего не нашла.";
+    },
+    empty: () => {
+      list.replaceChildren();
+      status.textContent = "Слово по-фински или по-русски, во всех колодах.";
+    },
+    error: (error) => {
+      list.replaceChildren();
+      status.textContent = errorText(error);
+    },
+  });
+  show(el("h1", {}, "Поиск"), input, status, list);
+  if (focus) {
+    input.focus();
+    try {
+      input.setSelectionRange(input.value.length, input.value.length);
+    } catch (_) {
+      // An input type without a caret API: the focus is enough.
+    }
+  }
+  run();
+}
+
+// --- one deck -----------------------------------------------------------------
+
+async function showDeck(deckId) {
+  const view = navigate(showDeckList);
+  show(loading());
+  let decks;
+  let page;
+  try {
+    // The counters come with the deck list (there is no one-deck GET).
+    [decks, page] = await Promise.all([
+      api("api/decks"),
+      api(`api/decks/${encodeURIComponent(deckId)}/notes?offset=0&limit=${NOTES_PAGE}`),
+    ]);
+  } catch (error) {
+    if (view !== navigation) return;
+    showNotice(isNotFound(error) ? DECK_GONE_TEXT : errorText(error), showDeckList);
+    return;
+  }
+  if (view !== navigation) return;
+  const deck = decks.decks.find((item) => item.id === deckId);
+  if (!deck) {
+    showNotice(DECK_GONE_TEXT, showDeckList);
+    return;
+  }
+  renderDeck(view, deck, page);
+}
+
+function renderDeck(view, deck, page) {
+  const guard = makeGuard();
+  const back = () => showDeck(deck.id);
+  const errorNode = el("p", { class: "error small" });
+  const editArea = el("div", {});
+
+  const learnButton = guardButton(guard, el("button", { type: "button" }, "📚 Учить эту колоду"));
+  learnButton.addEventListener("click", () => learnDeck(deck));
+  const menuButton = guardButton(guard, el("button", { type: "button", class: "secondary menu-button",
+    "aria-label": "Ещё", "aria-expanded": "false" }, "⋯"));
+  const rename = guardButton(guard, el("button", { type: "button", class: "secondary" }, "✍️ Переименовать"));
+  const remove = guardButton(guard, el("button", { type: "button", class: "secondary danger" },
+    "🗑 Удалить колоду"));
+  const menu = el("div", { class: "menu", hidden: "" }, rename, remove);
+  menuButton.addEventListener("click", () => {
+    menu.hidden = !menu.hidden;
+    menuButton.setAttribute("aria-expanded", String(!menu.hidden));
+  });
+  rename.addEventListener("click", () => {
+    menu.hidden = true;
+    const editor = inlineEditor(guard, {
+      value: deck.name,
+      placeholder: "Название колоды",
+      maxLength: DECK_NAME_MAX,
+      onCancel: () => editArea.replaceChildren(),
+      onSubmit: (name, ed) => {
+        if (!name) {
+          ed.error.textContent = DECK_NAME_TEXT;
+          return;
+        }
+        submitEdit(ed, view,
+          () => api(`api/decks/${encodeURIComponent(deck.id)}`, { method: "PATCH", body: { name } }),
+          back, deckNameErrorText);
+      },
+    });
+    editArea.replaceChildren(editor.node);
+    editor.input.focus();
+  });
+  remove.addEventListener("click", () => deleteDeck(view, deck, guard, errorNode));
+
+  const nodes = [el("h1", {}, deck.name)];
+  if (deck.chapter) nodes.push(el("p", { class: "muted small" }, deckCaption(deck.chapter)));
+  nodes.push(
+    el("p", { class: "muted small counters" }, deckCounters(deck), el("br"),
+      `формы: изучается ${deck.introduced}, ещё не открыто ${deck.not_introduced}`),
+    el("div", { class: "deck-head" }, learnButton, menuButton),
+    menu,
+    editArea,
+    errorNode,
+  );
+  // chapter.id is null-safe: the book's deletion leaves chapter null.
+  if (deck.chapter && deck.chapter.id) {
+    const chapterId = deck.chapter.id;
+    nodes.push(el("button", { type: "button", class: "secondary chapter-button",
+      onclick: () => showChapter(chapterId, back) }, "📖 Открыть главу"));
+  }
+  nodes.push(...deckWords(view, deck, page, back));
+  show(...nodes);
+}
+
+function learnDeck(deck) {
+  learn.decks = [];
+  learn.deckId = deck.id;
+  learn.fromDeck = deck.id;
+  showSides();
+}
+
+function deleteDeck(view, deck, guard, errorNode) {
+  if (guard.busy) return;
+  askConfirm(
+    `Удалить колоду «${deck.name}»? Слова (${deck.notes}) и история повторений удалятся вместе с ней.`,
+    () => {
+      if (guard.busy || view !== navigation) return;
+      setGuard(guard, true);
+      errorNode.textContent = "";
+      request(`api/decks/${encodeURIComponent(deck.id)}`, { method: "DELETE" })
+        .then(() => {
+          if (view === navigation) showDeckList();
+        })
+        .catch((error) => {
+          if (view !== navigation) return;
+          // Deleted already (another tap, another tab): the list shows that.
+          if (isNotFound(error)) {
+            showDeckList();
+            return;
+          }
+          setGuard(guard, false);
+          errorNode.textContent = errorText(error);
+        });
+    },
+  );
+}
+
+// The deck's words, newest first, 50 at a time: the next page loads when the
+// "Ещё" button under the list scrolls into view (or is tapped).
+// The search in the deck asks /api/notes/search and keeps this deck's notes:
+// it finds words not loaded yet, folds case the way the server does (ä,
+// Cyrillic), and costs one request per pause in typing. It sees what the
+// server's search returns (at most 50 over all decks), enough for one user.
+function deckWords(view, deck, page, back) {
+  const list = el("ul", { class: "chapters words" });
+  const found = el("ul", { class: "chapters words", hidden: "" });
+  const status = el("p", { class: "muted small" });
+  const more = el("button", { type: "button", class: "secondary more" }, "Ещё");
+  const pager = { loaded: 0, total: page.total, loading: false };
+
+  const append = (notes) => {
+    for (const note of notes) list.append(noteItem(note, back, false));
+    pager.loaded += notes.length;
+    // An empty page means the deck shrank meanwhile: nothing more to ask.
+    if (notes.length === 0) pager.total = pager.loaded;
+    more.hidden = pager.loaded >= pager.total;
+  };
+  append(page.notes);
+  if (pager.total === 0) status.textContent = "Слов пока нет.";
+
+  let observer = null;
+  const loadMore = () => {
+    if (pager.loading || pager.loaded >= pager.total) return;
+    pager.loading = true;
+    more.disabled = true;
+    more.textContent = "загружаю…";
+    api(`api/decks/${encodeURIComponent(deck.id)}/notes?offset=${pager.loaded}&limit=${NOTES_PAGE}`)
+      .then((data) => {
+        if (view !== navigation) return;
+        pager.total = data.total;
+        append(data.notes);
+        status.textContent = "";
+      })
+      .catch((error) => {
+        if (view !== navigation) return;
+        status.textContent = errorText(error);
+      })
+      .finally(() => {
+        pager.loading = false;
+        more.disabled = false;
+        more.textContent = "Ещё";
+        // Still in view after a short page: observe anew, which reports it.
+        if (observer && !more.hidden && view === navigation) {
+          observer.unobserve(more);
+          observer.observe(more);
+        }
+      });
+  };
+  more.addEventListener("click", loadMore);
+  if ("IntersectionObserver" in window) {
+    observer = new IntersectionObserver((entries) => {
+      // Another screen: the button left the page, which reports here too.
+      if (view !== navigation) {
+        observer.disconnect();
+        return;
+      }
+      if (entries.some((entry) => entry.isIntersecting)) loadMore();
+    }, { rootMargin: "200px" });
+    observer.observe(more);
+  }
+
+  const search = searchField("Поиск в колоде", "");
+  liveSearch(search, view, {
+    results: (notes) => {
+      const mine = notes.filter((note) => note.deck && note.deck.id === deck.id);
+      found.replaceChildren(...mine.map((note) => noteItem(note, back, false)));
+      found.hidden = false;
+      list.hidden = true;
+      more.hidden = true;
+      status.textContent = mine.length ? "" : "В этой колоде не нашла.";
+    },
+    empty: () => {
+      found.hidden = true;
+      found.replaceChildren();
+      list.hidden = false;
+      more.hidden = pager.loaded >= pager.total;
+      status.textContent = pager.total === 0 ? "Слов пока нет." : "";
+    },
+    error: (error) => {
+      status.textContent = errorText(error);
+    },
+  });
+  return [pager.total > 0 ? search : null, status, list, found, more].filter(Boolean);
+}
+
+// --- one word -----------------------------------------------------------------
+
+// back: the deck or the search the word was opened from.
+async function showNote(noteId, back) {
+  const view = navigate(back);
+  show(loading());
+  let note;
+  try {
+    note = await api(`api/notes/${encodeURIComponent(noteId)}`);
+  } catch (error) {
+    if (view === navigation) showNotice(isNotFound(error) ? NOTE_GONE_TEXT : errorText(error), back);
+    return;
+  }
+  if (view === navigation) renderNote(view, note, back);
+}
+
+// "🇫🇮→🇷🇺: следующее повторение 3 дек, повторений 5, забыто 1".
+function cardLine(card, now) {
+  const side = CARD_SIDE[card.type] || `🔤 ${card.form || "форма"}`;
+  if (card.status === "not_introduced") return `${side}: ещё не открыта`;
+  const parts = [];
+  const due = card.due ? new Date(card.due) : null;
+  if (due && !Number.isNaN(due.getTime())) {
+    parts.push(due <= now ? "пора повторить" : `следующее повторение ${shortDate(due, now)}`);
+  }
+  parts.push(`повторений ${card.reps || 0}`, `забыто ${card.lapses || 0}`);
+  return `${side}: ${parts.join(", ")}`;
+}
+
+function shortDate(date, now) {
+  const text = `${date.getDate()} ${MONTHS[date.getMonth()]}`;
+  return date.getFullYear() === now.getFullYear() ? text : `${text} ${date.getFullYear()}`;
+}
+
+function noteEditErrorText(error, value) {
+  // The bot's text for the same clash (bot/edit.py _clash_reply).
+  if (isConflict(error, "duplicate")) {
+    return `«${value}» уже есть в этой колоде отдельной карточкой - сначала удали одну из них.`;
+  }
+  if (error instanceof ApiError && error.status === 503 && error.reason === "no_openai") {
+    return "Слово сейчас не поменять: формы пересчитывает OpenAI, а он не подключён.";
+  }
+  if (error instanceof ApiError && error.status === 502) {
+    return "OpenAI не ответил, слово не изменилось. Попробуй ещё раз.";
+  }
+  if (isNotFound(error)) return NOTE_GONE_TEXT;
+  if (error instanceof ApiError && error.status === 422) return EMPTY_VALUE_TEXT;
+  return errorText(error);
+}
+
+function renderNote(view, note, back) {
+  const guard = makeGuard();
+  const reopen = () => showNote(note.id, back);
+  const speakError = el("p", { class: "muted small" });
+  const speakButton = (what, label) => {
+    const button = el("button", { type: "button", class: "speak", "aria-label": label }, "🔊");
+    button.addEventListener("click", () =>
+      playSound(button, speakError, (signal) =>
+        request(`api/notes/${encodeURIComponent(note.id)}/tts`, { body: { what }, signal })));
+    return button;
+  };
+
+  const nodes = [
+    el("div", { class: "word-head" }, el("h1", { lang: "fi" }, note.lemma),
+      speakButton("lemma", "Произнести слово")),
+  ];
+  if (note.pos) nodes.push(el("p", { class: "muted small" }, note.pos));
+  if (note.puhekieli) {
+    nodes.push(el("p", { class: "muted small" }, "разговорное: ", el("span", { lang: "fi" }, note.puhekieli)));
+  }
+  nodes.push(el("p", { class: "translation" }, note.translation_ru));
+  if (note.example_fi) {
+    nodes.push(el("div", { class: "example-line" },
+      el("p", { lang: "fi" }, note.example_fi), speakButton("example", "Произнести пример")));
+  }
+  if (note.example_ru) nodes.push(el("p", { class: "muted" }, note.example_ru));
+  nodes.push(speakError);
+
+  const forms = note.forms_verified && note.forms ? Object.entries(note.forms) : [];
+  if (forms.length) {
+    nodes.push(el("h2", {}, "Формы"), el("ul", { class: "forms" },
+      ...forms.map(([key, form]) => el("li", {}, el("span", { class: "muted" }, key), " ",
+        el("span", { lang: "fi" }, form)))));
+  }
+
+  const deckLine = el("p", { class: "muted small" }, note.deck ? `🗂 ${note.deck.name}` : "🗂 без колоды");
+  if (note.deck && note.deck.chapter) deckLine.append(el("br"), deckCaption(note.deck.chapter));
+  nodes.push(deckLine);
+
+  const now = new Date();
+  const cards = note.cards || [];
+  nodes.push(el("h2", {}, "Карточки"), cards.length
+    ? el("ul", { class: "card-states" }, ...cards.map((card) => el("li", {}, cardLine(card, now))))
+    : el("p", { class: "muted small" }, "Карточек нет."));
+
+  const editArea = el("div", {});
+  const errorNode = el("p", { class: "error small" });
+  const closeEdit = () => editArea.replaceChildren();
+  const editField = (field, value, placeholder) => {
+    const editor = inlineEditor(guard, {
+      value,
+      placeholder,
+      onCancel: closeEdit,
+      onSubmit: (text, ed) => {
+        if (!text) {
+          ed.error.textContent = EMPTY_VALUE_TEXT;
+          return;
+        }
+        if (text === value) {
+          closeEdit();
+          return;
+        }
+        // ✍️ Слово is an LLM call (the forms): "…" until it answers.
+        submitEdit(ed, view,
+          () => api(`api/notes/${encodeURIComponent(note.id)}`, { method: "PATCH", body: { [field]: text } }),
+          reopen, (error) => noteEditErrorText(error, text));
+      },
+    });
+    errorNode.textContent = "";
+    editArea.replaceChildren(editor.node);
+    editor.input.focus();
+  };
+  const action = (label, onTap, cls = "secondary") => {
+    const button = guardButton(guard, el("button", { type: "button", class: cls }, label));
+    button.addEventListener("click", () => {
+      if (!guard.busy) onTap();
+    });
+    return button;
+  };
+  nodes.push(
+    el("div", { class: "word-actions" },
+      action("✍️ Слово", () => editField("lemma", note.lemma, "Слово по-фински")),
+      action("✍️ Перевод", () => editField("translation_ru", note.translation_ru, "Перевод")),
+      action("📂 Перенести", () => pickTargetDeck(view, note, guard, editArea, errorNode, reopen)),
+      action("🗑 Удалить", () => deleteNote(view, note, guard, errorNode, back), "secondary danger")),
+    editArea,
+    errorNode,
+  );
+  show(el("div", { class: "word" }, ...nodes));
+}
+
+// "📂 Перенести": the decks as buttons, this word's deck among them marked.
+function pickTargetDeck(view, note, guard, editArea, errorNode, reopen) {
+  setGuard(guard, true);
+  errorNode.textContent = "";
+  editArea.replaceChildren(loading());
+  api("api/decks")
+    .then((data) => {
+      if (view !== navigation) return;
+      setGuard(guard, false);
+      const current = note.deck ? note.deck.id : null;
+      const buttons = data.decks.map((deck) => {
+        const here = deck.id === current;
+        const button = el("button", { type: "button", class: "secondary" },
+          here ? `${deck.name} (сейчас здесь)` : deck.name);
+        if (here) button.disabled = true;
+        else guardButton(guard, button);
+        button.addEventListener("click", () => moveNote(view, note, deck, guard, errorNode, reopen));
+        return button;
+      });
+      const cancel = guardButton(guard, el("button", { type: "button", class: "secondary" }, "Отмена"));
+      cancel.addEventListener("click", () => {
+        if (!guard.busy) editArea.replaceChildren();
+      });
+      editArea.replaceChildren(el("h2", {}, "В какую колоду?"), el("div", { class: "choices" }, ...buttons, cancel));
+    })
+    .catch((error) => {
+      if (view !== navigation) return;
+      setGuard(guard, false);
+      editArea.replaceChildren();
+      errorNode.textContent = errorText(error);
+    });
+}
+
+function moveNote(view, note, deck, guard, errorNode, reopen) {
+  if (guard.busy) return;
+  setGuard(guard, true);
+  errorNode.textContent = "";
+  api(`api/notes/${encodeURIComponent(note.id)}/move`, { body: { deck_id: deck.id } })
+    .then(() => {
+      if (view === navigation) reopen();
+    })
+    .catch((error) => {
+      if (view !== navigation) return;
+      setGuard(guard, false);
+      if (isConflict(error, "duplicate_in_target")) {
+        errorNode.textContent = `В колоде «${deck.name}» это слово уже есть.`;
+      } else if (isNotFound(error)) {
+        errorNode.textContent = "Слово или колода уже удалены.";
+      } else {
+        errorNode.textContent = errorText(error);
+      }
+    });
+}
+
+function deleteNote(view, note, guard, errorNode, back) {
+  if (guard.busy) return;
+  askConfirm(`Удалить «${note.lemma}» со всеми карточками и историей повторений?`, () => {
+    if (guard.busy || view !== navigation) return;
+    setGuard(guard, true);
+    errorNode.textContent = "";
+    request(`api/notes/${encodeURIComponent(note.id)}`, { method: "DELETE" })
+      .then(() => {
+        if (view === navigation) back();
+      })
+      .catch((error) => {
+        if (view !== navigation) return;
+        // A second delete (double tap, another tab) finds nothing: 404.
+        if (isNotFound(error)) {
+          showNotice(NOTE_GONE_TEXT, back);
+          return;
+        }
+        setGuard(guard, false);
+        errorNode.textContent = errorText(error);
+      });
+  });
+}
+
 // web.telegram.org on a desktop: ← Forgot, → Remember, space flips.
 document.addEventListener("keydown", (event) => {
   const ui = cardView;
@@ -890,8 +1611,12 @@ if (tg) {
   tg.ready();
   tg.expand();
 }
-// reader_url?screen=learn opens the learning screens. A query parameter, not
-// the hash: Telegram keeps tgWebAppData there.
+// reader_url?screen=learn opens the learning screens, ?screen=decks the
+// decks, ?screen=search the search (the bot's /delete). A query parameter,
+// not the hash: Telegram keeps tgWebAppData there.
+const screen = new URLSearchParams(window.location.search).get("screen");
 if (!tg || !tg.initData) show(el("p", { class: "muted" }, OPEN_FROM_BOT));
-else if (new URLSearchParams(window.location.search).get("screen") === "learn") showLearn();
+else if (screen === "learn") showLearn();
+else if (screen === "decks") showDeckList();
+else if (screen === "search") showSearch("");
 else showBooks();

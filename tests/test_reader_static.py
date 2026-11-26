@@ -13,8 +13,12 @@ from kielikaveri.reader.app import STATIC_DIR, make_app
 APP_JS = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
 INDEX_HTML = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
 
-# api("api/books"), api(`api/chapters/${id}`), request("api/tts", { body: ... })
-CALL_RE = re.compile(r"""\b(api|request)\(\s*(["`])(api/[^"`]*)\2\s*(,\s*\{\s*body\b)?""")
+# api("api/books"), api(`api/chapters/${id}`), request("api/tts", { body: ... }),
+# request(`api/notes/${id}`, { method: "DELETE" }), api(..., { method: "PATCH", body })
+CALL_RE = re.compile(
+    r"""\b(api|request)\(\s*(["`])(api/[^"`]*)\2\s*"""
+    r"""(?:,\s*\{\s*(?:method:\s*"([A-Z]+)"\s*,?\s*)?(body\b)?)?"""
+)
 
 # П3's endpoints come from the server branch (reader-lookup), merged
 # separately: their routes are checked against make_app after the merge.
@@ -22,10 +26,26 @@ LOOKUP_PATHS = {"/api/lookup", "/api/tts"}
 # П5's /api/learn/* come from the server branch (learn-api): until it is
 # merged they are not routes of make_app (test_reader_static_learn.py).
 LEARN_PREFIX = "/api/learn/"
+# П6's /api/decks* and /api/notes/* come from the server branch (decks-api),
+# checked against make_app once it is merged (test_reader_static_decks.py).
+DECKS_PREFIXES = ("/api/decks", "/api/notes/")
 
 
 def learn_merged(routes: dict[str, set[str]]) -> bool:
     return "/api/learn/start" in routes
+
+
+def decks_merged(routes: dict[str, set[str]]) -> bool:
+    return "/api/decks" in routes
+
+
+def unmerged(path: str, routes: dict[str, set[str]]) -> bool:
+    """A path whose server branch is not merged yet."""
+    if path.startswith(LEARN_PREFIX):
+        return not learn_merged(routes)
+    if path.startswith(DECKS_PREFIXES):
+        return not decks_merged(routes)
+    return False
 
 
 def _canonical(path: str) -> str:
@@ -38,8 +58,10 @@ def _canonical(path: str) -> str:
 def _calls() -> dict[str, set[str]]:
     """Each API path app.js calls (made absolute) -> the HTTP methods used."""
     calls: dict[str, set[str]] = {}
-    for _, _, path, body in CALL_RE.findall(APP_JS):
-        calls.setdefault(_canonical("/" + path), set()).add("POST" if body else "GET")
+    for _, _, path, method, body in CALL_RE.findall(APP_JS):
+        method = method or ("POST" if body else "GET")
+        # The query string is not part of the route.
+        calls.setdefault(_canonical("/" + path.split("?", 1)[0]), set()).add(method)
     return calls
 
 
@@ -80,7 +102,7 @@ def test_existing_paths_match_make_app_routes():
     for path, methods in calls.items():
         if path in LOOKUP_PATHS:
             continue
-        if path.startswith(LEARN_PREFIX) and not learn_merged(routes):
+        if unmerged(path, routes):
             continue
         assert path in routes, path
         assert methods <= routes[path], (path, methods, routes[path])
