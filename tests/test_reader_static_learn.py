@@ -224,7 +224,7 @@ def test_409_paths():
     rate = _function("rate")
     assert 'isConflict(error, "stale") && error.body && error.body.state' in rate
     assert "showState(error.body)" in rate
-    assert 'isConflict(error, "session_gone")' in rate
+    assert "isSessionLost(error)" in rate
     gone = _function("showSessionGone")
     assert "SESSION_GONE_TEXT" in gone and '"Начать заново"' in gone
     assert _const("SESSION_GONE_TEXT") == '"Сессия прервалась."'
@@ -323,3 +323,50 @@ async def test_stub_debt_and_empty():
     async with TestClient(TestServer(make_stub_app(delay=0, empty=True))) as client:
         status, data = await _post(client, "/api/learn/start", {"deck_id": None, "side": "ru"})
         assert data == {"state": "empty", "text": data["text"]}
+
+
+# --- review fixes -------------------------------------------------------------
+
+
+def test_tts_without_openai_and_session_gone_texts():
+    body = _function("errorText")
+    no_openai = body.index('error.reason === "no_openai"')
+    assert no_openai < body.index("error.status === 503) {")
+    assert '"Озвучка сейчас недоступна."' in body
+    assert 'isConflict(error, "session_gone")) return SESSION_GONE_TEXT' in body
+    # 🔊 on a card: session_gone ends the session like a rating does.
+    tts = _function("showCard").split('request("api/learn/tts"', 1)[1]
+    assert 'isConflict(error, "session_gone")' in tts and "showSessionGone()" in tts
+
+
+def test_404_ends_the_session_and_reloads_decks():
+    lost = _function("isSessionLost")
+    assert 'isConflict(error, "session_gone")' in lost and "error.status === 404" in lost
+    for name in ("rate", "undoLast", "showDebt"):
+        assert "isSessionLost(error)" in _function(name), name
+    start = _function("startSession")
+    assert "error.status === 404) showLearn()" in start
+
+
+def test_long_faces_scroll_in_full_and_hidden_face_takes_no_taps():
+    face = STYLE_CSS.split("\n.face {", 1)[1].split("}", 1)[0]
+    face = re.sub(r"/\*.*?\*/", "", face, flags=re.DOTALL)
+    assert "justify-content" not in face
+    assert "overflow-y: auto" in face
+    assert ".face > :first-child { margin-top: auto; }" in STYLE_CSS
+    assert ".face > :last-child { margin-bottom: auto; }" in STYLE_CSS
+    assert re.search(
+        r"\.flashcard-inner:not\(\.flipped\) \.face\.back,\s*"
+        r"\.flashcard-inner\.flipped \.face\.front \{ pointer-events: none; \}",
+        STYLE_CSS,
+    )
+
+
+def test_vertical_swipes_off_only_on_the_card():
+    swipes = _function("verticalSwipes")
+    assert '"enableVerticalSwipes"' in swipes and '"disableVerticalSwipes"' in swipes
+    assert 'typeof tg[method] === "function"' in swipes
+    # Every screen change turns them back on; the card turns them off.
+    assert "verticalSwipes(true)" in _function("navigate")
+    card = _function("showCard")
+    assert card.index("navigate(showSides)") < card.index("verticalSwipes(false)")

@@ -122,7 +122,19 @@ function navigate(back) {
   closePopup();
   navigation += 1;
   setPageBack(back);
+  // Only the card screen keeps Telegram's swipe-down-to-close off.
+  verticalSwipes(true);
   return navigation;
+}
+
+// On a card a vertical or diagonal drag must not collapse the Mini App.
+function verticalSwipes(enabled) {
+  const method = enabled ? "enableVerticalSwipes" : "disableVerticalSwipes";
+  try {
+    if (tg && typeof tg[method] === "function") tg[method]();
+  } catch (_) {
+    // Older clients have no such method.
+  }
 }
 
 // "📖 Книги | 📚 Учить" on top of the two root screens.
@@ -266,6 +278,11 @@ function wordAddress(chapterId, span) {
 
 function errorText(error) {
   if (error instanceof ApiError && error.status === 401) return OPEN_FROM_BOT;
+  if (isConflict(error, "session_gone")) return SESSION_GONE_TEXT;
+  // TTS without an OpenAI key: no sound, everything else works.
+  if (error instanceof ApiError && error.status === 503 && error.reason === "no_openai") {
+    return "Озвучка сейчас недоступна.";
+  }
   if (error instanceof ApiError && error.status === 503) {
     return error.reason === "daily"
       ? "Слишком много запросов, попробуй завтра."
@@ -546,6 +563,12 @@ function isConflict(error, reason) {
   return error instanceof ApiError && error.status === 409 && error.reason === reason;
 }
 
+// The session cannot go on: replaced or lost on the server (409
+// session_gone), or its card is gone (404: deleted after a lost answer).
+function isSessionLost(error) {
+  return isConflict(error, "session_gone") || (error instanceof ApiError && error.status === 404);
+}
+
 function showLearnError(error) {
   if (isConflict(error, "session_gone")) {
     showSessionGone();
@@ -613,7 +636,10 @@ async function startSession(side) {
   try {
     data = await api("api/learn/start", { body: { deck_id: learn.deckId, side } });
   } catch (error) {
-    if (view === navigation) showLearnError(error);
+    if (view !== navigation) return;
+    // The deck was deleted after the list loaded: load the decks again.
+    if (error instanceof ApiError && error.status === 404) showLearn();
+    else showLearnError(error);
     return;
   }
   if (view === navigation) showState(data);
@@ -658,7 +684,7 @@ function showDebt(data) {
       })
       .catch((error) => {
         if (view !== navigation) return;
-        if (isConflict(error, "session_gone")) {
+        if (isSessionLost(error)) {
           showSessionGone();
           return;
         }
@@ -752,7 +778,12 @@ function showCard(data) {
     const speak = el("button", { class: "speak", type: "button", "aria-label": "Произнести пример" }, "🔊");
     speak.addEventListener("click", () =>
       playSound(speak, speakError, (signal) =>
-        request("api/learn/tts", { body: { session: learn.session, card_id: card.id }, signal })));
+        request("api/learn/tts", { body: { session: learn.session, card_id: card.id }, signal })
+          .catch((error) => {
+            // The sound's 409 session_gone ends the session like a rating's.
+            if (isConflict(error, "session_gone") && view === navigation) showSessionGone();
+            throw error;
+          })));
     back.append(speak, speakError);
   }
   ui.inner = el("div", { class: "flashcard-inner" }, front, back);
@@ -788,6 +819,7 @@ function showCard(data) {
   nodes.push(ui.zone, ui.hint, ui.rateArea, ui.error);
   show(...nodes);
   attachSwipe(ui);
+  verticalSwipes(false);
   cardView = ui;
 }
 
@@ -910,7 +942,7 @@ function rate(ui, rating, direction) {
         showState(error.body);
         return;
       }
-      if (isConflict(error, "session_gone")) {
+      if (isSessionLost(error)) {
         showSessionGone();
         return;
       }
@@ -933,7 +965,7 @@ function undoLast(button, errorNode, ui) {
     })
     .catch((error) => {
       if (view !== navigation) return;
-      if (isConflict(error, "session_gone")) {
+      if (isSessionLost(error)) {
         showSessionGone();
         return;
       }
