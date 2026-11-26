@@ -15,7 +15,6 @@ import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-from enum import StrEnum
 
 from aiogram import F, Router
 from aiogram.filters import Command
@@ -29,17 +28,23 @@ from aiogram.types import (
     Message,
 )
 from openai import APIError, APIStatusError
-from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from kielikaveri.config import Settings
 from kielikaveri.db.decks import list_decks
-from kielikaveri.db.models import Card, CardType, Deck, Note, Review
-from kielikaveri.grammar import FORM_TASKS
-from kielikaveri.srs.curriculum import introduce_due_forms
-from kielikaveri.srs.graduation import ensure_card_types, sync_user_card_types
-from kielikaveri.srs.queue import build_session_queue, defer_overdue_tail, overdue_count
-from kielikaveri.srs.scheduler import RATING_LABELS, Rating, apply_review
+from kielikaveri.db.models import Card, CardType, Deck, Note
+from kielikaveri.learn_core import (
+    LearnSide,
+    build_queue,
+    card_view,
+    drop_deleted_head,
+    prepare_session,
+    record_review,
+    session_end_text,
+)
+from kielikaveri.srs.graduation import sync_user_card_types
+from kielikaveri.srs.queue import defer_overdue_tail
+from kielikaveri.srs.scheduler import RATING_LABELS, Rating
 from kielikaveri.tts import make_tts_client, synthesize_speech
 
 logger = logging.getLogger(__name__)
@@ -50,34 +55,6 @@ DECK_ALL_TOKEN = "all"
 DELETED_CARD_TEXT = "Это слово удалено."
 SIDE_PROMPT = "Что показывать на карточке?"
 STARTING_TEXT = "Повторение уже запускается - секунду."
-
-
-class LearnSide(StrEnum):
-    """Which side of the cards a session shows.
-
-    A side is a filter, not a flip: recognition and production are separate
-    cards with FSRS schedules of their own, so showing a recognition card
-    Russian-first would record a production answer into recognition's
-    history. Inflection cards ask a form of a Finnish lemma, so they go with
-    Finnish.
-    """
-
-    fi = "fi"
-    ru = "ru"
-    mix = "mix"
-
-    @property
-    def card_types(self) -> tuple[CardType, ...] | None:
-        """The card types this side shows; None - every type, unfiltered."""
-        if self is LearnSide.fi:
-            return (CardType.recognition, CardType.inflection)
-        if self is LearnSide.ru:
-            return (CardType.production,)
-        return None
-
-    @property
-    def shows_forms(self) -> bool:
-        return self.card_types is None or CardType.inflection in self.card_types
 
 
 class LearnStates(StatesGroup):
@@ -94,22 +71,17 @@ class LearnStates(StatesGroup):
 
 
 def render_card(card: Card, note: Note) -> tuple[str, str]:
-    """Return (front, back) text for one card, by its type."""
-    if card.type == CardType.recognition:
-        return f"🇫🇮 {note.lemma}", f"{note.translation_ru}\n\n{note.example_fi}\n{note.example_ru}"
-    if card.type == CardType.production:
-        return f"🇷🇺 {note.translation_ru}", f"{note.lemma}\n\n{note.example_fi}"
-    if card.type == CardType.inflection:
-        forms: dict = note.meta.get("principal_forms") or {}
-        # The card names its own form (one card per form), so the question
-        # is stable across reviews and its FSRS interval means something.
-        # A form with no FORM_TASKS entry is never asked - the front must
-        # not carry a bare key like "nut_partisiippi".
-        task = FORM_TASKS.get(card.form)
-        if task is not None and card.form in forms:
-            return f"{note.lemma} → {task.cue}", f"{forms[card.form]}\n\n✅ {task.label}"
-        return note.lemma, note.lemma
-    return note.lemma, note.translation_ru
+    """Return (front, back) text for one card, by its type (learn_core.card_view)."""
+    view = card_view(card, note)
+    if view.type == CardType.recognition:
+        return f"🇫🇮 {view.lemma}", f"{view.translation_ru}\n\n{view.example_fi}\n{view.example_ru}"
+    if view.type == CardType.production:
+        return f"🇷🇺 {view.translation_ru}", f"{view.lemma}\n\n{view.example_fi}"
+    if view.type == CardType.inflection:
+        if view.cue is not None:
+            return f"{view.lemma} → {view.cue}", f"{view.form_answer}\n\n✅ {view.form_label}"
+        return view.lemma, view.lemma
+    return view.lemma, view.translation_ru
 
 
 def _reveal_keyboard(card_id: str) -> InlineKeyboardMarkup:
@@ -184,27 +156,14 @@ async def _start_session(
     token: str,
 ) -> None:
     async with session_factory() as session:
-        queue = await build_session_queue(
-            session,
-            user_id,
-            now,
-            session_max_cards=settings.session_max_cards,
-            daily_new_limit=settings.daily_new_limit,
-            boundary_hour=settings.day_boundary_hour,
-            deck_id=deck_id,
-            card_types=side.card_types,
-        )
-        no_production = (
-            side is LearnSide.ru
-            and not queue
-            and not await _has_production(session, user_id, deck_id)
-        )
+        built = await build_queue(session, settings, user_id, now, deck_id, side)
+    queue = built.queue
 
     if not queue:
         if not await _leave_starting(state, token, None):
             return
         logger.info("event=learn.session_empty deck_id=%s side=%s", deck_id, side)
-        await answer_to.answer(_empty_session_text(side, no_production))
+        await answer_to.answer(built.empty_text)
         return
 
     session_data = {
@@ -220,33 +179,8 @@ async def _start_session(
     await _show_next_card(answer_to, state, session_factory)
 
 
-async def _has_production(session: AsyncSession, user_id: int, deck_id: str | None) -> bool:
-    stmt = select(Card.id).where(Card.user_id == user_id, Card.type == CardType.production)
-    if deck_id is not None:
-        stmt = stmt.join(Note, Card.note_id == Note.id).where(Note.deck_id == deck_id)
-    return await session.scalar(stmt.limit(1)) is not None
-
-
-def _empty_session_text(side: LearnSide, no_production: bool) -> str:
-    if side is LearnSide.mix:
-        return "Нечего повторять - все карточки выучены на сегодня."
-    # Only this side is done - the other may still have cards waiting.
-    text = "На этой стороне сейчас нечего повторять."
-    if no_production:
-        # Production cards open only once the Finnish side is known well
-        # (graduation.py) - until the first one does, Russian is empty.
-        text += "\nРусская сторона открывается для слова, когда его финская уже хорошо запомнилась."
-    return text
-
-
-async def _drop_deleted_head(session: AsyncSession, queue: list[str]) -> list[str]:
-    """The queue without deleted cards at its head. A word deleted
-    mid-session (/delete, 🗑 in a deck) leaves its card ids in the FSM queue -
-    delete_confirm has no state filter and knows nothing about /learn."""
-    while queue and await session.get(Card, queue[0]) is None:
-        logger.info("event=learn.skip_deleted card_id=%s", queue[0])
-        queue = queue[1:]
-    return queue
+# The bot's name for it, from before learn_core.
+_drop_deleted_head = drop_deleted_head
 
 
 async def _skip_deleted_card(
@@ -289,15 +223,10 @@ async def _show_next_card(
             remaining,
         )
         await state.clear()
-        text = f"Сессия окончена: {reviewed_count} карточек пройдено"
-        if remaining:
-            text += f", осталось {remaining} - /learn чтобы продолжить."
-        elif data.get("side", LearnSide.mix) == LearnSide.mix:
-            text += " - всё на сегодня!"
-        else:
-            # Only this side is done - see _empty_session_text.
-            text += " - на этой стороне всё на сегодня!"
-        await answer_to.answer(text)
+        side = data.get("side", LearnSide.mix)
+        await answer_to.answer(
+            session_end_text(reviewed_count, remaining, side, " - /learn чтобы продолжить.")
+        )
         return
 
     card_id = queue[0]
@@ -396,28 +325,9 @@ async def _proceed_past_side_choice(
     token: str,
 ) -> None:
     async with session_factory() as session:
-        await sync_user_card_types(session, user_id, now)
-        # Cards first, then the curriculum decides which of the new forms
-        # the learner actually meets today - see srs/curriculum.py. Not for
-        # a session that shows no forms: opening them there would spend the
-        # day's form budget on cards nobody sees.
-        if side.shows_forms:
-            await introduce_due_forms(
-                session,
-                user_id,
-                now,
-                daily_new_forms=settings.daily_new_forms,
-                boundary_hour=settings.day_boundary_hour,
-                deck_id=deck_id,
-            )
-        await session.commit()
-        overdue = await overdue_count(
-            session,
-            user_id,
-            now,
-            deck_id=deck_id,
-            reviewed_only=True,
-            card_types=side.card_types,
+        # This module's sync_user_card_types, looked up now: tests hold it here.
+        overdue = await prepare_session(
+            session, settings, user_id, now, deck_id, side, sync=sync_user_card_types
         )
 
     if overdue > settings.debt_threshold:
@@ -643,25 +553,10 @@ async def learn_rate(
             await callback.answer(DELETED_CARD_TEXT)
             await _show_next_card(callback.message, state, session_factory)
             return
-        # When this card was last answered - FSRS schedules off the gap since
-        # then. Read *before* the new row below is added to the session:
-        # adding it first would let autoflush include this very answer in the
-        # max(), making last_review == now, and a zero gap reads as a perfect
-        # recall. None here means "never answered", which is what FSRS wants
-        # for a card's first review.
-        last_review = await session.scalar(
-            select(func.max(Review.reviewed_at)).where(Review.card_id == card.id)
-        )
-        # Moves every SRS column on the card; the `reviews` row below is ours.
-        apply_review(card, rating, now, last_review)
-
-        session.add(
-            Review(card_id=card.id, user_id=card.user_id, rating=rating.value, reviewed_at=now)
-        )
-
-        note = await session.get(Note, card.note_id)
-        await ensure_card_types(session, note, now)
-        await session.commit()
+        # last_review -> apply_review -> the `reviews` row -> new card
+        # types -> commit; see learn_core.record_review for why max(reviewed_at)
+        # is read before the row is added.
+        await record_review(session, card, rating, now)
 
     logger.info("event=db.save entity=review card_id=%s rating=%d", card_id, rating.value)
     await callback.answer(f"Записано: {RATING_LABELS[rating]}")

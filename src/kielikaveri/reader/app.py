@@ -16,6 +16,9 @@ before the lookup's answer comes; no OpenAI) and POST /api/cards (➕,
 reader/cards.py); /api/lookup says whether the word is already in the
 chapter's deck (in_deck). Opening a chapter and /api/lemma warm the OpenAI
 connection up in the background (reader/warmup.py).
+
+П5 adds 📚 learning under /api/learn/ (reader/learn.py): decks, start,
+debt, review, undo and tts - the session's queue on the server.
 """
 
 from __future__ import annotations
@@ -38,9 +41,11 @@ from kielikaveri.cards_save import SaveStatus
 from kielikaveri.config import Settings
 from kielikaveri.db.books import chapter_by_number, mark_opened
 from kielikaveri.db.models import Book, BookChapter, ChapterStatus
+from kielikaveri.learn_core import LearnSide
 from kielikaveri.llm.breaker import BudgetExceededError, CallBreaker, CircuitOpenError
 from kielikaveri.llm.client import make_client
 from kielikaveri.logging_context import new_trace_id, trace_id_var
+from kielikaveri.reader import learn
 from kielikaveri.reader.auth import AuthError, user_id_from_header
 from kielikaveri.reader.cards import add_card, in_chapter_deck
 from kielikaveri.reader.lookup import (
@@ -53,8 +58,9 @@ from kielikaveri.reader.lookup import (
     lookup,
     resolve_target,
 )
-from kielikaveri.reader.speech import EmptySpeechError, speak
+from kielikaveri.reader.speech import EmptySpeechError, speak, speak_text
 from kielikaveri.reader.warmup import Warmup
+from kielikaveri.srs.scheduler import Rating
 from kielikaveri.translate.fst_check import split_words
 from kielikaveri.translate.worker import Translator
 from kielikaveri.tts import make_tts_client
@@ -81,6 +87,10 @@ TTS_CLIENT = web.AppKey("tts_client", AsyncOpenAI)
 LOOKUP_LOCKS = web.AppKey("lookup_locks", KeyedLocks)
 TTS_LOCKS = web.AppKey("tts_locks", KeyedLocks)
 CARD_LOCKS = web.AppKey("card_locks", KeyedLocks)
+# 📚 learning (reader/learn.py): one session per user, and the user's lock
+# every learn call takes.
+LEARN_SESSIONS = web.AppKey("learn_sessions", dict)
+LEARN_LOCKS = web.AppKey("learn_locks", KeyedLocks)
 # The time of the reader's OpenAI calls and the connection's warm-up.
 WARMUP = web.AppKey("warmup", Warmup)
 USER_ID = web.RequestKey("user_id", int)
@@ -105,8 +115,10 @@ CSP_DIRECTIVES = (
 CONTENT_SECURITY_POLICY = "; ".join(CSP_DIRECTIVES)
 # Replaces aiohttp's "Python/3.x aiohttp/3.x": no versions to look up CVEs by.
 SERVER_HEADER = "kirjakaveri"
-# The lookup and TTS bodies are three short fields; the rest of /api is GET.
+# The lookup, TTS and learn bodies are a few short fields; the rest of /api is GET.
 CLIENT_MAX_SIZE = 16 * 1024
+# The OpenAI clients' key when OPENAI_API_KEY is empty (see make_app).
+NO_API_KEY = "unset"
 # A reader tap is a person waiting: one SDK retry, not ingest's three.
 LOOKUP_MAX_RETRIES = 1
 
@@ -275,7 +287,18 @@ async def get_chapter(request: web.Request) -> web.Response:
     return web.json_response(body)
 
 
+def _no_openai(app: web.Application) -> web.Response | None:
+    """503 {"reason": "no_openai"} when OPENAI_API_KEY is empty: the
+    clients hold a stand-in key (make_app), a call would only fail as a 401
+    and spend the reader's breaker."""
+    if app[SETTINGS].openai_api_key:
+        return None
+    return web.json_response({"reason": "no_openai"}, status=503)
+
+
 def _warm_up(app: web.Application) -> None:
+    if not app[SETTINGS].openai_api_key:
+        return
     app[WARMUP].maybe_start(app[LOOKUP_CLIENT], app[SETTINGS].openai_text_model)
 
 
@@ -312,34 +335,28 @@ async def _word_in_chapter(request: web.Request) -> tuple[Target, BookChapter, B
     return target, chapter, book
 
 
-def _call_failed(event: str, target: Target, exc: Exception) -> web.Response:
+def _target_ids(target: Target) -> str:
+    return f"chapter_id={target.chapter_id} paragraph={target.paragraph} token={target.token}"
+
+
+def _call_failed(event: str, target: Target | str, exc: Exception) -> web.Response:
     """503 with the breaker's reason, 502 for OpenAI. Only the class is
-    logged: an API error's message can quote the request."""
+    logged: an API error's message can quote the request. `target` - the
+    word, or the log's ids ("key=value ...") of whatever else was asked."""
+    ids = target if isinstance(target, str) else _target_ids(target)
     if isinstance(exc, CircuitOpenError):
         reason = "daily" if isinstance(exc, BudgetExceededError) else "rate"
-        logger.warning(
-            "event=%s chapter_id=%s paragraph=%d token=%d reason=%s",
-            event,
-            target.chapter_id,
-            target.paragraph,
-            target.token,
-            reason,
-        )
+        logger.warning("event=%s %s reason=%s", event, ids, reason)
         return web.json_response({"reason": reason}, status=503)
-    logger.warning(
-        "event=%s chapter_id=%s paragraph=%d token=%d error=%s",
-        event,
-        target.chapter_id,
-        target.paragraph,
-        target.token,
-        type(exc).__name__,
-    )
+    logger.warning("event=%s %s error=%s", event, ids, type(exc).__name__)
     return web.json_response({"reason": "openai"}, status=502)
 
 
 async def lookup_word(request: web.Request) -> web.Response:
     target = await _word_target(request)
     app = request.app
+    if (refused := _no_openai(app)) is not None:
+        return refused
     try:
         body = await lookup(
             app[SESSION_FACTORY],
@@ -391,6 +408,8 @@ async def save_word(request: web.Request) -> web.Response:
     {"reason": "save_failed"} when the card can't be built."""
     target, chapter, book = await _word_in_chapter(request)
     app = request.app
+    if (refused := _no_openai(app)) is not None:
+        return refused
     try:
         result = await add_card(
             app[SESSION_FACTORY],
@@ -428,6 +447,8 @@ async def save_word(request: web.Request) -> web.Response:
 async def speak_word(request: web.Request) -> web.Response:
     target = await _word_target(request)
     app = request.app
+    if (refused := _no_openai(app)) is not None:
+        return refused
     settings = app[SETTINGS]
     try:
         audio = await speak(
@@ -441,6 +462,165 @@ async def speak_word(request: web.Request) -> web.Response:
         )
     except (CircuitOpenError, OpenAIError, EmptySpeechError) as exc:
         return _call_failed("reader.tts_failed", target, exc)
+    return web.Response(body=audio, content_type="audio/wav")
+
+
+async def _json_body(request: web.Request) -> dict:
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise web.HTTPBadRequest() from None
+    if not isinstance(body, dict):
+        raise web.HTTPBadRequest()
+    return body
+
+
+def _string(body: dict, name: str) -> str:
+    value = body.get(name)
+    if not isinstance(value, str) or not value:
+        raise web.HTTPBadRequest()
+    return value
+
+
+def _conflict(reason: str, payload: dict | None = None) -> web.Response:
+    return web.json_response({"reason": reason, **(payload or {})}, status=409)
+
+
+async def _learn_call(call: Awaitable[dict]) -> web.Response:
+    """A learn call's answer, its errors as the plan says: 404 for what isn't
+    the user's, 409 with a reason for the session's own refusals."""
+    try:
+        return web.json_response(await call)
+    except learn.NotFoundError:
+        raise web.HTTPNotFound() from None
+    except learn.SessionGoneError:
+        return _conflict("session_gone")
+    except learn.NothingToUndoError:
+        return _conflict("nothing_to_undo")
+    except learn.StaleError as exc:
+        return _conflict("stale", exc.payload)
+
+
+async def learn_decks(request: web.Request) -> web.Response:
+    return web.json_response(await learn.decks(request.app[SESSION_FACTORY], request[USER_ID]))
+
+
+async def learn_start(request: web.Request) -> web.Response:
+    body = await _json_body(request)
+    deck_id = body.get("deck_id")
+    side = body.get("side")
+    if deck_id is not None and not isinstance(deck_id, str):
+        raise web.HTTPBadRequest()
+    if not isinstance(side, str) or side not in LearnSide:
+        raise web.HTTPBadRequest()
+    app = request.app
+    return await _learn_call(
+        learn.start(
+            app[SESSION_FACTORY],
+            app[SETTINGS],
+            app[LEARN_SESSIONS],
+            app[LEARN_LOCKS],
+            request[USER_ID],
+            deck_id,
+            LearnSide(side),
+        )
+    )
+
+
+async def learn_debt(request: web.Request) -> web.Response:
+    body = await _json_body(request)
+    session_id = _string(body, "session")
+    action = body.get("action")
+    if action not in ("batch", "defer"):
+        raise web.HTTPBadRequest()
+    app = request.app
+    return await _learn_call(
+        learn.debt(
+            app[SESSION_FACTORY],
+            app[SETTINGS],
+            app[LEARN_SESSIONS],
+            app[LEARN_LOCKS],
+            request[USER_ID],
+            session_id,
+            defer=action == "defer",
+        )
+    )
+
+
+async def learn_review(request: web.Request) -> web.Response:
+    body = await _json_body(request)
+    session_id = _string(body, "session")
+    card_id = _string(body, "card_id")
+    rating = body.get("rating")
+    if not isinstance(rating, int) or isinstance(rating, bool) or not 1 <= rating <= 4:
+        raise web.HTTPBadRequest()
+    app = request.app
+    return await _learn_call(
+        learn.review(
+            app[SESSION_FACTORY],
+            app[SETTINGS],
+            app[LEARN_SESSIONS],
+            app[LEARN_LOCKS],
+            request[USER_ID],
+            session_id,
+            card_id,
+            Rating(rating),
+        )
+    )
+
+
+async def learn_undo(request: web.Request) -> web.Response:
+    body = await _json_body(request)
+    session_id = _string(body, "session")
+    app = request.app
+    return await _learn_call(
+        learn.undo(
+            app[SESSION_FACTORY],
+            app[LEARN_SESSIONS],
+            app[LEARN_LOCKS],
+            request[USER_ID],
+            session_id,
+        )
+    )
+
+
+async def learn_tts(request: web.Request) -> web.Response:
+    """🔊 of the card's example_fi: WAV, the reader's cache and breaker,
+    the errors of /api/tts; 503 {"reason": "no_openai"} without a key."""
+    body = await _json_body(request)
+    session_id = _string(body, "session")
+    card_id = _string(body, "card_id")
+    app = request.app
+    settings = app[SETTINGS]
+    try:
+        text = await learn.example_to_speak(
+            app[SESSION_FACTORY],
+            app[LEARN_SESSIONS],
+            app[LEARN_LOCKS],
+            request[USER_ID],
+            session_id,
+            card_id,
+        )
+    except learn.NotFoundError:
+        raise web.HTTPNotFound() from None
+    except learn.SessionGoneError:
+        return _conflict("session_gone")
+    if (refused := _no_openai(app)) is not None:
+        return refused
+    ids = f"card_id={card_id} source=learn"
+    try:
+        audio = await speak_text(
+            app[TTS_CLIENT],
+            app[READER_BREAKER],
+            settings.reader_tts_model,
+            settings.reader_tts_speed,
+            Path(settings.reader_tts_cache_dir),
+            app[TTS_LOCKS],
+            text,
+            ids,
+        )
+    except (CircuitOpenError, OpenAIError, EmptySpeechError) as exc:
+        return _call_failed("reader.tts_failed", ids, exc)
     return web.Response(body=audio, content_type="audio/wav")
 
 
@@ -472,13 +652,17 @@ def make_app(
         timedelta(minutes=settings.reader_breaker_window_minutes),
         daily_max_calls=settings.reader_daily_max_calls,
     )
-    app[LOOKUP_CLIENT] = make_client(
-        settings.openai_api_key, settings.openai_timeout_seconds, LOOKUP_MAX_RETRIES
-    )
-    app[TTS_CLIENT] = make_tts_client(settings.openai_api_key, settings.openai_tts_timeout_seconds)
+    # The SDK refuses to build a client without a key, and learning must
+    # still work then (П5): the clients get a stand-in nobody calls with -
+    # lookup, ➕ and both TTS answer 503 no_openai, the warm-up is skipped.
+    api_key = settings.openai_api_key or NO_API_KEY
+    app[LOOKUP_CLIENT] = make_client(api_key, settings.openai_timeout_seconds, LOOKUP_MAX_RETRIES)
+    app[TTS_CLIENT] = make_tts_client(api_key, settings.openai_tts_timeout_seconds)
     app[LOOKUP_LOCKS] = KeyedLocks()
     app[TTS_LOCKS] = KeyedLocks()
     app[CARD_LOCKS] = KeyedLocks()
+    app[LEARN_SESSIONS] = {}
+    app[LEARN_LOCKS] = KeyedLocks()
     app[WARMUP] = Warmup()
     app.on_shutdown.append(_stop_warmup)
     app.on_cleanup.append(_close_clients)
@@ -491,6 +675,12 @@ def make_app(
     app.router.add_post("/api/tts", speak_word)
     app.router.add_post("/api/lemma", lemma_word)
     app.router.add_post("/api/cards", save_word)
+    app.router.add_get("/api/learn/decks", learn_decks)
+    app.router.add_post("/api/learn/start", learn_start)
+    app.router.add_post("/api/learn/debt", learn_debt)
+    app.router.add_post("/api/learn/review", learn_review)
+    app.router.add_post("/api/learn/undo", learn_undo)
+    app.router.add_post("/api/learn/tts", learn_tts)
     static = app.router.add_static("/static/", STATIC_DIR)
     app[PUBLIC_RESOURCES] = frozenset({index_route.resource, favicon_route.resource, static})
     return app
