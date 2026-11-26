@@ -19,6 +19,13 @@ CALL_RE = re.compile(r"""\b(api|request)\(\s*(["`])(api/[^"`]*)\2\s*(,\s*\{\s*bo
 # П3's endpoints come from the server branch (reader-lookup), merged
 # separately: their routes are checked against make_app after the merge.
 LOOKUP_PATHS = {"/api/lookup", "/api/tts"}
+# П5's /api/learn/* come from the server branch (learn-api): until it is
+# merged they are not routes of make_app (test_reader_static_learn.py).
+LEARN_PREFIX = "/api/learn/"
+
+
+def learn_merged(routes: dict[str, set[str]]) -> bool:
+    return "/api/learn/start" in routes
 
 
 def _canonical(path: str) -> str:
@@ -73,6 +80,8 @@ def test_existing_paths_match_make_app_routes():
     for path, methods in calls.items():
         if path in LOOKUP_PATHS:
             continue
+        if path.startswith(LEARN_PREFIX) and not learn_merged(routes):
+            continue
         assert path in routes, path
         assert methods <= routes[path], (path, methods, routes[path])
     assert "/api/books" in calls
@@ -88,12 +97,13 @@ def test_lookup_and_tts_are_posts():
 def test_audio_is_unlocked_inside_the_tap():
     # An Audio element played after an awaited fetch stayed silent in
     # Telegram: the AudioContext must be resumed in the click handler itself,
-    # i.e. in a synchronous playWord, before the first await.
+    # i.e. in a synchronous playSound (the popup's and the flashcard's 🔊),
+    # before the first await.
     assert "AudioContext" in APP_JS
     assert "decodeAudioData" in APP_JS
     assert "AbortController" in APP_JS
     assert "new Audio(" not in APP_JS
-    assert "async function playWord" not in APP_JS
-    body = APP_JS.split("function playWord", 1)[1].split("\n}\n", 1)[0]
+    assert "async function playSound" not in APP_JS
+    body = APP_JS.split("function playSound", 1)[1].split("\n}\n", 1)[0]
     assert "unlockAudio()" in body
     assert "await" not in body
