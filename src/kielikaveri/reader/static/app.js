@@ -1,7 +1,8 @@
-// The reader Mini App (plan 2026-11-20-kirjakaveri-reader, "П2", "П3", "П4"):
-// the list of books and chapters, one chapter as paragraphs of word spans, and
-// a bottom popup with the tapped word's lookup, 🔊 and ➕.
-// No build step. Book text is only ever set through textContent.
+// The reader Mini App (plan 2026-11-20-kirjakaveri-reader, "П2"-"П5"):
+// the list of books and chapters, one chapter as paragraphs of word spans, a
+// bottom popup with the tapped word's lookup, 🔊 and ➕, and the learning
+// screens (flashcards rated by swipes).
+// No build step. Book and card text is only ever set through textContent.
 "use strict";
 
 const tg = window.Telegram && window.Telegram.WebApp;
@@ -18,12 +19,15 @@ const OPEN_FROM_BOT = "Открой читалку кнопкой «📖 Чит�
 const TRY_AGAIN = "Не получилось, попробуй ещё раз.";
 
 class ApiError extends Error {
-  constructor(status, reason) {
+  constructor(status, body) {
     super(`HTTP ${status}`);
     this.status = status;
     // The JSON body's reason, if any: a 503 from the reader's breaker says
-    // "rate" or "daily", a 422 from /api/cards may say "save_failed".
-    this.reason = reason || null;
+    // "rate" or "daily", a 422 from /api/cards may say "save_failed", a 409
+    // from /api/learn "stale", "session_gone" or "nothing_to_undo".
+    this.reason = (body && body.reason) || null;
+    // The whole JSON body: a 409 "stale" carries the session's current state.
+    this.body = body || null;
   }
 }
 
@@ -41,15 +45,13 @@ async function request(path, { body, signal } = {}) {
   }
   const response = await fetch(path, options);
   if (!response.ok) {
-    let reason = null;
-    if (response.status === 503 || response.status === 422) {
-      try {
-        reason = (await response.json()).reason;
-      } catch (_) {
-        // No JSON body: a 503 is shown as "rate", a 422 as TRY_AGAIN.
-      }
+    let body = null;
+    try {
+      body = await response.json();
+    } catch (_) {
+      // No JSON body (aiohttp's own 401/404 pages): only the status counts.
     }
-    throw new ApiError(response.status, reason);
+    throw new ApiError(response.status, body && typeof body === "object" ? body : null);
   }
   return response;
 }
@@ -70,7 +72,12 @@ function el(tag, attrs = {}, ...children) {
   return node;
 }
 
+// The flashcard on screen (П5), or null: show() drops it, so keys and late
+// answers can tell a card that is gone.
+let cardView = null;
+
 function show(...nodes) {
+  cardView = null;
   app.replaceChildren(...nodes);
   window.scrollTo(0, 0);
 }
@@ -107,26 +114,56 @@ function setPageBack(handler) {
   setBack(handler);
 }
 
+// Bumped by every move to another screen. A request remembers the value it
+// started under and drops its answer if the user has moved on since.
+let navigation = 0;
+
+function navigate(back) {
+  closePopup();
+  navigation += 1;
+  setPageBack(back);
+  return navigation;
+}
+
+// "📖 Книги | 📚 Учить" on top of the two root screens.
+function switcher(active) {
+  const tab = (name, label, go) =>
+    el(
+      "button",
+      {
+        type: "button",
+        class: name === active ? "tab active" : "tab",
+        "aria-pressed": String(name === active),
+        onclick: () => {
+          if (name !== active) go();
+        },
+      },
+      label,
+    );
+  return el("nav", { class: "switch" }, tab("books", "📖 Книги", showBooks), tab("learn", "📚 Учить", showLearn));
+}
+
 // --- list of books ------------------------------------------------------------
 
 async function showBooks() {
-  closePopup();
-  setPageBack(null);
+  const view = navigate(null);
   let data;
   try {
     data = await api("api/books");
   } catch (error) {
-    showError(error);
+    if (view === navigation) showError(error);
     return;
   }
+  if (view !== navigation) return;
   if (data.books.length === 0) {
     show(
+      switcher("books"),
       el("h1", {}, "Книг пока нет"),
       el("p", { class: "muted" }, "Пришли книгу боту файлом .txt - переведу её на финский."),
     );
     return;
   }
-  const nodes = [];
+  const nodes = [switcher("books")];
   for (const book of data.books) {
     nodes.push(el("h2", {}, book.title));
     const list = el("ul", { class: "chapters" });
@@ -188,15 +225,15 @@ function textBlock(chapter) {
 }
 
 async function showChapter(chapterId) {
-  closePopup();
-  setPageBack(showBooks);
+  const view = navigate(showBooks);
   let chapter;
   try {
     chapter = await api(`api/chapters/${encodeURIComponent(chapterId)}`);
   } catch (error) {
-    showError(error);
+    if (view === navigation) showError(error);
     return;
   }
+  if (view !== navigation) return;
   show(
     el("p", { class: "muted small" }, chapter.book.title),
     el("h1", {}, `Глава ${chapter.number}`),
@@ -311,7 +348,8 @@ function renderLookup(data, address) {
   }
   const speak = el("button", { class: "speak", type: "button", "aria-label": "Произнести" }, "🔊");
   const speakError = el("p", { class: "muted small" });
-  speak.addEventListener("click", () => playWord(address, speak, speakError));
+  speak.addEventListener("click", () =>
+    playSound(speak, speakError, (signal) => request("api/tts", { body: address, signal })));
   const add = el("button", { class: "add", type: "button", "aria-label": "В колоду" }, "➕");
   const addError = el("p", { class: "muted small" });
   if (data.in_deck) markAdded(add, "duplicate");
@@ -379,7 +417,9 @@ function soundErrorText(error) {
   return error && error.name ? `Не получилось воспроизвести (${error.name}).` : TRY_AGAIN;
 }
 
-function playWord(address, button, errorNode) {
+// fetchSound(signal) makes the request: the word's /api/tts in the popup,
+// the card example's /api/learn/tts on a flashcard.
+function playSound(button, errorNode, fetchSound) {
   if (button.disabled) return;
   const context = unlockAudio();
   if (!context) {
@@ -391,13 +431,13 @@ function playWord(address, button, errorNode) {
   stopSound();
   const controller = new AbortController();
   audioController = controller;
-  fetchAndPlay(context, address, controller, button, errorNode);
+  fetchAndPlay(context, fetchSound, controller, button, errorNode);
 }
 
-async function fetchAndPlay(context, address, controller, button, errorNode) {
+async function fetchAndPlay(context, fetchSound, controller, button, errorNode) {
   let data;
   try {
-    const response = await request("api/tts", { body: address, signal: controller.signal });
+    const response = await fetchSound(controller.signal);
     data = await response.arrayBuffer();
   } catch (error) {
     if (error.name !== "AbortError") errorNode.textContent = errorText(error);
@@ -473,9 +513,461 @@ document.addEventListener("click", (event) => {
   closePopup();
 });
 
+// --- learning (П5) ------------------------------------------------------------
+// Screens: deck (only with more than one deck) -> side -> debt (if the
+// server asks) -> card -> end. The session's queue lives on the server; the
+// page holds one card at a time.
+
+const SIDES = [
+  ["fi", "🇫🇮 Финский"],
+  ["ru", "🇷🇺 Русский"],
+  ["mix", "🔀 Вперемешку"],
+];
+// FSRS ratings: a swipe left is Again ("Забыл", not Hard: Hard still counts
+// as remembered), a swipe right is Good. Hard and Easy are small buttons.
+const RATING = { again: 1, hard: 2, good: 3, easy: 4 };
+// A swipe rates once the card has moved 30% of its width, or on a flick.
+const SWIPE_THRESHOLD = 0.3;
+const FLICK_MIN_PX = 40;
+const FLICK_PX_PER_MS = 0.6;
+// Below this a pointer that went down and up is a tap (a flip), not a drag.
+const DRAG_SLOP_PX = 8;
+const MAX_ROTATE_DEG = 8;
+const SESSION_GONE_TEXT = "Сессия прервалась.";
+
+// deckId: null means all decks. session: the server's id of the session.
+const learn = { decks: [], deckId: null, side: null, session: null };
+
+function loading() {
+  return el("p", { class: "muted" }, "загружаю…");
+}
+
+function isConflict(error, reason) {
+  return error instanceof ApiError && error.status === 409 && error.reason === reason;
+}
+
+function showLearnError(error) {
+  if (isConflict(error, "session_gone")) {
+    showSessionGone();
+    return;
+  }
+  navigate(learn.side ? showSides : null);
+  show(el("p", { class: "muted" }, errorText(error)));
+}
+
+async function showLearn() {
+  const view = navigate(null);
+  show(switcher("learn"), loading());
+  let data;
+  try {
+    data = await api("api/learn/decks");
+  } catch (error) {
+    if (view === navigation) showLearnError(error);
+    return;
+  }
+  if (view !== navigation) return;
+  learn.decks = data.decks || [];
+  if (learn.decks.length > 1) {
+    showDecks();
+  } else {
+    // Like the bot: one deck (or none) needs no choice.
+    learn.deckId = learn.decks.length === 1 ? learn.decks[0].id : null;
+    showSides();
+  }
+}
+
+function showDecks() {
+  navigate(null);
+  const list = el("ul", { class: "chapters" });
+  const item = (label, deckId) =>
+    el("li", { class: "ready", onclick: () => pickDeck(deckId) }, el("span", {}, label));
+  for (const deck of learn.decks) list.append(item(deck.name, deck.id));
+  list.append(item("Все", null));
+  show(switcher("learn"), el("h1", {}, "Какую колоду?"), list);
+}
+
+function pickDeck(deckId) {
+  learn.deckId = deckId;
+  showSides();
+}
+
+function showSides() {
+  // The deck picker is one step back only when there was a choice.
+  navigate(learn.decks.length > 1 ? showDecks : null);
+  const buttons = SIDES.map(([side, label]) =>
+    el("button", { type: "button", onclick: () => startSession(side) }, label));
+  show(
+    switcher("learn"),
+    el("h1", {}, "Какой стороной?"),
+    el("p", { class: "muted small" }, "🇫🇮 - финское слово, вспомни перевод. 🇷🇺 - наоборот."),
+    el("div", { class: "choices" }, ...buttons),
+  );
+}
+
+async function startSession(side) {
+  learn.side = side;
+  learn.session = null;
+  const view = navigate(showSides);
+  show(loading());
+  let data;
+  try {
+    data = await api("api/learn/start", { body: { deck_id: learn.deckId, side } });
+  } catch (error) {
+    if (view === navigation) showLearnError(error);
+    return;
+  }
+  if (view === navigation) showState(data);
+}
+
+// Every learning answer is one of these states.
+function showState(data) {
+  if (data.session) learn.session = data.session;
+  if (data.state === "card") showCard(data);
+  else if (data.state === "debt") showDebt(data);
+  else if (data.state === "end") showEnd(data);
+  else showMessage(data.text || "Сейчас нечего повторять.");
+}
+
+function showMessage(text) {
+  navigate(showSides);
+  show(
+    el("p", { class: "message" }, text),
+    el("button", { type: "button", class: "secondary", onclick: showSides }, "Назад"),
+  );
+}
+
+function showSessionGone() {
+  navigate(showSides);
+  show(
+    el("p", { class: "message" }, SESSION_GONE_TEXT),
+    el("button", { type: "button", onclick: () => startSession(learn.side) }, "Начать заново"),
+  );
+}
+
+function showDebt(data) {
+  const view = navigate(showSides);
+  const errorNode = el("p", { class: "muted small" });
+  const buttons = [];
+  const choose = (action) => {
+    if (buttons.some((button) => button.disabled)) return;
+    for (const button of buttons) button.disabled = true;
+    errorNode.textContent = "";
+    api("api/learn/debt", { body: { session: learn.session, action } })
+      .then((answer) => {
+        if (view === navigation) showState(answer);
+      })
+      .catch((error) => {
+        if (view !== navigation) return;
+        if (isConflict(error, "session_gone")) {
+          showSessionGone();
+          return;
+        }
+        for (const button of buttons) button.disabled = false;
+        errorNode.textContent = errorText(error);
+      });
+  };
+  buttons.push(
+    el("button", { type: "button", onclick: () => choose("batch") }, "Заниматься как обычно"),
+    el("button", { type: "button", class: "secondary", onclick: () => choose("defer") },
+      "Отложить остальное"),
+  );
+  show(
+    el("p", { class: "message" },
+      `Просрочено ${data.overdue} карточек - это много за одну сессию.\n` +
+        `Разгребать как обычно (по ${data.max_cards} за раз) ` +
+        `или отложить остальное на ${data.postpone_days} дн.?`),
+    el("div", { class: "choices" }, ...buttons),
+    errorNode,
+  );
+}
+
+function showEnd(data) {
+  navigate(showSides);
+  const errorNode = el("p", { class: "muted small" });
+  const nodes = [
+    el("p", { class: "message" }, data.text || `Сессия окончена: ${data.reviewed} пройдено.`),
+  ];
+  if (data.can_undo) {
+    const undo = el("button", { type: "button", class: "undo" }, "↩ Отменить");
+    undo.addEventListener("click", () => undoLast(undo, errorNode, null));
+    nodes.push(undo);
+  }
+  nodes.push(
+    errorNode,
+    el("div", { class: "choices" },
+      el("button", { type: "button", onclick: showSides }, "Ещё сессия"),
+      el("button", { type: "button", class: "secondary", onclick: showBooks }, "📖 Книги")),
+  );
+  show(...nodes);
+}
+
+// The two faces of a card, by its type (plan, "Карточка в ответе"). front:
+// the prompt; answer: the main line of the back; label: the form's name.
+function cardText(card) {
+  if (card.type === "production") {
+    return { flag: "🇷🇺", front: card.translation_ru, frontLang: "ru", answer: card.lemma, answerLang: "fi" };
+  }
+  if (card.type === "inflection") {
+    // A form with no task: the lemma on both sides, as in the bot.
+    if (!card.cue || !card.form_answer) {
+      return { flag: "🇫🇮", front: card.lemma, frontLang: "fi", answer: card.lemma, answerLang: "fi" };
+    }
+    return {
+      flag: "🇫🇮",
+      front: `${card.lemma} → ${card.cue}`,
+      frontLang: "fi",
+      answer: card.form_answer,
+      answerLang: "fi",
+      label: card.form_label ? `✅ ${card.form_label}` : null,
+    };
+  }
+  return { flag: "🇫🇮", front: card.lemma, frontLang: "fi", answer: card.translation_ru, answerLang: "ru" };
+}
+
+function showCard(data) {
+  const view = navigate(showSides);
+  const card = data.card;
+  const text = cardText(card);
+  const ui = { view, card, revealed: false, flipped: false, busy: false, buttons: [] };
+
+  const done = (data.progress && data.progress.done) || 0;
+  const total = (data.progress && data.progress.total) || 0;
+  const fill = el("div", { class: "progress-fill" });
+  fill.style.width = `${total ? Math.round((100 * done) / total) : 0}%`;
+  const progress = el("div", { class: "learn-progress" },
+    el("div", { class: "progress-bar" }, fill),
+    el("span", { class: "muted small" }, `${done} / ${total}`));
+
+  const front = el("div", { class: "face front" },
+    el("p", { class: "flag" }, text.flag),
+    el("p", { class: "prompt", lang: text.frontLang }, text.front));
+  const back = el("div", { class: "face back" },
+    el("p", { class: "muted small", lang: text.frontLang }, text.front),
+    el("p", { class: "answer", lang: text.answerLang }, text.answer),
+    text.label ? el("p", { class: "muted small", lang: "fi" }, text.label) : null);
+  if (card.example_fi) back.append(el("p", { class: "example", lang: "fi" }, card.example_fi));
+  if (card.example_ru) back.append(el("p", { class: "example muted" }, card.example_ru));
+  const speakError = el("p", { class: "muted small" });
+  if (card.example_fi) {
+    const speak = el("button", { class: "speak", type: "button", "aria-label": "Произнести пример" }, "🔊");
+    speak.addEventListener("click", () =>
+      playSound(speak, speakError, (signal) =>
+        request("api/learn/tts", { body: { session: learn.session, card_id: card.id }, signal })));
+    back.append(speak, speakError);
+  }
+  ui.inner = el("div", { class: "flashcard-inner" }, front, back);
+  ui.node = el("div", { class: "flashcard", role: "button", tabindex: "0",
+    "aria-label": "Карточка: нажми, чтобы перевернуть" }, ui.inner);
+  ui.zone = el("div", { class: "swipe-zone" },
+    el("div", { class: "underlay", "aria-hidden": "true" },
+      el("span", { class: "label remember" }, "Помню"),
+      el("span", { class: "label forgot" }, "Забыл")),
+    ui.node);
+
+  const rateButton = (label, rating, cls) => {
+    const button = el("button", { type: "button", class: cls }, label);
+    button.addEventListener("click", () => rate(ui, rating, 0));
+    ui.buttons.push(button);
+    return button;
+  };
+  ui.rateArea = el("div", { class: "rate", hidden: "" },
+    rateButton("✗ Забыл", RATING.again, "again"),
+    rateButton("✓ Помню", RATING.good, "good"),
+    rateButton("Трудно", RATING.hard, "fine"),
+    rateButton("Легко", RATING.easy, "fine"));
+  ui.hint = el("p", { class: "muted small hint" }, "Нажми на карточку, чтобы увидеть ответ.");
+  ui.error = el("p", { class: "muted small" });
+
+  const nodes = [progress];
+  if (data.can_undo) {
+    const undo = el("button", { type: "button", class: "undo" }, "↩ Отменить");
+    undo.addEventListener("click", () => undoLast(undo, ui.error, ui));
+    ui.buttons.push(undo);
+    nodes.push(undo);
+  }
+  nodes.push(ui.zone, ui.hint, ui.rateArea, ui.error);
+  show(...nodes);
+  attachSwipe(ui);
+  cardView = ui;
+}
+
+function flip(ui) {
+  if (ui.busy || ui !== cardView) return;
+  ui.flipped = !ui.flipped;
+  ui.revealed = true;
+  ui.inner.classList.toggle("flipped", ui.flipped);
+  ui.rateArea.hidden = false;
+  ui.hint.hidden = true;
+}
+
+// A finished drag: Again to the left, Good to the right, null below the
+// threshold (the card snaps back).
+function swipeRating(dx, width, ms) {
+  const distance = Math.abs(dx);
+  const far = distance >= width * SWIPE_THRESHOLD;
+  const flick = distance >= FLICK_MIN_PX && distance / Math.max(ms, 1) >= FLICK_PX_PER_MS;
+  if (!far && !flick) return null;
+  return dx < 0 ? RATING.again : RATING.good;
+}
+
+// The card follows the finger; the underlay turns red (left, "Забыл") or
+// green (right, "Помню"), more saturated the further the card has gone.
+function follow(ui, dx) {
+  const width = ui.node.offsetWidth || 1;
+  const share = Math.min(1, Math.abs(dx) / (width * SWIPE_THRESHOLD));
+  ui.node.style.transform = `translateX(${dx}px) rotate(${(dx / width) * MAX_ROTATE_DEG}deg)`;
+  ui.zone.style.setProperty("--swipe", share.toFixed(3));
+  ui.zone.classList.toggle("to-left", dx < 0);
+  ui.zone.classList.toggle("to-right", dx > 0);
+}
+
+function snapBack(ui) {
+  ui.node.classList.remove("dragging");
+  ui.node.style.transform = "";
+  ui.zone.style.setProperty("--swipe", "0");
+  ui.zone.classList.remove("to-left", "to-right");
+}
+
+function attachSwipe(ui) {
+  const node = ui.node;
+  let drag = null;
+  node.addEventListener("pointerdown", (event) => {
+    if (drag || ui.busy || event.button > 0 || event.target.closest("button")) return;
+    drag = { id: event.pointerId, x: event.clientX, y: event.clientY, t: event.timeStamp, dx: 0, moving: false };
+    try {
+      node.setPointerCapture(event.pointerId);
+    } catch (_) {
+      // The pointer is already gone.
+    }
+  });
+  node.addEventListener("pointermove", (event) => {
+    if (!drag || event.pointerId !== drag.id) return;
+    const dx = event.clientX - drag.x;
+    if (!drag.moving) {
+      // Before the flip a swipe rates nothing and the card stays put.
+      if (Math.abs(dx) < DRAG_SLOP_PX || !ui.revealed || ui.busy) return;
+      drag.moving = true;
+      node.classList.add("dragging");
+    }
+    drag.dx = dx;
+    follow(ui, dx);
+  });
+  node.addEventListener("pointerup", (event) => {
+    if (!drag || event.pointerId !== drag.id) return;
+    const finished = drag;
+    drag = null;
+    if (!finished.moving) {
+      const still = Math.abs(event.clientX - finished.x) < DRAG_SLOP_PX &&
+        Math.abs(event.clientY - finished.y) < DRAG_SLOP_PX;
+      if (still) flip(ui);
+      return;
+    }
+    const rating = swipeRating(finished.dx, node.offsetWidth || 1, event.timeStamp - finished.t);
+    if (rating === null || ui.busy) snapBack(ui);
+    else rate(ui, rating, finished.dx < 0 ? -1 : 1);
+  });
+  node.addEventListener("pointercancel", (event) => {
+    if (!drag || event.pointerId !== drag.id) return;
+    drag = null;
+    snapBack(ui);
+  });
+}
+
+function setBusy(ui, busy) {
+  ui.busy = busy;
+  for (const button of ui.buttons) button.disabled = busy;
+  ui.zone.classList.toggle("busy", busy);
+}
+
+function haptic() {
+  try {
+    if (tg && tg.HapticFeedback) tg.HapticFeedback.impactOccurred("medium");
+  } catch (_) {
+    // Older clients have no haptics.
+  }
+}
+
+// One rating per card: busy is set before the request leaves, so a second
+// swipe, key or button press while it is in flight sends nothing.
+function rate(ui, rating, direction) {
+  if (ui.busy || !ui.revealed || ui !== cardView) return;
+  setBusy(ui, true);
+  haptic();
+  ui.error.textContent = "";
+  if (direction) {
+    ui.node.classList.remove("dragging");
+    ui.node.style.transform = `translateX(${direction * 120}%) rotate(${direction * MAX_ROTATE_DEG}deg)`;
+  }
+  api("api/learn/review", { body: { session: learn.session, card_id: ui.card.id, rating } })
+    .then((data) => {
+      if (ui.view === navigation) showState(data);
+    })
+    .catch((error) => {
+      if (ui.view !== navigation) return;
+      // Stale: this card was rated already (another tab, a lost answer).
+      // The body is the session's current state: redraw it, no message.
+      if (isConflict(error, "stale") && error.body && error.body.state) {
+        showState(error.body);
+        return;
+      }
+      if (isConflict(error, "session_gone")) {
+        showSessionGone();
+        return;
+      }
+      snapBack(ui);
+      setBusy(ui, false);
+      ui.error.textContent = errorText(error);
+    });
+}
+
+// ↩: on the next card (ui is its view) and on the end screen (ui is null).
+function undoLast(button, errorNode, ui) {
+  if (button.disabled || (ui && ui.busy)) return;
+  if (ui) setBusy(ui, true);
+  else button.disabled = true;
+  errorNode.textContent = "";
+  const view = navigation;
+  api("api/learn/undo", { body: { session: learn.session } })
+    .then((data) => {
+      if (view === navigation) showState(data);
+    })
+    .catch((error) => {
+      if (view !== navigation) return;
+      if (isConflict(error, "session_gone")) {
+        showSessionGone();
+        return;
+      }
+      if (ui) setBusy(ui, false);
+      else button.disabled = false;
+      if (isConflict(error, "nothing_to_undo")) button.hidden = true;
+      else errorNode.textContent = errorText(error);
+    });
+}
+
+// web.telegram.org on a desktop: ← Forgot, → Remember, space flips.
+document.addEventListener("keydown", (event) => {
+  const ui = cardView;
+  if (!ui || event.repeat || event.altKey || event.ctrlKey || event.metaKey) return;
+  // Space or Enter on a focused button presses that button.
+  if (event.target instanceof Element && event.target.closest("button")) return;
+  if (event.key === " ") {
+    event.preventDefault();
+    flip(ui);
+  } else if (event.key === "ArrowLeft" && ui.revealed) {
+    event.preventDefault();
+    rate(ui, RATING.again, -1);
+  } else if (event.key === "ArrowRight" && ui.revealed) {
+    event.preventDefault();
+    rate(ui, RATING.good, 1);
+  }
+});
+
 if (tg) {
   tg.ready();
   tg.expand();
 }
+// reader_url?screen=learn opens the learning screens. A query parameter, not
+// the hash: Telegram keeps tgWebAppData there.
 if (!tg || !tg.initData) show(el("p", { class: "muted" }, OPEN_FROM_BOT));
+else if (new URLSearchParams(window.location.search).get("screen") === "learn") showLearn();
 else showBooks();

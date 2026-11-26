@@ -83,3 +83,80 @@ button {
   background: var(--accent); color: var(--accent-text);
   font: inherit; cursor: pointer;
 }
+button:disabled { opacity: 0.5; cursor: default; }
+button.secondary { background: var(--card); color: var(--text); }
+[hidden] { display: none !important; }
+
+/* П5: "📖 Книги | 📚 Учить" on top of the two root screens. */
+.switch {
+  display: flex; gap: 4px; padding: 4px; margin: 0 0 16px;
+  background: var(--card); border-radius: 12px;
+}
+.switch .tab { flex: 1; padding: 8px; background: transparent; color: var(--text); }
+.switch .tab.active { background: var(--accent); color: var(--accent-text); }
+
+.choices { display: grid; gap: 8px; margin-top: 12px; }
+.message { white-space: pre-line; font-size: 1.05rem; }
+
+/* П5: the flashcard. */
+.learn-progress { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.progress-bar { flex: 1; height: 6px; background: var(--card); border-radius: 3px; overflow: hidden; }
+.progress-fill { height: 100%; width: 0; background: var(--accent); transition: width 0.3s ease; }
+
+.undo {
+  width: auto; padding: 4px 10px; margin: 0 0 8px;
+  background: transparent; color: var(--link); font-size: 0.9rem;
+}
+
+/* --swipe (0..1, set by app.js) is how far the card has gone towards the
+   rating threshold: the underlay's colour and label grow with it. */
+.swipe-zone { position: relative; margin: 8px 0 12px; --swipe: 0; }
+.underlay {
+  position: absolute; inset: 0; border-radius: 16px;
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 0 20px; font-weight: 600; color: #ffffff;
+}
+.underlay .label { opacity: 0; }
+.to-left .underlay { background: rgba(214, 48, 49, calc(var(--swipe) * 0.9)); }
+.to-right .underlay { background: rgba(39, 174, 96, calc(var(--swipe) * 0.9)); }
+.to-left .underlay .forgot,
+.to-right .underlay .remember { opacity: var(--swipe); }
+
+/* pan-y: vertical scrolling stays the browser's, horizontal moves are ours. */
+.flashcard {
+  position: relative; touch-action: pan-y; cursor: pointer; outline: none;
+  user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+  perspective: 1200px; transition: transform 0.25s ease;
+}
+.flashcard.dragging { transition: none; }
+.flashcard:focus-visible .face { box-shadow: 0 0 0 2px var(--accent); }
+.flashcard-inner {
+  position: relative; min-height: 50vh;
+  transform-style: preserve-3d; transition: transform 0.45s ease;
+}
+.flashcard-inner.flipped { transform: rotateY(180deg); }
+.face {
+  position: absolute; inset: 0; overflow-y: auto;
+  display: flex; flex-direction: column; justify-content: center; align-items: center;
+  padding: 20px; text-align: center; overflow-wrap: anywhere;
+  background: var(--card); color: var(--text); border-radius: 16px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.12);
+  backface-visibility: hidden; -webkit-backface-visibility: hidden;
+}
+.face.back { transform: rotateY(180deg); }
+.face p { margin: 0 0 8px; }
+.face .flag { font-size: 1.6rem; }
+.face .prompt { font-size: 1.6rem; font-weight: 600; }
+.face .answer { font-size: 1.5rem; font-weight: 600; }
+.face .example { font-size: 1rem; }
+.face .speak { width: auto; min-width: 56px; padding: 8px 14px; font-size: 1.2rem; margin-top: 4px; }
+
+.hint { text-align: center; }
+.rate { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.rate .again { background: #d63031; color: #ffffff; }
+.rate .good { background: #27ae60; color: #ffffff; }
+.rate .fine { padding: 6px; font-size: 0.9rem; background: var(--card); color: var(--text); }
+
+@media (prefers-reduced-motion: reduce) {
+  .flashcard, .flashcard-inner, .progress-fill { transition: none; }
+}
