@@ -137,7 +137,9 @@ function switcher(active) {
         class: name === active ? "tab active" : "tab",
         "aria-pressed": String(name === active),
         onclick: () => {
-          if (name !== active) go();
+          // 📚 Учить after "📚 Учить эту колоду" is active but leads to the
+          // usual start (the deck choice) too.
+          if (name !== active || (name === "learn" && learn.fromDeck)) go();
         },
       },
       label,
@@ -1165,7 +1167,8 @@ function showSearch(query, focus = true) {
 
 // --- one deck -----------------------------------------------------------------
 
-async function showDeck(deckId) {
+// query: the search in the deck, kept when coming back from a word.
+async function showDeck(deckId, query = "") {
   const view = navigate(showDeckList);
   show(loading());
   let decks;
@@ -1187,10 +1190,10 @@ async function showDeck(deckId) {
     showNotice(DECK_GONE_TEXT, showDeckList);
     return;
   }
-  renderDeck(view, deck, page);
+  renderDeck(view, deck, page, query);
 }
 
-function renderDeck(view, deck, page) {
+function renderDeck(view, deck, page, query) {
   const guard = makeGuard();
   const back = () => showDeck(deck.id);
   const errorNode = el("p", { class: "error small" });
@@ -1246,7 +1249,7 @@ function renderDeck(view, deck, page) {
     nodes.push(el("button", { type: "button", class: "secondary chapter-button",
       onclick: () => showChapter(chapterId, back) }, "📖 Открыть главу"));
   }
-  nodes.push(...deckWords(view, deck, page, back));
+  nodes.push(...deckWords(view, deck, page, query));
   show(...nodes);
 }
 
@@ -1289,7 +1292,9 @@ function deleteDeck(view, deck, guard, errorNode) {
 // it finds words not loaded yet, folds case the way the server does (ä,
 // Cyrillic), and costs one request per pause in typing. It sees what the
 // server's search returns (at most 50 over all decks), enough for one user.
-function deckWords(view, deck, page, back) {
+function deckWords(view, deck, page, query) {
+  // A word opened from here comes back to this deck with the search typed.
+  const back = () => showDeck(deck.id, search.value);
   const list = el("ul", { class: "chapters words" });
   const found = el("ul", { class: "chapters words", hidden: "" });
   const status = el("p", { class: "muted small" });
@@ -1347,8 +1352,8 @@ function deckWords(view, deck, page, back) {
     observer.observe(more);
   }
 
-  const search = searchField("Поиск в колоде", "");
-  liveSearch(search, view, {
+  const search = searchField("Поиск в колоде", query);
+  const runSearch = liveSearch(search, view, {
     results: (notes) => {
       const mine = notes.filter((note) => note.deck && note.deck.id === deck.id);
       found.replaceChildren(...mine.map((note) => noteItem(note, back, false)));
@@ -1368,7 +1373,9 @@ function deckWords(view, deck, page, back) {
       status.textContent = errorText(error);
     },
   });
-  return [pager.total > 0 ? search : null, status, list, found, more].filter(Boolean);
+  // Back from a word: the same query, asked again.
+  if (search.value.trim()) runSearch();
+  return [pager.total > 0 || search.value.trim() ? search : null, status, list, found, more].filter(Boolean);
 }
 
 // --- one word -----------------------------------------------------------------
@@ -1406,9 +1413,11 @@ function shortDate(date, now) {
 }
 
 function noteEditErrorText(error, value) {
-  // The bot's text for the same clash (bot/edit.py _clash_reply).
+  // The bot's text for the same clash (bot/edit.py _clash_reply), with the
+  // lemma the server made of the input when it says so.
   if (isConflict(error, "duplicate")) {
-    return `«${value}» уже есть в этой колоде отдельной карточкой - сначала удали одну из них.`;
+    const lemma = error.body && typeof error.body.lemma === "string" && error.body.lemma ? error.body.lemma : value;
+    return `«${lemma}» уже есть в этой колоде отдельной карточкой - сначала удали одну из них.`;
   }
   if (error instanceof ApiError && error.status === 503 && error.reason === "no_openai") {
     return "Слово сейчас не поменять: формы пересчитывает OpenAI, а он не подключён.";
@@ -1417,7 +1426,8 @@ function noteEditErrorText(error, value) {
     return "OpenAI не ответил, слово не изменилось. Попробуй ещё раз.";
   }
   if (isNotFound(error)) return NOTE_GONE_TEXT;
-  if (error instanceof ApiError && error.status === 422) return EMPTY_VALUE_TEXT;
+  // An empty value is caught before the request; the server's 400 is the rest.
+  if (error instanceof ApiError && error.status === 400) return EMPTY_VALUE_TEXT;
   return errorText(error);
 }
 
@@ -1459,6 +1469,12 @@ function renderNote(view, note, back) {
   const deckLine = el("p", { class: "muted small" }, note.deck ? `🗂 ${note.deck.name}` : "🗂 без колоды");
   if (note.deck && note.deck.chapter) deckLine.append(el("br"), deckCaption(note.deck.chapter));
   nodes.push(deckLine);
+  // The chapter deck's way into its chapter; back comes to this word.
+  if (note.deck && note.deck.chapter && note.deck.chapter.id) {
+    const chapterId = note.deck.chapter.id;
+    nodes.push(el("button", { type: "button", class: "secondary chapter-button",
+      onclick: () => showChapter(chapterId, reopen) }, "📖 Открыть главу"));
+  }
 
   const now = new Date();
   const cards = note.cards || [];

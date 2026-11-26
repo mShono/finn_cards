@@ -429,7 +429,7 @@ async def test_stub_note_detail_move_edit_delete():
         status, data = await _json(
             await client.patch(f"/api/notes/{aiti}", json={"lemma": "talo"}, headers=AUTH)
         )
-        assert (status, data) == (409, {"reason": "duplicate"})
+        assert (status, data) == (409, {"reason": "duplicate", "lemma": "talo"})
         status, data = await _json(
             await client.patch(f"/api/notes/{aiti}", json={"translation_ru": "мать"}, headers=AUTH)
         )
@@ -456,3 +456,31 @@ async def test_stub_note_detail_move_edit_delete():
         status, _ = await _json(await client.delete(f"/api/notes/{aiti}", headers=AUTH))
         assert status == 404
         assert (await client.get(f"/api/notes/{aiti}", headers=AUTH)).status == 404
+
+
+# --- review fixes -------------------------------------------------------------
+
+
+def test_duplicate_names_the_servers_lemma_and_400_is_a_bad_value():
+    edit = _function("noteEditErrorText")
+    assert "error.body.lemma" in edit and ": value;" in edit
+    assert "error.status === 400) return EMPTY_VALUE_TEXT" in edit
+    assert "422" not in edit
+
+
+def test_word_screen_opens_the_chapter_and_comes_back():
+    body = _function("renderNote")
+    assert "if (note.deck && note.deck.chapter && note.deck.chapter.id)" in body
+    assert "showChapter(chapterId, reopen)" in body and '"📖 Открыть главу"' in body
+
+
+def test_learn_tab_leaves_learn_this_deck():
+    assert 'name !== active || (name === "learn" && learn.fromDeck)' in _function("switcher")
+
+
+def test_deck_search_survives_a_word():
+    body = _function("deckWords")
+    assert "const back = () => showDeck(deck.id, search.value);" in body
+    assert 'searchField("Поиск в колоде", query)' in body
+    assert "if (search.value.trim()) runSearch();" in body
+    assert "renderDeck(view, deck, page, query)" in _function("showDeck")

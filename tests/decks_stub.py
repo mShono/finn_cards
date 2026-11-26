@@ -441,16 +441,16 @@ async def edit_note(request: web.Request) -> web.Response:
     if "translation_ru" in body:
         value = body["translation_ru"]
         if not isinstance(value, str) or not value.strip():
-            return _reason(422, "bad_value")
+            return _reason(400, "bad_request")
         note["translation_ru"] = value.strip()
         return web.json_response({"note": _note_detail(state, note)})
     value = body.get("lemma")
     if not isinstance(value, str) or not value.strip():
-        return _reason(422, "bad_value")
+        return _reason(400, "bad_request")
     lemma = value.strip()
     # Checked before the model call, like the bot's ✍️ Слово.
     if _clash(state, note, lemma, note["deck_id"]):
-        return _reason(409, "duplicate")
+        return web.json_response({"reason": "duplicate", "lemma": lemma}, status=409)
     failure = LLM_MODES[state.llm_mode]
     if failure == (503, "no_openai"):
         return _reason(*failure)
@@ -460,7 +460,7 @@ async def edit_note(request: web.Request) -> web.Response:
     if request.match_info["note_id"] not in state.notes:
         return _reason(404, "not_found")
     if _clash(state, note, lemma, note["deck_id"]):
-        return _reason(409, "duplicate")
+        return web.json_response({"reason": "duplicate", "lemma": lemma}, status=409)
     note["lemma"] = lemma
     return web.json_response({"note": _note_detail(state, note)})
 
