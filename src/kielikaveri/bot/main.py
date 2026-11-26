@@ -14,9 +14,7 @@ from kielikaveri.bot.add import router as add_router
 from kielikaveri.bot.books import router as books_router
 from kielikaveri.bot.books import send_chapter_event
 from kielikaveri.bot.decks import DeckStates
-from kielikaveri.bot.decks import router as decks_router
 from kielikaveri.bot.edit import CANCEL_WORDS, EditStates
-from kielikaveri.bot.edit import router as edit_router
 from kielikaveri.bot.handlers import MAIN_KEYBOARD, router
 from kielikaveri.bot.middleware import (
     InputEscapeMiddleware,
@@ -37,16 +35,20 @@ from kielikaveri.translate.worker import Translator
 # keyboard (bot/handlers.py's MAIN_KEYBOARD) is the primary way in; /read is
 # the reader's entry point (see bot/handlers.py's read). No /learn: learning
 # lives in the Mini App, reached by the 📚 button (bot/handlers.py's learn_entry).
+# /decks stays: it hands out the reader's decks button (decks_entry), and the
+# menu is where it's found. No /delete: words are deleted in the reader's
+# search (a typed /delete still points there - delete_entry).
 BOT_COMMANDS = [
     BotCommand(command="read", description="📖 Читать"),
     BotCommand(command="add", description="Добавить слова из текста"),
-    BotCommand(command="delete", description="Удалить слово"),
     BotCommand(command="decks", description="Колоды"),
     BotCommand(command="help", description="Справка"),
 ]
 
 # States whose handler takes the next message as a value - see
 # InputEscapeMiddleware for why commands and menu buttons must skip them.
+# DeckStates/EditStates are no longer routed (decks and edit moved to the
+# reader, П6) - kept until bot/decks.py and bot/edit.py go (К4).
 INPUT_STATES = {
     EditStates.awaiting_value.state,
     AddStates.naming_new_deck.state,
@@ -100,16 +102,15 @@ def build_dispatcher(whitelist: set[int]) -> Dispatcher:
     # Before InputEscapeMiddleware - it must see the words before they're dropped
     dp.message.outer_middleware(UnsavedWordsMiddleware(drops_unsaved_words, WORDS_NOT_SAVED_TEXT))
     dp.message.outer_middleware(InputEscapeMiddleware(INPUT_STATES, MENU_TEXTS, CANCEL_WORDS))
-    # No learning router: learning lives in the Mini App (reader/learn.py),
-    # the bot only hands out its button (bot/handlers.py's learn_entry).
+    # No learning, decks or edit routers: those live in the Mini App, the
+    # bot only hands out their buttons (bot/handlers.py's learn_entry,
+    # decks_entry). The core router first - its /delete and old-button
+    # handlers win over bot/add.py's delete_command/delete_confirm.
     dp.include_router(router)
-    dp.include_router(decks_router)
-    dp.include_router(edit_router)
     dp.include_router(books_router)
     # add_router last - chat_message's plain-text catch-all would otherwise
-    # shadow every other router's text/state-based message handlers (e.g.
-    # decks.py's DeckStates.naming prompt, edit.py's EditStates.awaiting_value
-    # prompt) registered after it.
+    # shadow every other router's text/state-based message handlers
+    # registered after it.
     dp.include_router(add_router)
     return dp
 
