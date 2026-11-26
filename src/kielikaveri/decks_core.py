@@ -24,6 +24,7 @@ from datetime import datetime
 from sqlalchemy import delete, func, literal_column, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.exc import StaleDataError
 
 from kielikaveri.db.decks import create_deck, get_or_create_default_deck, list_decks
 from kielikaveri.db.models import (
@@ -148,7 +149,13 @@ async def set_translation(
         return None
     old = note.translation_ru
     note.translation_ru = value
-    await session.commit()
+    try:
+        await session.commit()
+    except StaleDataError:
+        # Deleted meanwhile, with its deck (delete_deck) or alone: the
+        # UPDATE found no row.
+        await session.rollback()
+        return None
     return note, old
 
 
@@ -204,7 +211,7 @@ async def save_lemma(
     """Write the new lemma and its forms, and match the inflection cards to
     them. Commits. `resolved` - the forms resolve_note_forms gave for the
     new lemma; None when they weren't recomputed (no LLM for this note, or
-    the call failed). None back - the note is gone. Raises
+    the call failed). None back - the note is gone, or went while this ran. Raises
     DuplicateNoteError when a concurrent change took the lemma in the
     meantime (the note keeps its old one)."""
     note = await session.get(Note, note_id)
@@ -238,6 +245,10 @@ async def save_lemma(
         # changes with it.
         deleted, created = await resync_inflection_cards(session, note, now)
         await session.commit()
+    except StaleDataError:
+        # Deleted meanwhile (its deck deleted, say): the UPDATE found no row.
+        await session.rollback()
+        return None
     except IntegrityError as error:
         # The clash lookup said this lemma was free, but a concurrent /add
         # or edit took it in the meantime.
@@ -363,7 +374,8 @@ async def delete_deck(session: AsyncSession, user_id: int, deck_id: str) -> int 
 async def move_note(session: AsyncSession, user_id: int, note_id: str, deck_id: str) -> Note | None:
     """Put the note into another deck of the user. Only notes.deck_id
     changes: the cards and their reviews stay with the note, so does its
-    history. Commits. None - the note or the deck is not the user's. The
+    history. Commits. None - the note or the deck is not the user's (or the
+    note was deleted while this ran). The
     same deck - nothing changes. Raises DuplicateNoteError when that deck
     has the same lemma and part of speech already (NOTE_UNIQUE_INDEX)."""
     note = await own_note(session, user_id, note_id)
@@ -375,6 +387,11 @@ async def move_note(session: AsyncSession, user_id: int, note_id: str, deck_id: 
     note.deck_id = deck.id
     try:
         await session.commit()
+    except StaleDataError:
+        # Deleted meanwhile, with its old deck (delete_deck) or alone: the
+        # UPDATE found no row.
+        await session.rollback()
+        return None
     except IntegrityError as error:
         if not is_note_duplicate_error(error):
             raise

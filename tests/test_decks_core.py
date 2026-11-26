@@ -17,7 +17,9 @@ from kielikaveri.decks_core import (
     move_note,
     note_detail,
     rename_deck,
+    save_lemma,
     search_notes,
+    set_translation,
 )
 from kielikaveri.translate.chapters import split_book
 
@@ -191,6 +193,29 @@ async def test_move_note_same_deck_others_and_no_deck(session_factory):
         assert await move_note(session, OWNER, "n", "missing") is None
         # A note in no deck (import_cards.py) can be put into one.
         assert (await move_note(session, OWNER, "loose", "a")).deck_id == "a"
+
+
+@pytest.mark.parametrize("case", ["move", "translation", "lemma"])
+async def test_a_note_deleted_with_its_deck_meanwhile_is_none(session_factory, case):
+    # The note is already in the session (as after own_note) when another
+    # session deletes its deck: the UPDATE finds no row - None, not a
+    # StaleDataError.
+    await add_deck(session_factory, "a")
+    await add_deck(session_factory, "b")
+    await add_note(session_factory, "n", "a", lemma="talo")
+
+    async with session_factory() as session:
+        assert await session.get(Note, "n") is not None
+        async with session_factory() as other:
+            assert await delete_deck(other, OWNER, "a") == 1
+        if case == "move":
+            result = await move_note(session, OWNER, "n", "b")
+        elif case == "translation":
+            result = await set_translation(session, OWNER, "n", "дом")
+        else:
+            result = await save_lemma(session, "n", "kissa", None, NOW)
+    assert result is None
+    assert await count(session_factory, Note) == 0
 
 
 # --- search --------------------------------------------------------------------------

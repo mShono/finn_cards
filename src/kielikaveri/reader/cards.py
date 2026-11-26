@@ -45,6 +45,7 @@ from kielikaveri.db.decks import get_or_create_chapter_deck
 from kielikaveri.db.models import Book, BookChapter, Deck, Note
 from kielikaveri.ingest import SURFACE_FIELD, existing_note_keys
 from kielikaveri.llm.breaker import CallBreaker
+from kielikaveri.reader.decks import deck_lock_key
 from kielikaveri.reader.excerpt import make_excerpt
 from kielikaveri.reader.lookup import (
     MARK_CLOSE,
@@ -104,13 +105,18 @@ async def add_card(
     model: str,
     lookup_locks: KeyedLocks,
     card_locks: KeyedLocks,
+    deck_locks: KeyedLocks,
     warmup: Warmup | None,
     user_id: int,
     chapter: BookChapter,
     book: Book,
     target: Target,
 ) -> CardResult:
-    """Raises what lookup and the excerpt raise (CircuitOpenError,
+    """`deck_locks` - the deck screens' (reader/decks.py): the chapter's
+    deck is held from the dedup to the INSERT, so 🗂 deleting it waits
+    instead of leaving the INSERT a deck that is gone.
+
+    Raises what lookup and the excerpt raise (CircuitOpenError,
     LookupFailedError, OpenAI's errors); a save that fails on its own is a
     CardResult with status failed."""
     started = time.monotonic()
@@ -126,6 +132,7 @@ async def add_card(
                 breaker,
                 model,
                 lookup_locks,
+                deck_locks,
                 warmup,
                 user_id,
                 chapter,
@@ -156,6 +163,7 @@ async def _add_card(
     breaker: CallBreaker,
     model: str,
     lookup_locks: KeyedLocks,
+    deck_locks: KeyedLocks,
     warmup: Warmup | None,
     user_id: int,
     chapter: BookChapter,
@@ -166,13 +174,51 @@ async def _add_card(
     word = await lookup(
         session_factory, client, breaker, model, lookup_locks, target, warmup, usage=usage
     )
-    sentence, span = _sentence_and_span(target)
+    while True:
+        async with session_factory() as session:
+            deck = await get_or_create_chapter_deck(
+                session, user_id, chapter, deck_name(book, chapter)
+            )
+            await session.commit()
+            deck_id, name = deck.id, deck.name
+        async with deck_locks.hold(deck_lock_key(deck_id)):
+            async with session_factory() as session:
+                if await session.get(Deck, deck_id) is None:
+                    # Deleted between its creation and the lock: the
+                    # next round makes it again, empty.
+                    continue
+                dedup = DedupState(await existing_note_keys(session, user_id, deck_id=deck_id))
+            return await _save_in_deck(
+                session_factory,
+                client,
+                breaker,
+                model,
+                warmup,
+                user_id,
+                target,
+                usage,
+                word,
+                deck_id,
+                name,
+                dedup,
+            )
 
-    async with session_factory() as session:
-        deck = await get_or_create_chapter_deck(session, user_id, chapter, deck_name(book, chapter))
-        await session.commit()
-        deck_id, name = deck.id, deck.name
-        dedup = DedupState(await existing_note_keys(session, user_id, deck_id=deck_id))
+
+async def _save_in_deck(
+    session_factory: async_sessionmaker[AsyncSession],
+    client: AsyncOpenAI,
+    breaker: CallBreaker,
+    model: str,
+    warmup: Warmup | None,
+    user_id: int,
+    target: Target,
+    usage: Usage,
+    word: dict,
+    deck_id: str,
+    name: str,
+    dedup: DedupState,
+) -> CardResult:
+    sentence, span = _sentence_and_span(target)
 
     candidate: dict = {
         "kind": "word",

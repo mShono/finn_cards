@@ -659,7 +659,8 @@ async def test_edit_lemma_duplicate_is_409(client, session_factory, resolve):
     await add_note(session_factory, "elsewhere", "b", lemma="koira")
 
     r = await client.patch("/api/notes/n", json={"lemma": "kissan"}, headers=header())
-    assert (r.status, await r.json()) == (409, {"reason": "duplicate"})
+    # The lemma as settled (canonical_key), for the bot's clash text.
+    assert (r.status, await r.json()) == (409, {"reason": "duplicate", "lemma": "kissa"})
     assert (await get_note(session_factory, "n")).lemma == "talo"
     assert resolve.calls == []
 
@@ -678,7 +679,7 @@ async def test_edit_lemma_lost_race_is_409(client, session_factory, monkeypatch)
     monkeypatch.setattr("kielikaveri.reader.decks.resolve_note_forms", steal)
 
     r = await client.patch("/api/notes/n", json={"lemma": "kissa"}, headers=header())
-    assert (r.status, await r.json()) == (409, {"reason": "duplicate"})
+    assert (r.status, await r.json()) == (409, {"reason": "duplicate", "lemma": "kissa"})
     assert (await get_note(session_factory, "n")).lemma == "talo"
 
 

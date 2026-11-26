@@ -424,6 +424,7 @@ async def save_word(request: web.Request) -> web.Response:
             app[SETTINGS].openai_text_model,
             app[LOOKUP_LOCKS],
             app[CARD_LOCKS],
+            app[DECK_LOCKS],
             app[WARMUP],
             request[USER_ID],
             chapter,
@@ -645,7 +646,7 @@ async def _decks_call(event: str, ids: str, call: Awaitable[dict | None]) -> web
     except decks.NotFoundError:
         raise web.HTTPNotFound() from None
     except decks.ConflictError as exc:
-        return _conflict(exc.reason)
+        return _conflict(exc.reason, exc.payload)
     except decks.BadNameError:
         return web.json_response({"reason": "bad_name"}, status=422)
     except decks.NoOpenAIError:
