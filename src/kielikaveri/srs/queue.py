@@ -1,4 +1,4 @@
-"""Builds a learning session's queue: due cards, capped by the daily new-card
+"""Builds a /learn session's queue: due cards, capped by the daily new-card
 limit and the debt (backlog) threshold. DB-facing, no Telegram here.
 """
 
@@ -117,7 +117,7 @@ async def overdue_count(
     opens an inflection card per form, counting those as debt would fire
     the backlog prompt on day one. The deck screen leaves it off: there
     "к повторению" does mean everything due, new cards included.
-    `card_types` narrows the count to the side the session was asked to show.
+    `card_types` narrows the count to the side /learn was asked to show.
     """
     stmt = (
         select(func.count())
@@ -198,7 +198,7 @@ async def build_session_queue(
     deck_id: str | None = None,
     card_types: Sequence[CardType] | None = None,
 ) -> list[str]:
-    """Card ids for one learning session, in the order the learner meets them.
+    """Card ids for one /learn session, in the order the learner meets them.
 
     The order is the contract, not an accident of the query plan: oldest due
     first, then - among cards sharing a due second, which every batch the
@@ -221,7 +221,7 @@ async def build_session_queue(
     global across decks on purpose - it's a "don't overload the learner today"
     cap, not a per-deck one.
     `card_types` narrows candidates to the side the learner chose to see
-    (see learn_core.LearnSide.card_types); None means every type.
+    (see bot/learn.py's LearnSide.card_types); None means every type.
     """
     new_today = await count_new_cards_today(session, user_id, now, boundary_hour)
     new_budget = max(0, daily_new_limit - new_today)

@@ -17,8 +17,8 @@ reports what actually landed where, rather than a silent per-candidate
 "add" button.
 
 Must fail honestly, never crash the bot, when OpenAI is unreachable or the
-breaker trips - learning (in the reader) has no LLM dependency and must keep
-working regardless (plan 3.10).
+breaker trips - /learn has no LLM dependency and must keep working regardless
+(plan 3.10).
 """
 
 from __future__ import annotations
@@ -30,7 +30,8 @@ from datetime import UTC, datetime
 
 import openai
 from aiogram import F, Router
-from aiogram.filters import Command, CommandObject
+from aiogram.dispatcher.event.bases import SkipHandler
+from aiogram.filters import Command, CommandObject, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -40,6 +41,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from kielikaveri.bot.decks import NEW_DECK_PROMPT
 from kielikaveri.bot.edit import CANCEL_WORDS
+from kielikaveri.bot.learn import LearnStates
 from kielikaveri.bot.text import split_message
 from kielikaveri.cards_save import (
     DedupState,
@@ -74,6 +76,11 @@ router = Router(name="add")
 
 ADD_BUTTON_TEXT = "💬 Добавить"
 ADD_PROMPT = "Просто напиши мне текст на финском или свой перевод - отвечу в чате."
+LEARN_TEXT_HINT = (
+    "Сейчас идёт повторение. Используй кнопки ниже.\n"
+    "Чтобы написать мне текст, нажми «💬 Добавить» - повторение закончится."
+)
+LEARN_STOPPED_TEXT = "Повторение остановлено."
 UNKNOWN_COMMAND_TEXT = "Не знаю такой команды. Список команд - /help"
 RESEND_HINT = "Чтобы сохранить, пришли текст ещё раз."
 WORDS_NOT_SAVED_TEXT = f"Слова из прошлого текста не сохранила. {RESEND_HINT}"
@@ -89,6 +96,19 @@ class AddStates(StatesGroup):
     choosing_deck = State()
     # Data: same as choosing_deck, carried over - waiting for the new deck's name.
     naming_new_deck = State()
+
+
+# Adding ends a live session first: the prompt invites plain text, which
+# learn_plain_text would only answer with a hint, and "/add <text>" would
+# overwrite the learn state from inside the chat turn. SkipHandler then
+# passes the message on to the regular button/command handler below.
+@router.message(StateFilter(LearnStates), Command("add"))
+@router.message(StateFilter(LearnStates), F.text == ADD_BUTTON_TEXT)
+async def add_during_learn(message: Message, state: FSMContext) -> None:
+    logger.info("event=learn.session_end reason=add")
+    await state.clear()
+    await message.answer(LEARN_STOPPED_TEXT)
+    raise SkipHandler
 
 
 @router.message(F.text == ADD_BUTTON_TEXT)
@@ -174,9 +194,9 @@ async def delete_confirm(
 
         # Two callback_query updates for one genuine double-tap both pass the
         # None-check above (neither has committed yet) - same race class as
-        # ingest_cache. There's no FSM state to claim ahead of the first await
-        # here (the note to delete isn't known until session.get() itself
-        # returns), so the note DELETE's rowcount is the guard instead:
+        # learn_rate/ingest_cache. There's no FSM state to claim ahead of the
+        # first await here (the note to delete isn't known until session.get()
+        # itself returns), so the note DELETE's rowcount is the guard instead:
         # only the invocation that actually removed the row may report success.
         #
         # Children first: there is no ON DELETE CASCADE (db/models.py) and
@@ -247,6 +267,16 @@ async def add_new_deck_save(
     )
 
 
+# Right before chat_message, not in learn.py: menu buttons are matched by
+# earlier handlers, so only plain text is left here. In chat_message it would
+# reach the LLM, whose clarifying question or deck picker overwrites the
+# learn state and kills the session's buttons.
+@router.message(StateFilter(LearnStates), F.text & ~F.text.startswith("/"))
+async def learn_plain_text(message: Message) -> None:
+    logger.debug("event=learn.plain_text_ignored")
+    await message.answer(LEARN_TEXT_HINT)
+
+
 @router.message(F.text & ~F.text.startswith("/"))
 async def chat_message(
     message: Message,
@@ -260,7 +290,7 @@ async def chat_message(
 
 # Last message handler of the last router: every known command is matched
 # above, so a "/..." that got this far is a typo or a removed command.
-# State is left as is - an unknown command must not end, say, a deck pick.
+# State is left as is - an unknown command mid-review must not end it.
 @router.message(F.text.startswith("/"))
 async def unknown_command(message: Message) -> None:
     logger.debug("event=route.unknown_command")

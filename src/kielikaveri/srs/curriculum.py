@@ -166,7 +166,7 @@ async def introduce_due_forms(
     notes = (await session.scalars(stmt.order_by(Note.created_at, Note.id))).all()
     # One query for every note's cards instead of one per note. The loop below
     # walks *all* the notes whenever little is eligible - the ordinary state of
-    # a session start - so the per-note SELECT cost a statement per note even on days
+    # a /learn - so the per-note SELECT cost a statement per note even on days
     # it opened nothing (measured: 500 notes -> 503 statements). Safe to read
     # them all up front: the three queries above have already autoflushed
     # whatever sync_user_card_types created in this same uncommitted session.
