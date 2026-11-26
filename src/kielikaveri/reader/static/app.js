@@ -790,14 +790,15 @@ function showCard(data) {
   ui.hint = el("p", { class: "muted small hint" }, "Нажми на карточку, чтобы увидеть ответ.");
   ui.error = el("p", { class: "muted small" });
 
-  const nodes = [progress];
+  // ↩ on a line of its own under the card and the rating buttons.
+  const nodes = [progress, ui.node, ui.hint, ui.rateArea];
   if (data.can_undo) {
     const undo = el("button", { type: "button", class: "undo" }, "↩ Отменить");
     undo.addEventListener("click", () => undoLast(undo, ui.error, ui));
     ui.buttons.push(undo);
     nodes.push(undo);
   }
-  nodes.push(ui.node, ui.hint, ui.rateArea, ui.error);
+  nodes.push(ui.error);
   show(...nodes);
   cardView = ui;
 }

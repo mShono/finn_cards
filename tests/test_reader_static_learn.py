@@ -1,8 +1,9 @@
 """Static checks on the reader's learning screens (plan
 2026-11-20-kirjakaveri-reader, "П5", stage У2): the /api/learn/* calls, card
 text through textContent only, ?screen=learn, the rating buttons and keys
-(no swipes since У5), the in-flight guard, the 409 paths. And the test-side
-stub server (tests/learn_stub.py) answers in the contract's shapes."""
+(no swipes since У5), the in-flight guard, the 409 paths, ↩ under the
+buttons. And the test-side stub server (tests/learn_stub.py) answers in the
+contract's shapes."""
 
 import re
 
@@ -239,6 +240,22 @@ def test_undo_on_next_card_and_end_screen():
     for name in ("showCard", "showEnd"):
         body = _function(name)
         assert "if (data.can_undo)" in body and '"↩ Отменить"' in body, name
+
+
+def test_undo_below_the_card_and_the_rating_buttons():
+    body = _function("showCard")
+    # The card, the hint and the rating row go in first; ↩ after them.
+    assert "const nodes = [progress, ui.node, ui.hint, ui.rateArea];" in body
+    assert body.index("const nodes = [") < body.index("nodes.push(undo)")
+    assert body.index("nodes.push(undo)") < body.index("nodes.push(ui.error)")
+    end = _function("showEnd")
+    assert end.index('class: "message"') < end.index("nodes.push(undo)")
+    assert end.index("nodes.push(undo)") < end.index('class: "choices"')
+    # A line of its own, centered, full-size.
+    undo = STYLE_CSS.split("\n.undo {", 1)[1].split("}", 1)[0]
+    assert "display: block" in undo and "margin: 16px auto 0" in undo
+    assert "font-size" not in undo
+    assert STYLE_CSS.index("\n.undo {") > STYLE_CSS.index("\n.rate {")
 
 
 def test_learn_tts_unlocks_audio_in_the_tap():
