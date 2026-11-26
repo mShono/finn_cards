@@ -8,6 +8,10 @@ No aiogram or HTTP here and no UI text. The LLM call of a lemma edit
 each have their own client and breaker, and their own answer when it
 fails. This module settles the lemma, finds a clash, and saves.
 
+What the bot never had and the reader adds: renaming and deleting a deck,
+moving a word to another deck (its history goes with it), a search over
+every deck and the word's details with its cards.
+
 Logs: none of its own - the callers log their steps. Nothing here may log
 a lemma, a translation or a deck's name.
 """
@@ -22,7 +26,17 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from kielikaveri.db.decks import create_deck, get_or_create_default_deck, list_decks
-from kielikaveri.db.models import Card, Deck, Note, NoteKind, Review, is_note_duplicate_error
+from kielikaveri.db.models import (
+    Book,
+    BookChapter,
+    Card,
+    CardType,
+    Deck,
+    Note,
+    NoteKind,
+    Review,
+    is_note_duplicate_error,
+)
 from kielikaveri.ingest import ResolvedForms, canonical_key
 from kielikaveri.srs.graduation import resync_inflection_cards
 from kielikaveri.srs.queue import CardCounters, card_counters
@@ -281,3 +295,170 @@ async def delete_note(session: AsyncSession, user_id: int, note_id: str) -> Dele
     if deck_id is not None:
         remaining = await count_deck_notes(session, user_id, deck_id)
     return DeletedNote(lemma, deck_id, deck_name, remaining)
+
+
+# --- what the reader adds (П6) -------------------------------------------------------
+
+# A search answers with this many notes at most.
+SEARCH_LIMIT = 50
+
+
+@dataclass(frozen=True)
+class ChapterRef:
+    """The chapter a deck was made for (decks.chapter_id), for its label and
+    the way back into the book."""
+
+    id: str
+    book_title: str
+    number: int
+
+
+async def deck_chapter(session: AsyncSession, deck: Deck) -> ChapterRef | None:
+    """None - not a chapter's deck, or its book was deleted since (SET NULL)."""
+    if deck.chapter_id is None:
+        return None
+    chapter = await session.get(BookChapter, deck.chapter_id)
+    if chapter is None:
+        return None
+    book = await session.get(Book, chapter.book_id)
+    return ChapterRef(chapter.id, book.title, chapter.number)
+
+
+async def rename_deck(session: AsyncSession, user_id: int, deck_id: str, name: str) -> Deck | None:
+    """Commits. None - not the user's deck."""
+    deck = await own_deck(session, user_id, deck_id)
+    if deck is None:
+        return None
+    deck.name = name
+    await session.commit()
+    return deck
+
+
+async def delete_deck(session: AsyncSession, user_id: int, deck_id: str) -> int | None:
+    """Delete the deck with its notes, their cards and the cards' reviews,
+    in one transaction. Commits. The number of notes deleted; None - not the
+    user's deck, or deleted already (a double tap: the deck DELETE's
+    rowcount decides, as delete_note's does).
+
+    Children first, as in delete_note: no ON DELETE CASCADE, foreign keys
+    on. A chapter's deck goes the same way - the next ➕ in the chapter
+    makes a new, empty one."""
+    if await own_deck(session, user_id, deck_id) is None:
+        return None
+    note_ids = select(Note.id).where(Note.deck_id == deck_id, Note.user_id == user_id)
+    card_ids = select(Card.id).where(Card.note_id.in_(note_ids))
+    await session.execute(delete(Review).where(Review.card_id.in_(card_ids)))
+    await session.execute(delete(Card).where(Card.note_id.in_(note_ids)))
+    notes = await session.execute(
+        delete(Note).where(Note.deck_id == deck_id, Note.user_id == user_id)
+    )
+    result = await session.execute(delete(Deck).where(Deck.id == deck_id, Deck.user_id == user_id))
+    if result.rowcount == 0:
+        await session.rollback()
+        return None
+    await session.commit()
+    return notes.rowcount
+
+
+async def move_note(session: AsyncSession, user_id: int, note_id: str, deck_id: str) -> Note | None:
+    """Put the note into another deck of the user. Only notes.deck_id
+    changes: the cards and their reviews stay with the note, so does its
+    history. Commits. None - the note or the deck is not the user's. The
+    same deck - nothing changes. Raises DuplicateNoteError when that deck
+    has the same lemma and part of speech already (NOTE_UNIQUE_INDEX)."""
+    note = await own_note(session, user_id, note_id)
+    deck = await own_deck(session, user_id, deck_id)
+    if note is None or deck is None:
+        return None
+    if note.deck_id == deck.id:
+        return note
+    note.deck_id = deck.id
+    try:
+        await session.commit()
+    except IntegrityError as error:
+        if not is_note_duplicate_error(error):
+            raise
+        await session.rollback()
+        raise DuplicateNoteError from None
+    return note
+
+
+@dataclass(frozen=True)
+class FoundNote:
+    note: Note
+    # None - a note in no deck (old notes, import_cards.py).
+    deck: Deck | None
+
+
+def _match_rank(query: str, value: str | None) -> int | None:
+    """0 - the whole value, 1 - the start of a word in it, 2 - anywhere
+    else; None - not in it. Both casefolded already."""
+    if not value or query not in value:
+        return None
+    if value == query:
+        return 0
+    start = value.find(query)
+    while start != -1:
+        if start == 0 or not value[start - 1].isalnum():
+            return 1
+        start = value.find(query, start + 1)
+    return 2
+
+
+async def search_notes(
+    session: AsyncSession, user_id: int, query: str, limit: int = SEARCH_LIMIT
+) -> list[FoundNote]:
+    """The user's notes, every deck, whose lemma, translation or colloquial
+    spelling (meta.puhekieli) has `query` in it, regardless of case.
+
+    SQLite's lower() folds ASCII only (not ä/ö, not Cyrillic), so the
+    matching is Python's casefold() over the user's notes in memory - one
+    user, hundreds of notes. Exact matches first, then the start of a word,
+    then the rest; by lemma within each."""
+    folded = query.strip().casefold()
+    if not folded:
+        return []
+    notes = (await session.scalars(select(Note).where(Note.user_id == user_id))).all()
+    ranked = []
+    for note in notes:
+        puhekieli = note.meta.get("puhekieli")
+        values = (note.lemma, note.translation_ru, puhekieli if isinstance(puhekieli, str) else "")
+        ranks = [r for v in values if (r := _match_rank(folded, (v or "").casefold())) is not None]
+        if ranks:
+            ranked.append((min(ranks), note.lemma.casefold(), note.id, note))
+    ranked.sort(key=lambda row: row[:3])
+    decks = {deck.id: deck for deck in await list_decks(session, user_id)}
+    return [FoundNote(row[3], decks.get(row[3].deck_id)) for row in ranked[:limit]]
+
+
+@dataclass(frozen=True)
+class NoteDetail:
+    note: Note
+    deck: Deck | None
+    chapter: ChapterRef | None
+    cards: list[Card]
+
+
+_CARD_TYPE_ORDER = {
+    CardType.recognition: 0,
+    CardType.production: 1,
+    CardType.inflection: 2,
+}
+
+
+async def note_detail(session: AsyncSession, user_id: int, note_id: str) -> NoteDetail | None:
+    """The note with its deck, the deck's chapter and every card - for the
+    word's screen. None - not the user's note."""
+    note = await own_note(session, user_id, note_id)
+    if note is None:
+        return None
+    deck = await session.get(Deck, note.deck_id) if note.deck_id else None
+    chapter = await deck_chapter(session, deck) if deck is not None else None
+    cards = (await session.scalars(select(Card).where(Card.note_id == note.id))).all()
+    forms = list((note.meta.get("principal_forms") or {}).keys())
+
+    def order(card: Card) -> tuple:
+        form_index = forms.index(card.form) if card.form in forms else len(forms)
+        return (_CARD_TYPE_ORDER[card.type], form_index, card.form or "", card.id)
+
+    return NoteDetail(note, deck, chapter, sorted(cards, key=order))
