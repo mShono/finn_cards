@@ -63,6 +63,9 @@ FAKE_TELEGRAM_JS = """\
       initData: "stub",
       ready() {},
       expand() {},
+      isVersionAtLeast() { return true; },
+      // The decks' deletes (tests/decks_stub.py): the browser's own dialog.
+      showConfirm(message, callback) { callback(window.confirm(message)); },
       BackButton: {
         onClick(fn) { handlers.push(fn); },
         offClick(fn) { handlers = handlers.filter((h) => h !== fn); },
