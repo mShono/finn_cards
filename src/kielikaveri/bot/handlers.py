@@ -6,6 +6,7 @@ from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
+    CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -60,6 +61,7 @@ async def help_(message: Message) -> None:
 
 READER_NOT_CONFIGURED_TEXT = "Читалка не настроена."
 LEARN_ENTRY_TEXT = "Карточки теперь учатся в читалке:"
+LEARN_MOVED_TEXT = "Учёба теперь в читалке: 📚 Учить"
 
 
 def _web_app_markup(text: str, url: str) -> InlineKeyboardMarkup:
@@ -104,3 +106,10 @@ async def learn_entry(message: Message, state: FSMContext, settings: Settings) -
         return
     url = with_query_param(settings.reader_url, "screen", "learn")
     await message.answer(LEARN_ENTRY_TEXT, reply_markup=_web_app_markup("📚 Учить", url))
+
+
+# Buttons of old bot sessions still sit in the chat history - answered, so
+# they don't spin, with no new message.
+@router.callback_query(F.data.startswith("learn:"))
+async def old_learn_button(callback: CallbackQuery) -> None:
+    await callback.answer(LEARN_MOVED_TEXT)

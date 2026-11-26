@@ -10,13 +10,14 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 from aiogram import Bot
 from aiogram.fsm.storage.base import StorageKey
-from aiogram.methods import SendMessage
+from aiogram.methods import AnswerCallbackQuery, SendMessage
 from aiogram.types import InlineKeyboardMarkup, MenuButtonCommands
 from bot_helpers import (
     RecordingSession,
     make_breaker,
     make_settings,
     routed_dispatcher,
+    tg_callback_update,
     tg_text_update,
 )
 
@@ -24,6 +25,7 @@ from kielikaveri.bot.add import WORDS_NOT_SAVED_TEXT, AddStates
 from kielikaveri.bot.decks import DeckStates
 from kielikaveri.bot.handlers import (
     LEARN_ENTRY_TEXT,
+    LEARN_MOVED_TEXT,
     READER_NOT_CONFIGURED_TEXT,
     help_,
     with_query_param,
@@ -60,7 +62,18 @@ async def routed():
         )
         return [m for m in telegram.sent[since:] if isinstance(m, SendMessage)]
 
-    yield {"send": send, "storage": dp.storage, "key": key}
+    async def tap(data: str) -> list:
+        since = len(telegram.sent)
+        await dp.feed_update(
+            bot,
+            tg_callback_update(since + 1, data),
+            session_factory=session_factory,
+            settings=make_settings(reader_url=READER_URL),
+            breaker=make_breaker(),
+        )
+        return telegram.sent[since:]
+
+    yield {"send": send, "tap": tap, "storage": dp.storage, "key": key}
     await dp.storage.set_state(key, None)
     await dp.storage.set_data(key, {})
     await engine.dispose()
@@ -199,3 +212,11 @@ def test_learn_router_is_not_in_the_dispatcher():
         "assert router not in dp.sub_routers\n"
     )
     subprocess.run([sys.executable, "-c", script], check=True)
+
+
+@pytest.mark.parametrize("data", ["learn:reveal:c1", "learn:side:mix", "learn:rate:c1:3"])
+async def test_old_learn_button_is_answered_without_a_message(routed, data):
+    sent = await routed["tap"](data)
+
+    assert [type(m) for m in sent] == [AnswerCallbackQuery]
+    assert sent[0].text == LEARN_MOVED_TEXT
