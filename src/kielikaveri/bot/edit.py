@@ -90,8 +90,8 @@ async def note_edit_cancel(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "noteeditcancel")
 async def note_edit_cancel_stray(callback: CallbackQuery) -> None:
-    # No edit in progress - the state belongs to someone else (a /learn
-    # session, an /add deck pick) and an old menu's Отмена must not wipe it.
+    # No edit in progress - the state belongs to someone else (an /add deck
+    # pick, a clarifying question) and an old menu's Отмена must not wipe it.
     await callback.answer("Отменено.")
 
 

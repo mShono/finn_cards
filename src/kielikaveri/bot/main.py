@@ -100,8 +100,8 @@ def build_dispatcher(whitelist: set[int]) -> Dispatcher:
     # Before InputEscapeMiddleware - it must see the words before they're dropped
     dp.message.outer_middleware(UnsavedWordsMiddleware(drops_unsaved_words, WORDS_NOT_SAVED_TEXT))
     dp.message.outer_middleware(InputEscapeMiddleware(INPUT_STATES, MENU_TEXTS, CANCEL_WORDS))
-    # bot/learn.py's router is left out on purpose: learning moved to the
-    # Mini App (bot/handlers.py's learn_entry).
+    # No learning router: learning lives in the Mini App (reader/learn.py),
+    # the bot only hands out its button (bot/handlers.py's learn_entry).
     dp.include_router(router)
     dp.include_router(decks_router)
     dp.include_router(edit_router)

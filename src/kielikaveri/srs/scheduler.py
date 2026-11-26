@@ -105,7 +105,7 @@ def apply_review(
     Still no DB access - this only assigns attributes on an ORM instance.
     Reading `last_review` out of `reviews`, writing the new row there and
     committing all stay with the caller, which is the half that holds a
-    session (see bot/learn.py's rating handler).
+    session (see learn_core.record_review).
     """
     updated = review(
         SrsState(

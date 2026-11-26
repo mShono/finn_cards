@@ -184,7 +184,7 @@ async def test_two_concurrent_adds_of_the_same_word_leave_exactly_one_note(make_
 
 
 async def test_the_surviving_note_opens_exactly_one_set_of_cards(make_db, monkeypatch):
-    # /add itself writes no cards - /learn opens them lazily per note
+    # /add itself writes no cards - learning opens them lazily per note
     # (srs/graduation). So "no two sets of cards" is only really answered by
     # running that same opening path over whatever the race left behind.
     session_factory = await make_db("cards")

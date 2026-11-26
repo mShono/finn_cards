@@ -933,7 +933,7 @@ async def test_delete_confirm_on_an_already_deleted_note_is_honest(session_facto
 
 
 async def test_delete_confirm_concurrent_double_tap_deletes_only_once(session_factory):
-    # Same real-concurrency race class as learn_rate/ingest_cache: two
+    # Same real-concurrency race class as ingest_cache: two
     # callback_query updates for one genuine double-tap on the same confirm
     # button both fetch the note before either commits. Proven with
     # asyncio.gather() on real aiosqlite, not mocked.
