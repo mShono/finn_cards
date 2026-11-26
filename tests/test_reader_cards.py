@@ -229,6 +229,47 @@ async def test_a_bad_excerpt_falls_back_to_the_rule(session_factory, book, tmp_p
     assert note.example_ru == "Я в доме, — сказал он."
 
 
+async def test_deleting_the_chapter_deck_during_a_plus_waits_for_it(
+    session_factory, book, tmp_path
+):
+    # 🗂 deleting the chapter's deck while ➕ is in its LLM calls: the
+    # delete waits on the deck's lock, so the INSERT never meets a deck
+    # that is gone (a foreign key error, a 500).
+    _, chapter_id, _ = book
+    started, release = asyncio.Event(), asyncio.Event()
+
+    class HeldExcerpt(FakeOpenAI):
+        async def _create(self, **kwargs):
+            if kwargs["text"]["format"]["name"] == EXCERPT_SCHEMA_NAME and not started.is_set():
+                started.set()
+                await release.wait()
+            return await super()._create(**kwargs)
+
+    async with TestClient(
+        TestServer(build_app(session_factory, HeldExcerpt(), tmp_path))
+    ) as client:
+        plus_task = asyncio.create_task(plus(client, body(chapter_id)))
+        await started.wait()
+        async with session_factory() as session:
+            deck_id = await session.scalar(select(Deck.id).where(Deck.chapter_id == chapter_id))
+        delete_task = asyncio.create_task(client.delete(f"/api/decks/{deck_id}", headers=header()))
+        await asyncio.sleep(0.2)
+        assert not delete_task.done()
+        release.set()
+        saved, deleted = await asyncio.gather(plus_task, delete_task)
+
+        assert (saved.status, (await saved.json())["status"]) == (200, "saved")
+        assert (deleted.status, await deleted.json()) == (200, {"deleted_notes": 1})
+        assert await all_notes(session_factory) == []
+
+        # The next ➕ makes the chapter's deck again, empty but for it.
+        r = await plus(client, body(chapter_id, token=KAUKANA))
+        assert (await r.json())["status"] == "saved"
+    async with session_factory() as session:
+        decks = (await session.scalars(select(Deck))).all()
+    assert [(d.chapter_id, d.id != deck_id) for d in decks] == [(chapter_id, True)]
+
+
 async def test_words_of_one_chapter_share_its_deck(client, book, session_factory):
     _, chapter_id, _ = book
     await plus(client, body(chapter_id, token=TALOSSA))

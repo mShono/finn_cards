@@ -22,6 +22,7 @@ morphology) are cut to their event name.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import UTC, datetime
 
@@ -52,12 +53,14 @@ class BadNameError(Exception):
 
 
 class ConflictError(Exception):
-    """409 with `reason`: "duplicate" (a lemma edit), "duplicate_in_target"
-    (a move)."""
+    """409 with `reason`: "duplicate" (a lemma edit, with the settled
+    `lemma` in `payload` - what the bot's clash reply names),
+    "duplicate_in_target" (a move)."""
 
-    def __init__(self, reason: str) -> None:
+    def __init__(self, reason: str, payload: dict | None = None) -> None:
         super().__init__(reason)
         self.reason = reason
+        self.payload = payload
 
 
 class NoOpenAIError(Exception):
@@ -75,7 +78,8 @@ def _note_key(note_id: str) -> str:
     return f"note/{note_id}"
 
 
-def _deck_key(deck_id: str) -> str:
+def deck_lock_key(deck_id: str) -> str:
+    """A deck's key in DECK_LOCKS; ➕ (reader/cards.py) holds it too."""
     return f"deck/{deck_id}"
 
 
@@ -173,7 +177,7 @@ async def rename_deck(
     name: str,
 ) -> dict:
     name = clean_name(name)
-    async with locks.hold(_deck_key(deck_id)), session_factory() as db:
+    async with locks.hold(deck_lock_key(deck_id)), session_factory() as db:
         deck = await decks_core.rename_deck(db, user_id, deck_id, name)
         if deck is None:
             raise NotFoundError
@@ -188,7 +192,7 @@ async def delete_deck(
     user_id: int,
     deck_id: str,
 ) -> dict:
-    async with locks.hold(_deck_key(deck_id)), session_factory() as db:
+    async with locks.hold(deck_lock_key(deck_id)), session_factory() as db:
         deleted = await decks_core.delete_deck(db, user_id, deck_id)
     if deleted is None:
         raise NotFoundError
@@ -310,13 +314,16 @@ async def _set_lemma(
         current = await decks_core.own_note(db, user_id, note_id)
         if current is None:
             raise NotFoundError
-        new_lemma = decks_core.settle_lemma(current, value)
+        # The FST off the event loop, as the lookup's: a word's first
+        # analysis can take a while. The thread gets a copy of this
+        # context, so its log lines are cut as well.
+        new_lemma = await asyncio.to_thread(decks_core.settle_lemma, current, value)
         clash = await decks_core.find_lemma_clash(db, current, new_lemma)
     if clash is not None:
         logger.info(
             "event=decks.lemma_clash note_id=%s clash_note_id=%s source=reader", note_id, clash.id
         )
-        raise ConflictError("duplicate")
+        raise ConflictError("duplicate", {"lemma": new_lemma})
 
     resolved = None
     if decks_core.needs_forms(current):
@@ -337,7 +344,7 @@ async def _set_lemma(
             saved = await decks_core.save_lemma(db, note_id, new_lemma, resolved, datetime.now(UTC))
         except DuplicateNoteError:
             logger.info("event=decks.lemma_clash_race note_id=%s source=reader", note_id)
-            raise ConflictError("duplicate") from None
+            raise ConflictError("duplicate", {"lemma": new_lemma}) from None
         if saved is None:
             raise NotFoundError
         body = await _note_json(db, user_id, note_id)
@@ -364,7 +371,7 @@ async def move_note(
     # lock only, so the order can't deadlock.
     async with (
         locks.hold(_note_key(note_id)),
-        locks.hold(_deck_key(deck_id)),
+        locks.hold(deck_lock_key(deck_id)),
         session_factory() as db,
     ):
         before = await decks_core.own_note(db, user_id, note_id)
