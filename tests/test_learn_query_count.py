@@ -1,6 +1,6 @@
-"""/learn must not issue one SQL statement per note.
+"""Starting a learning session must not issue one SQL statement per note.
 
-Both of /learn's per-note walks - graduation.sync_user_card_types and
+Both of the session start's per-note walks - graduation.sync_user_card_types and
 curriculum.introduce_due_forms - used to run `SELECT ... WHERE cards.note_id
 = ?` inside their loop. Measured on this schema before the fix: 50 notes ->
 51 statements, 200 -> 201, 500 -> 501, i.e. linear in the size of the
@@ -146,7 +146,7 @@ async def test_sync_user_card_types_reads_cards_once_whatever_the_note_count(cou
 async def test_sync_user_card_types_reads_cards_once_when_nothing_is_missing(counted, note_count):
     """The ordinary case: every card already exists and the run creates nothing.
 
-    This is what a returning learner's /learn does, and it was the worst of
+    This is what a returning learner's session start does, and it was the worst of
     the two - a full statement per note to conclude there was nothing to do.
     """
     session_factory, counter = counted

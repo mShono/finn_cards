@@ -1,10 +1,12 @@
-"""Minimal OpenAI TTS wrapper for /learn's "listen" button (plan 3.7, phase 2).
+"""Minimal OpenAI TTS wrapper for the reader's 🔊 (reader/speech.py): a
+tapped word and a learning card's example.
 
-Deliberately thin - one async call, mp3 straight from OpenAI, no circuit
-breaker. Async so a slow OpenAI never stalls the bot's event loop, and with
-its own client rather than llm.client.make_client: that one is tuned for
-ingest (long timeout, three retries), while a button the user is waiting on
-gives up after one short retry.
+Deliberately thin - one async call, audio straight from OpenAI, no circuit
+breaker of its own (the reader puts its breaker around it). Async so a slow
+OpenAI never stalls the event loop, and with its own client rather than
+llm.client.make_client: that one is tuned for ingest (long timeout, three
+retries), while a button the user is waiting on gives up after one short
+retry.
 """
 
 from __future__ import annotations

@@ -32,7 +32,7 @@ async def cards_by_note(
 
     Exactly the rows the per-note `WHERE cards.note_id = ?` lookups used to
     return, fetched once: walking N notes cost N SELECTs (measured on this
-    schema: 500 notes -> 501 statements for a single /learn). Joined to
+    schema: 500 notes -> 501 statements for a single session start). Joined to
     `notes` by the very predicate that selects those notes, so the grouping
     covers precisely them and nothing else.
 
@@ -59,7 +59,7 @@ async def ensure_card_types(
     """Create any review-card types `note` has become eligible for.
 
     Safe to call repeatedly (e.g. after every review, or lazily before
-    building a /learn queue) - each type is created at most once per note.
+    building a learning queue) - each type is created at most once per note.
 
     `existing` is this note's cards, for a caller that already holds them -
     see sync_user_card_types, which fetches every note's in one query rather
@@ -161,7 +161,7 @@ async def resync_inflection_cards(
     a lemma whose part of speech turned out to be another one
     (ingest.resolve_note_pos) - rewrites meta.principal_forms wholesale, and
     the cards keyed by the forms that are gone quiz nothing the note still
-    has. learn.render_card falls back to (lemma, lemma) for them, so they
+    has. learn_core.card_view falls back to the bare lemma for them, so they
     are unanswerable, yet they keep their place in the queue, spend the
     daily form budget and hold up the curriculum's level gate.
 
