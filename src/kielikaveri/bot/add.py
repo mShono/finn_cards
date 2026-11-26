@@ -353,7 +353,8 @@ async def _handle_chat_turn(
         except openai.APIError:
             logger.exception("ingest.check_and_suggest failed")
             await message.answer(
-                "OpenAI сейчас недоступен - попробуй позже. /learn при этом работает как обычно."
+                "OpenAI сейчас недоступен - попробуй позже. "
+                "Учить карточки (📚 Учить) при этом можно как обычно."
             )
             return
 

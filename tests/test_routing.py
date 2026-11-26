@@ -101,6 +101,26 @@ async def routed(tmp_path, monkeypatch):
     await engine.dispose()
 
 
+@pytest.fixture
+def legacy_learn_router():
+    """bot/learn.py's router mounted back into the shared Dispatcher, ahead of
+    the core one, for the tests below that still drive its session handlers.
+
+    Production no longer routes it (learning moved to the Mini App, plan
+    2026-11-20-kirjakaveri-reader, П5/У3); the code stays until У4, and so do
+    these tests. aiogram has no public way to detach a router, hence the
+    private attribute.
+    """
+    dp = routed_dispatcher()
+    learn_module.router.parent_router = dp
+    # parent_router appends - move it in front of the core router's 📚 handler
+    dp.sub_routers.remove(learn_module.router)
+    dp.sub_routers.insert(0, learn_module.router)
+    yield
+    dp.sub_routers.remove(learn_module.router)
+    learn_module.router._parent_router = None
+
+
 async def _add_note(session_factory) -> Note:
     async with session_factory() as session:
         deck = await get_or_create_default_deck(session, 1)
@@ -342,6 +362,7 @@ async def _start_review(routed) -> None:
     assert await routed["get_state"]() == LearnStates.reviewing.state
 
 
+@pytest.mark.usefixtures("legacy_learn_router")
 async def test_double_tap_on_the_side_buttons_starts_one_session(routed):
     # Two taps that both land before the first one has finished: aiogram
     # handles updates as concurrent tasks, and the side handler awaits the
@@ -362,6 +383,7 @@ async def test_double_tap_on_the_side_buttons_starts_one_session(routed):
     assert [c.type for c in cards] == [CardType.recognition]  # created once
 
 
+@pytest.mark.usefixtures("legacy_learn_router")
 async def test_double_tap_on_a_deck_button_asks_the_side_once(routed):
     note = await _add_note(routed["session_factory"])
     async with routed["session_factory"]() as session:
@@ -379,6 +401,7 @@ async def test_double_tap_on_a_deck_button_asks_the_side_once(routed):
     assert await routed["get_state"]() == LearnStates.side_choice.state
 
 
+@pytest.mark.usefixtures("legacy_learn_router")
 async def test_double_tap_on_the_debt_buttons_starts_one_session(routed):
     note = await _add_note(routed["session_factory"])
     now = datetime.now(UTC)
@@ -426,6 +449,7 @@ def _hold_card_sync(monkeypatch, holds: int = 1) -> list[tuple[asyncio.Event, as
     return gates
 
 
+@pytest.mark.usefixtures("legacy_learn_router")
 async def test_add_while_the_session_starts_keeps_it_stopped(routed, monkeypatch):
     # The side tap is still syncing cards when /add ends the session; the
     # tap finishing afterwards must not bring the session back.
@@ -446,6 +470,7 @@ async def test_add_while_the_session_starts_keeps_it_stopped(routed, monkeypatch
     assert await routed["get_state"]() is None
 
 
+@pytest.mark.usefixtures("legacy_learn_router")
 async def test_learn_while_the_session_starts_lets_it_start(routed, monkeypatch):
     await _add_note(routed["session_factory"])
     [(entered, release)] = _hold_card_sync(monkeypatch)
@@ -464,6 +489,7 @@ async def test_learn_while_the_session_starts_lets_it_start(routed, monkeypatch)
     assert await routed["get_state"]() == LearnStates.reviewing.state
 
 
+@pytest.mark.usefixtures("legacy_learn_router")
 async def test_an_old_start_leaves_a_newer_one_alone(routed, monkeypatch):
     # The first tap is stopped by /add mid-sync, then /learn and a new tap
     # start over. The old tap, finishing while the new one still syncs,
@@ -490,6 +516,7 @@ async def test_an_old_start_leaves_a_newer_one_alone(routed, monkeypatch):
     assert (await routed["get_data"]())["side"] == "mix"
 
 
+@pytest.mark.usefixtures("legacy_learn_router")
 async def test_old_edit_menu_cancel_leaves_a_review_session_alone(routed):
     await _start_review(routed)
 
@@ -508,6 +535,7 @@ async def test_edit_menu_cancel_still_drops_an_edit_in_progress(routed):
     assert await routed["get_state"]() is None
 
 
+@pytest.mark.usefixtures("legacy_learn_router")
 async def test_decks_button_during_review_keeps_the_session(routed):
     await _start_review(routed)
 
@@ -517,6 +545,7 @@ async def test_decks_button_during_review_keeps_the_session(routed):
     assert await routed["get_state"]() == LearnStates.reviewing.state
 
 
+@pytest.mark.usefixtures("legacy_learn_router")
 async def test_learn_button_during_review_starts_over_with_the_side_question(routed):
     await _start_review(routed)
 
@@ -551,6 +580,7 @@ async def test_add_during_learn_ends_the_session(routed, state, text):
     routed["check"].assert_awaited_once()
 
 
+@pytest.mark.usefixtures("legacy_learn_router")
 async def test_add_with_text_during_review_ends_the_session_before_the_chat(routed):
     routed["check"].return_value = ("Вот", False, [WORD_CANDIDATE], TokenUsage(1, 1, 2))
     await _start_review(routed)
@@ -603,6 +633,7 @@ async def test_plain_text_during_learn_gets_a_hint_not_the_llm(routed, state, da
     assert await routed["get_data"]() == data
 
 
+@pytest.mark.usefixtures("legacy_learn_router")
 async def test_reveal_still_works_after_plain_text_during_review(routed):
     routed["check"].return_value = ("Вот", False, [WORD_CANDIDATE], TokenUsage(1, 1, 2))
     await _start_review(routed)
@@ -641,6 +672,7 @@ async def test_unknown_command_gets_an_answer(routed, text):
     routed["check"].assert_not_awaited()
 
 
+@pytest.mark.usefixtures("legacy_learn_router")
 async def test_unknown_command_during_review_keeps_the_session(routed):
     await _start_review(routed)
 

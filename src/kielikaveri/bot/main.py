@@ -18,7 +18,6 @@ from kielikaveri.bot.decks import router as decks_router
 from kielikaveri.bot.edit import CANCEL_WORDS, EditStates
 from kielikaveri.bot.edit import router as edit_router
 from kielikaveri.bot.handlers import MAIN_KEYBOARD, router
-from kielikaveri.bot.learn import router as learn_router
 from kielikaveri.bot.middleware import (
     InputEscapeMiddleware,
     RequestLoggingMiddleware,
@@ -36,9 +35,9 @@ from kielikaveri.translate.worker import Translator
 
 # Shown behind Telegram's "/" menu button. Kept short - the persistent
 # keyboard (bot/handlers.py's MAIN_KEYBOARD) is the primary way in; /read is
-# the reader's only entry point (see bot/handlers.py's read).
+# the reader's entry point (see bot/handlers.py's read). No /learn: learning
+# lives in the Mini App, reached by the 📚 button (bot/handlers.py's learn_entry).
 BOT_COMMANDS = [
-    BotCommand(command="learn", description="Повторить карточки"),
     BotCommand(command="read", description="📖 Читать"),
     BotCommand(command="add", description="Добавить слова из текста"),
     BotCommand(command="delete", description="Удалить слово"),
@@ -101,8 +100,9 @@ def build_dispatcher(whitelist: set[int]) -> Dispatcher:
     # Before InputEscapeMiddleware - it must see the words before they're dropped
     dp.message.outer_middleware(UnsavedWordsMiddleware(drops_unsaved_words, WORDS_NOT_SAVED_TEXT))
     dp.message.outer_middleware(InputEscapeMiddleware(INPUT_STATES, MENU_TEXTS, CANCEL_WORDS))
+    # bot/learn.py's router is left out on purpose: learning moved to the
+    # Mini App (bot/handlers.py's learn_entry).
     dp.include_router(router)
-    dp.include_router(learn_router)
     dp.include_router(decks_router)
     dp.include_router(edit_router)
     dp.include_router(books_router)

@@ -177,7 +177,7 @@ async def test_chat_reports_openai_unavailable_honestly(session_factory, monkeyp
     await chat_message(message, make_state(), session_factory, make_settings(), make_breaker())
 
     assert "недоступен" in message.answer.call_args.args[0]
-    assert "/learn" in message.answer.call_args.args[0]
+    assert "📚 Учить" in message.answer.call_args.args[0]
 
 
 async def test_chat_falls_back_when_the_llm_returns_an_empty_reply_with_no_candidates(
