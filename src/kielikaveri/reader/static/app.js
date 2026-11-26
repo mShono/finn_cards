@@ -574,7 +574,7 @@ async function showLearn() {
   if (learn.decks.length > 1) {
     showDecks();
   } else {
-    // Like the bot: one deck (or none) needs no choice.
+    // One deck (or none) needs no choice.
     learn.deckId = learn.decks.length === 1 ? learn.decks[0].id : null;
     showSides();
   }
@@ -715,7 +715,7 @@ function cardText(card) {
     return { flag: "🇷🇺", front: card.translation_ru, frontLang: "ru", answer: card.lemma, answerLang: "fi" };
   }
   if (card.type === "inflection") {
-    // A form with no task: the lemma on both sides, as in the bot.
+    // A form with no task: the lemma on both sides.
     if (!card.cue || !card.form_answer) {
       return { flag: "🇫🇮", front: card.lemma, frontLang: "fi", answer: card.lemma, answerLang: "fi" };
     }
