@@ -1,7 +1,11 @@
-"""/read - the reader's entry point in the commands menu - and the menu
-button bot/main.py sets on start."""
+"""/read - the reader's entry point in the commands menu - the menu button
+bot/main.py sets on start, and the 📚 button / typed /learn that now open
+learning in the Mini App (plan 2026-11-20-kirjakaveri-reader, П5/У3)."""
 
+import subprocess
+import sys
 from unittest.mock import AsyncMock
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from aiogram import Bot
@@ -16,8 +20,14 @@ from bot_helpers import (
     tg_text_update,
 )
 
+from kielikaveri.bot.add import WORDS_NOT_SAVED_TEXT, AddStates
 from kielikaveri.bot.decks import DeckStates
-from kielikaveri.bot.handlers import READER_NOT_CONFIGURED_TEXT
+from kielikaveri.bot.handlers import (
+    LEARN_ENTRY_TEXT,
+    READER_NOT_CONFIGURED_TEXT,
+    help_,
+    with_query_param,
+)
 from kielikaveri.bot.main import BOT_COMMANDS, set_up_menu
 from kielikaveri.db.engine import create_all, make_engine, make_session_factory
 
@@ -100,3 +110,92 @@ async def test_startup_sets_commands_menu_button():
     bot.set_chat_menu_button.assert_awaited_once()
     menu_button = bot.set_chat_menu_button.await_args.kwargs["menu_button"]
     assert isinstance(menu_button, MenuButtonCommands)
+
+
+# --- learning entry (📚 Учить, /learn) ------------------------------------------------
+
+
+@pytest.mark.parametrize("text", ["📚 Учить", "/learn"])
+async def test_learn_entry_replies_with_inline_web_app_button_to_the_learn_screen(routed, text):
+    sent = await routed["send"](text)
+
+    assert [m.text for m in sent] == [LEARN_ENTRY_TEXT]
+    assert web_app_urls(sent[0]) == [READER_URL + "?screen=learn"]
+
+
+@pytest.mark.parametrize("text", ["📚 Учить", "/learn"])
+async def test_learn_entry_without_reader_url_says_not_configured(routed, text):
+    sent = await routed["send"](text, reader_url="")
+
+    assert [m.text for m in sent] == [READER_NOT_CONFIGURED_TEXT]
+    assert web_app_urls(sent[0]) == []
+
+
+@pytest.mark.parametrize(
+    "url, expected",
+    [
+        ("https://reader.example/", "https://reader.example/?screen=learn"),
+        ("https://reader.example/app", "https://reader.example/app?screen=learn"),
+        ("https://reader.example/?v=2", "https://reader.example/?v=2&screen=learn"),
+        ("https://reader.example/?screen=books", "https://reader.example/?screen=learn"),
+        ("https://reader.example/#top", "https://reader.example/?screen=learn#top"),
+    ],
+)
+def test_with_query_param_keeps_the_rest_of_the_url(url, expected):
+    assert with_query_param(url, "screen", "learn") == expected
+
+
+async def test_learn_entry_url_keeps_a_query_already_in_reader_url(routed):
+    sent = await routed["send"]("📚 Учить", reader_url="https://reader.example/?v=2")
+
+    (url,) = web_app_urls(sent[0])
+    assert parse_qs(urlsplit(url).query) == {"v": ["2"], "screen": ["learn"]}
+
+
+async def test_learn_entry_drops_an_old_bot_session(routed):
+    # A bot/learn.py session state left from before the move (raw, so this
+    # outlives that module) - only the button now, and the state is gone.
+    await routed["storage"].set_state(routed["key"], "LearnStates:reviewing")
+
+    sent = await routed["send"]("📚 Учить")
+
+    assert web_app_urls(sent[-1]) == [READER_URL + "?screen=learn"]
+    assert await routed["storage"].get_state(routed["key"]) is None
+
+
+async def test_learn_entry_during_deck_pick_warns_and_drops_the_words(routed):
+    # PICKER_BREAKERS still lists 📚/learn: the warning must stay true
+    await routed["storage"].set_state(routed["key"], AddStates.choosing_deck)
+    await routed["storage"].set_data(routed["key"], {"batch_id": "b", "candidates": [{}]})
+
+    sent = await routed["send"]("/learn")
+
+    assert [m.text for m in sent] == [WORDS_NOT_SAVED_TEXT, LEARN_ENTRY_TEXT]
+    assert await routed["storage"].get_state(routed["key"]) is None
+    assert await routed["storage"].get_data(routed["key"]) == {}
+
+
+def test_learn_is_not_in_bot_commands():
+    assert "learn" not in [c.command for c in BOT_COMMANDS]
+
+
+async def test_help_does_not_mention_learn():
+    message = AsyncMock()
+
+    await help_(message)
+
+    assert "/learn" not in message.answer.await_args.args[0]
+
+
+def test_learn_router_is_not_in_the_dispatcher():
+    # A fresh process: the shared test Dispatcher can't be rebuilt (aiogram
+    # attaches a router once), and test_routing.py mounts the learn router
+    # into it for its legacy tests.
+    script = (
+        "from kielikaveri.bot.learn import router\n"
+        "from kielikaveri.bot.main import build_dispatcher\n"
+        "dp = build_dispatcher({1})\n"
+        "assert router.parent_router is None, 'learn router is routed'\n"
+        "assert router not in dp.sub_routers\n"
+    )
+    subprocess.run([sys.executable, "-c", script], check=True)
