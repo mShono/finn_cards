@@ -181,12 +181,16 @@ def session_end_text(reviewed: int, remaining: int, side: LearnSide, continue_hi
     return text
 
 
-async def drop_deleted_head(session: AsyncSession, queue: list[str]) -> list[str]:
+async def drop_deleted_head(
+    session: AsyncSession, queue: list[str], source: str | None = None
+) -> list[str]:
     """The queue without deleted cards at its head. A word deleted
     mid-session (/delete, 🗑 in a deck) leaves its card ids in the session's
-    queue - deleting knows nothing about sessions."""
+    queue - deleting knows nothing about sessions. `source` goes into the
+    log line (the reader's "reader"; the bot's line has none)."""
+    suffix = "" if source is None else f" source={source}"
     while queue and await session.get(Card, queue[0]) is None:
-        logger.info("event=learn.skip_deleted card_id=%s", queue[0])
+        logger.info("event=learn.skip_deleted card_id=%s%s", queue[0], suffix)
         queue = queue[1:]
     return queue
 
@@ -269,9 +273,11 @@ async def record_review(
 async def undo_review(session: AsyncSession, record: ReviewRecord) -> bool:
     """Take `record` back: the card's SRS columns, its `reviews` row, and
     the cards that rating created - those that have no reviews of their
-    own yet. Commits. False when the card is gone (deleted since)."""
+    own yet. Commits. False, changing nothing, when the card is gone
+    (deleted since) or was rated again after `record` (say, in the bot):
+    putting the old columns back would erase that newer answer."""
     card = await session.get(Card, record.card_id)
-    if card is None:
+    if card is None or await _rated_since(session, card, record):
         return False
     record.before.restore(card)
     review = await session.get(Review, record.review_id)
@@ -286,6 +292,15 @@ async def undo_review(session: AsyncSession, record: ReviewRecord) -> bool:
             await session.delete(created)
     await session.commit()
     return True
+
+
+async def _rated_since(session: AsyncSession, card: Card, record: ReviewRecord) -> bool:
+    if card.reps != record.before.reps + 1:
+        return True
+    newer = await session.scalar(
+        select(Review.id).where(Review.card_id == card.id, Review.id > record.review_id).limit(1)
+    )
+    return newer is not None
 
 
 @dataclass(frozen=True)
