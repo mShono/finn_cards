@@ -1,7 +1,7 @@
 // The reader Mini App (plan 2026-11-20-kirjakaveri-reader, "П2"-"П5"):
 // the list of books and chapters, one chapter as paragraphs of word spans, a
 // bottom popup with the tapped word's lookup, 🔊 and ➕, and the learning
-// screens (flashcards rated by swipes).
+// screens (flashcards rated by buttons).
 // No build step. Book and card text is only ever set through textContent.
 "use strict";
 
@@ -122,19 +122,7 @@ function navigate(back) {
   closePopup();
   navigation += 1;
   setPageBack(back);
-  // Only the card screen keeps Telegram's swipe-down-to-close off.
-  verticalSwipes(true);
   return navigation;
-}
-
-// On a card a vertical or diagonal drag must not collapse the Mini App.
-function verticalSwipes(enabled) {
-  const method = enabled ? "enableVerticalSwipes" : "disableVerticalSwipes";
-  try {
-    if (tg && typeof tg[method] === "function") tg[method]();
-  } catch (_) {
-    // Older clients have no such method.
-  }
 }
 
 // "📖 Книги | 📚 Учить" on top of the two root screens.
@@ -540,16 +528,9 @@ const SIDES = [
   ["ru", "🇷🇺 Русский"],
   ["mix", "🔀 Вперемешку"],
 ];
-// FSRS ratings: a swipe left is Again ("Забыл", not Hard: Hard still counts
-// as remembered), a swipe right is Good. Hard and Easy are small buttons.
+// FSRS ratings: "✗ Забыл" is Again (not Hard: Hard still counts as
+// remembered), "✓ Помню" is Good. Hard and Easy are small buttons.
 const RATING = { again: 1, hard: 2, good: 3, easy: 4 };
-// A swipe rates once the card has moved 30% of its width, or on a flick.
-const SWIPE_THRESHOLD = 0.3;
-const FLICK_MIN_PX = 40;
-const FLICK_PX_PER_MS = 0.6;
-// Below this a pointer that went down and up is a tap (a flip), not a drag.
-const DRAG_SLOP_PX = 8;
-const MAX_ROTATE_DEG = 8;
 const SESSION_GONE_TEXT = "Сессия прервалась.";
 
 // deckId: null means all decks. session: the server's id of the session.
@@ -789,15 +770,15 @@ function showCard(data) {
   ui.inner = el("div", { class: "flashcard-inner" }, front, back);
   ui.node = el("div", { class: "flashcard", role: "button", tabindex: "0",
     "aria-label": "Карточка: нажми, чтобы перевернуть" }, ui.inner);
-  ui.zone = el("div", { class: "swipe-zone" },
-    el("div", { class: "underlay", "aria-hidden": "true" },
-      el("span", { class: "label remember" }, "Помню"),
-      el("span", { class: "label forgot" }, "Забыл")),
-    ui.node);
+  // A tap flips; 🔊 on the back is its own button.
+  ui.node.addEventListener("click", (event) => {
+    if (event.target.closest("button")) return;
+    flip(ui);
+  });
 
   const rateButton = (label, rating, cls) => {
     const button = el("button", { type: "button", class: cls }, label);
-    button.addEventListener("click", () => rate(ui, rating, 0));
+    button.addEventListener("click", () => rate(ui, rating));
     ui.buttons.push(button);
     return button;
   };
@@ -816,10 +797,8 @@ function showCard(data) {
     ui.buttons.push(undo);
     nodes.push(undo);
   }
-  nodes.push(ui.zone, ui.hint, ui.rateArea, ui.error);
+  nodes.push(ui.node, ui.hint, ui.rateArea, ui.error);
   show(...nodes);
-  attachSwipe(ui);
-  verticalSwipes(false);
   cardView = ui;
 }
 
@@ -832,104 +811,17 @@ function flip(ui) {
   ui.hint.hidden = true;
 }
 
-// A finished drag: Again to the left, Good to the right, null below the
-// threshold (the card snaps back).
-function swipeRating(dx, width, ms) {
-  const distance = Math.abs(dx);
-  const far = distance >= width * SWIPE_THRESHOLD;
-  const flick = distance >= FLICK_MIN_PX && distance / Math.max(ms, 1) >= FLICK_PX_PER_MS;
-  if (!far && !flick) return null;
-  return dx < 0 ? RATING.again : RATING.good;
-}
-
-// The card follows the finger; the underlay turns red (left, "Забыл") or
-// green (right, "Помню"), more saturated the further the card has gone.
-function follow(ui, dx) {
-  const width = ui.node.offsetWidth || 1;
-  const share = Math.min(1, Math.abs(dx) / (width * SWIPE_THRESHOLD));
-  ui.node.style.transform = `translateX(${dx}px) rotate(${(dx / width) * MAX_ROTATE_DEG}deg)`;
-  ui.zone.style.setProperty("--swipe", share.toFixed(3));
-  ui.zone.classList.toggle("to-left", dx < 0);
-  ui.zone.classList.toggle("to-right", dx > 0);
-}
-
-function snapBack(ui) {
-  ui.node.classList.remove("dragging");
-  ui.node.style.transform = "";
-  ui.zone.style.setProperty("--swipe", "0");
-  ui.zone.classList.remove("to-left", "to-right");
-}
-
-function attachSwipe(ui) {
-  const node = ui.node;
-  let drag = null;
-  node.addEventListener("pointerdown", (event) => {
-    if (drag || ui.busy || event.button > 0 || event.target.closest("button")) return;
-    drag = { id: event.pointerId, x: event.clientX, y: event.clientY, t: event.timeStamp, dx: 0, moving: false };
-    try {
-      node.setPointerCapture(event.pointerId);
-    } catch (_) {
-      // The pointer is already gone.
-    }
-  });
-  node.addEventListener("pointermove", (event) => {
-    if (!drag || event.pointerId !== drag.id) return;
-    const dx = event.clientX - drag.x;
-    if (!drag.moving) {
-      // Before the flip a swipe rates nothing and the card stays put.
-      if (Math.abs(dx) < DRAG_SLOP_PX || !ui.revealed || ui.busy) return;
-      drag.moving = true;
-      node.classList.add("dragging");
-    }
-    drag.dx = dx;
-    follow(ui, dx);
-  });
-  node.addEventListener("pointerup", (event) => {
-    if (!drag || event.pointerId !== drag.id) return;
-    const finished = drag;
-    drag = null;
-    if (!finished.moving) {
-      const still = Math.abs(event.clientX - finished.x) < DRAG_SLOP_PX &&
-        Math.abs(event.clientY - finished.y) < DRAG_SLOP_PX;
-      if (still) flip(ui);
-      return;
-    }
-    const rating = swipeRating(finished.dx, node.offsetWidth || 1, event.timeStamp - finished.t);
-    if (rating === null || ui.busy) snapBack(ui);
-    else rate(ui, rating, finished.dx < 0 ? -1 : 1);
-  });
-  node.addEventListener("pointercancel", (event) => {
-    if (!drag || event.pointerId !== drag.id) return;
-    drag = null;
-    snapBack(ui);
-  });
-}
-
 function setBusy(ui, busy) {
   ui.busy = busy;
   for (const button of ui.buttons) button.disabled = busy;
-  ui.zone.classList.toggle("busy", busy);
-}
-
-function haptic() {
-  try {
-    if (tg && tg.HapticFeedback) tg.HapticFeedback.impactOccurred("medium");
-  } catch (_) {
-    // Older clients have no haptics.
-  }
 }
 
 // One rating per card: busy is set before the request leaves, so a second
-// swipe, key or button press while it is in flight sends nothing.
-function rate(ui, rating, direction) {
+// key or button press while it is in flight sends nothing.
+function rate(ui, rating) {
   if (ui.busy || !ui.revealed || ui !== cardView) return;
   setBusy(ui, true);
-  haptic();
   ui.error.textContent = "";
-  if (direction) {
-    ui.node.classList.remove("dragging");
-    ui.node.style.transform = `translateX(${direction * 120}%) rotate(${direction * MAX_ROTATE_DEG}deg)`;
-  }
   api("api/learn/review", { body: { session: learn.session, card_id: ui.card.id, rating } })
     .then((data) => {
       if (ui.view === navigation) showState(data);
@@ -946,7 +838,6 @@ function rate(ui, rating, direction) {
         showSessionGone();
         return;
       }
-      snapBack(ui);
       setBusy(ui, false);
       ui.error.textContent = errorText(error);
     });
@@ -987,10 +878,10 @@ document.addEventListener("keydown", (event) => {
     flip(ui);
   } else if (event.key === "ArrowLeft" && ui.revealed) {
     event.preventDefault();
-    rate(ui, RATING.again, -1);
+    rate(ui, RATING.again);
   } else if (event.key === "ArrowRight" && ui.revealed) {
     event.preventDefault();
-    rate(ui, RATING.good, 1);
+    rate(ui, RATING.good);
   }
 });
 

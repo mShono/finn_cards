@@ -108,27 +108,11 @@ button.secondary { background: var(--card); color: var(--text); }
   background: transparent; color: var(--link); font-size: 0.9rem;
 }
 
-/* --swipe (0..1, set by app.js) is how far the card has gone towards the
-   rating threshold: the underlay's colour and label grow with it. */
-.swipe-zone { position: relative; margin: 8px 0 12px; --swipe: 0; }
-.underlay {
-  position: absolute; inset: 0; border-radius: 16px;
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 0 20px; font-weight: 600; color: #ffffff;
-}
-.underlay .label { opacity: 0; }
-.to-left .underlay { background: rgba(214, 48, 49, calc(var(--swipe) * 0.9)); }
-.to-right .underlay { background: rgba(39, 174, 96, calc(var(--swipe) * 0.9)); }
-.to-left .underlay .forgot,
-.to-right .underlay .remember { opacity: var(--swipe); }
-
-/* pan-y: vertical scrolling stays the browser's, horizontal moves are ours. */
 .flashcard {
-  position: relative; touch-action: pan-y; cursor: pointer; outline: none;
+  position: relative; margin: 8px 0 12px; cursor: pointer; outline: none;
   user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
-  perspective: 1200px; transition: transform 0.25s ease;
+  perspective: 1200px;
 }
-.flashcard.dragging { transition: none; }
 .flashcard:focus-visible .face { box-shadow: 0 0 0 2px var(--accent); }
 .flashcard-inner {
   position: relative; min-height: 50vh;
@@ -166,5 +150,5 @@ button.secondary { background: var(--card); color: var(--text); }
 .rate .fine { padding: 6px; font-size: 0.9rem; background: var(--card); color: var(--text); }
 
 @media (prefers-reduced-motion: reduce) {
-  .flashcard, .flashcard-inner, .progress-fill { transition: none; }
+  .flashcard-inner, .progress-fill { transition: none; }
 }

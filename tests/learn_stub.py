@@ -7,10 +7,10 @@ database or Telegram: the real static files, under the real CSP, plus fake
                                       [--empty] [--delay 0.6]
 
 then open http://localhost:8099/?screen=learn (a phone-sized window in the
-browser's dev tools gives touch events for swipes). The page loads a fake
+browser's dev tools shows the phone layout). The page loads a fake
 telegram-web-app.js: initData is "stub", the BackButton is a floating
-"← Back" button, haptics go to the console. Every API call is printed, so a
-fast double swipe can be seen to send one review. GET /stub/drop forgets the
+"← Back" button. Every API call is printed, so a fast double press can be
+seen to send one review. GET /stub/drop forgets the
 session: the next rating answers 409 session_gone. /api/learn/review waits
 --delay seconds, so the in-flight guard has time to matter.
 
@@ -68,9 +68,6 @@ FAKE_TELEGRAM_JS = """\
         offClick(fn) { handlers = handlers.filter((h) => h !== fn); },
         show() { backButton().hidden = false; },
         hide() { if (button) button.hidden = true; },
-      },
-      HapticFeedback: {
-        impactOccurred(style) { console.log("haptic", style); },
       },
     },
   };

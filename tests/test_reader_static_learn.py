@@ -1,8 +1,8 @@
 """Static checks on the reader's learning screens (plan
 2026-11-20-kirjakaveri-reader, "П5", stage У2): the /api/learn/* calls, card
-text through textContent only, ?screen=learn, the swipe's thresholds and
-ratings, the in-flight guard, the 409 paths. And the test-side stub server
-(tests/learn_stub.py) answers in the contract's shapes."""
+text through textContent only, ?screen=learn, the rating buttons and keys
+(no swipes since У5), the in-flight guard, the 409 paths. And the test-side
+stub server (tests/learn_stub.py) answers in the contract's shapes."""
 
 import re
 
@@ -142,17 +142,33 @@ def test_back_button_steps():
     assert "navigate(learn.decks.length > 1 ? showDecks : null)" in _function("showSides")
 
 
-# --- swipe --------------------------------------------------------------------
+# --- rating: buttons and keys, no swipes (У5) --------------------------------
 
 
-def test_swipe_constants_and_ratings():
-    assert _const("SWIPE_THRESHOLD") == "0.3"
+def test_ratings():
     assert re.search(r"again: 1, hard: 2, good: 3, easy: 4", _const("RATING"))
-    body = _function("swipeRating")
-    assert "width * SWIPE_THRESHOLD" in body
-    assert "FLICK_PX_PER_MS" in body
-    assert "return dx < 0 ? RATING.again : RATING.good;" in body
-    assert "return null" in body
+
+
+def test_no_swipe_code_left():
+    js = APP_JS.lower()
+    for marker in (
+        "pointerdown",
+        "pointermove",
+        "pointerup",
+        "pointercancel",
+        "setpointercapture",
+        "swipe",
+        "drag",
+        "flick",
+        "translatex",
+        "hapticfeedback",
+        "verticalswipes",
+        "underlay",
+    ):
+        assert marker not in js, marker
+    css = STYLE_CSS.lower()
+    for marker in ("--swipe", "swipe", "touch-action", "pan-y", "underlay", "dragging", "to-left"):
+        assert marker not in css, marker
 
 
 def test_buttons_under_the_card():
@@ -166,26 +182,13 @@ def test_buttons_under_the_card():
     assert "ui.rateArea.hidden = false" in _function("flip")
 
 
-def test_swipe_only_after_flip_and_tap_flips():
-    body = _function("attachSwipe")
-    for event in ("pointerdown", "pointermove", "pointerup", "pointercancel"):
-        assert f'"{event}"' in body, event
-    assert "!ui.revealed" in body
-    assert "flip(ui)" in body
-    assert "snapBack(ui)" in body
-    assert "rate(ui, rating" in body
+def test_tap_flips_with_a_plain_click():
+    body = _function("showCard")
+    click = body.split('ui.node.addEventListener("click"', 1)[1].split("});", 1)[0]
+    # 🔊 on the back does not flip the card.
+    assert 'event.target.closest("button")' in click
+    assert "flip(ui)" in click
     assert "!ui.revealed" in _function("rate")
-
-
-def test_card_follows_the_finger_and_underlay_colours():
-    body = _function("follow")
-    assert "translateX(" in body and "rotate(" in body
-    assert '"--swipe"' in body
-    assert '"to-left"' in body and '"to-right"' in body
-    assert "Забыл" in APP_JS and "Помню" in APP_JS
-    assert "touch-action: pan-y" in STYLE_CSS
-    assert ".to-left .underlay" in STYLE_CSS and ".to-right .underlay" in STYLE_CSS
-    assert "var(--swipe)" in STYLE_CSS
 
 
 def test_flip_animation_respects_reduced_motion():
@@ -194,11 +197,11 @@ def test_flip_animation_respects_reduced_motion():
     assert ".flashcard-inner" in reduced and "transition: none" in reduced
 
 
-def test_keyboard_and_haptics():
+def test_keyboard():
     assert '"ArrowLeft"' in APP_JS and '"ArrowRight"' in APP_JS and 'event.key === " "' in APP_JS
-    assert "rate(ui, RATING.again, -1)" in APP_JS and "rate(ui, RATING.good, 1)" in APP_JS
-    assert "HapticFeedback" in _function("haptic")
-    assert "haptic()" in _function("rate")
+    assert "rate(ui, RATING.again)" in APP_JS and "rate(ui, RATING.good)" in APP_JS
+    keys = APP_JS.split('document.addEventListener("keydown"', 1)[1].split("\n});\n", 1)[0]
+    assert "flip(ui)" in keys
 
 
 # --- in-flight guard and 409 --------------------------------------------------
@@ -210,10 +213,10 @@ def test_one_rating_request_in_flight():
     busy = body.index("setBusy(ui, true)")
     call = body.index('api("api/learn/review"')
     # The guard and the busy flag come before the request leaves, with no
-    # await in between: a second swipe in the same tick already sees busy.
+    # await in between: a second press in the same tick already sees busy.
     assert guard < busy < call
     assert "await" not in body
-    assert "ui.busy" in _function("attachSwipe")
+    assert "ui.busy" in _function("flip")
     assert "button.disabled = busy" in _function("setBusy")
     # Undo shares the card's guard.
     assert "ui.busy" in _function("undoLast")
@@ -360,13 +363,3 @@ def test_long_faces_scroll_in_full_and_hidden_face_takes_no_taps():
         r"\.flashcard-inner\.flipped \.face\.front \{ pointer-events: none; \}",
         STYLE_CSS,
     )
-
-
-def test_vertical_swipes_off_only_on_the_card():
-    swipes = _function("verticalSwipes")
-    assert '"enableVerticalSwipes"' in swipes and '"disableVerticalSwipes"' in swipes
-    assert 'typeof tg[method] === "function"' in swipes
-    # Every screen change turns them back on; the card turns them off.
-    assert "verticalSwipes(true)" in _function("navigate")
-    card = _function("showCard")
-    assert card.index("navigate(showSides)") < card.index("verticalSwipes(false)")
