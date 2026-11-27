@@ -28,10 +28,13 @@ from kielikaveri.bot.add import (
 )
 from kielikaveri.bot.decks import DeckStates
 from kielikaveri.bot.edit import EditStates
+from kielikaveri.bot.handlers import DECKS_ENTRY_TEXT, DELETE_ENTRY_TEXT
 from kielikaveri.db.decks import get_or_create_default_deck
 from kielikaveri.db.engine import create_all, make_engine, make_session_factory
 from kielikaveri.db.models import Deck, Note, NoteKind
 from kielikaveri.ingest import TokenUsage
+
+READER_URL = "https://reader.example/"
 
 
 @pytest.fixture
@@ -56,7 +59,7 @@ async def routed(tmp_path, monkeypatch):
     await dp.storage.set_data(key, {})
     context = {
         "session_factory": session_factory,
-        "settings": make_settings(),
+        "settings": make_settings(reader_url=READER_URL),
         "breaker": make_breaker(),
     }
 
@@ -125,13 +128,15 @@ async def _deck_names(session_factory) -> list[str]:
         return list((await session.scalars(select(Deck.name))).all())
 
 
-# --- EditStates.awaiting_value ------------------------------------------------------
+# --- EditStates.awaiting_value (the old card edit, no longer routed) --------------
+# Its own handler is gone from the Dispatcher (edits are in the reader), but
+# the state is still an input state - navigation drops it.
 
 
 @pytest.mark.parametrize(
     "field, text, expected_reply",
     [
-        ("translation_ru", "/delete hakea", "Что удалить?"),
+        ("translation_ru", "/delete hakea", DELETE_ENTRY_TEXT),
         ("translation_ru", "/add", "Просто напиши мне текст"),
         ("lemma", "/add", "Просто напиши мне текст"),
         ("translation_ru", "💬 Добавить", "Просто напиши мне текст"),
@@ -158,25 +163,13 @@ async def test_decks_button_during_card_edit_drops_the_edit(routed):
     )
 
     replies = await routed["send"]("🗂 Колоды")
-    assert replies[0].startswith("Твои колоды:")
+    assert replies == [DECKS_ENTRY_TEXT]
     assert await routed["get_state"]() is None
 
     # The next word is chat again, not the card's new translation
     await routed["send"]("talo")
     routed["check"].assert_awaited_once()
     assert (await _note(routed["session_factory"])).translation_ru == "искать"
-
-
-@pytest.mark.parametrize("text", ["/cancel", "отмена"])
-async def test_cancel_during_card_edit_still_cancels(routed, text):
-    await _add_note(routed["session_factory"])
-    await routed["set_state"](
-        EditStates.awaiting_value, {"note_id": "n1", "field": "translation_ru"}
-    )
-
-    assert await routed["send"](text) == ["Отменено."]
-    assert (await _note(routed["session_factory"])).translation_ru == "искать"
-    assert await routed["get_state"]() is None
 
 
 # --- AddStates.naming_new_deck ------------------------------------------------------
@@ -220,25 +213,11 @@ async def test_plain_name_during_deck_naming_still_creates_the_deck(routed):
     assert await _deck_names(routed["session_factory"]) == ["Из книги"]
 
 
-@pytest.mark.parametrize(
-    "state, data, tap_data, cancelled_reply",
-    [
-        (
-            AddStates.choosing_deck,
-            NAMING_DATA,
-            "addnewdeck:abc123",
-            "Отменено, слова не сохранила. Чтобы сохранить, пришли текст ещё раз.",
-        ),
-        (None, None, "decks:new", "Отменено."),
-    ],
-    ids=["add-picker", "decks-screen"],
-)
-async def test_new_deck_prompt_names_a_word_that_cancels_it(
-    routed, state, data, tap_data, cancelled_reply
-):
-    await routed["set_state"](state, data)
+async def test_new_deck_prompt_names_a_word_that_cancels_it(routed):
+    await routed["set_state"](AddStates.choosing_deck, NAMING_DATA)
+    cancelled_reply = "Отменено, слова не сохранила. Чтобы сохранить, пришли текст ещё раз."
 
-    (prompt,) = await routed["tap"](tap_data)
+    (prompt,) = await routed["tap"]("addnewdeck:abc123")
     # The cancel was invisible: the prompt only asked for a name
     (offered,) = re.findall(r"«(.+?)»", prompt)
 
@@ -247,7 +226,9 @@ async def test_new_deck_prompt_names_a_word_that_cancels_it(
     assert await routed["get_state"]() is None
 
 
-# --- DeckStates.naming (🗂 Колоды → ➕) ---------------------------------------------
+# --- DeckStates.naming (the old 🗂 Колоды → ➕, no longer routed) ------------------
+# Its own handler is gone from the Dispatcher (decks are in the reader), but
+# the state is still an input state - navigation drops it.
 
 
 @pytest.mark.parametrize(
@@ -255,7 +236,7 @@ async def test_new_deck_prompt_names_a_word_that_cancels_it(
     [
         ("/add", "Просто напиши мне текст"),
         ("💬 Добавить", "Просто напиши мне текст"),
-        ("/delete hakea", "Не нашла такое слово."),
+        ("/delete hakea", DELETE_ENTRY_TEXT),
     ],
 )
 async def test_command_during_decks_naming_runs_the_command_and_creates_no_deck(
@@ -268,23 +249,6 @@ async def test_command_during_decks_naming_runs_the_command_and_creates_no_deck(
     assert replies[0].startswith(expected_reply)
     assert await routed["get_state"]() is None
     assert await _deck_names(routed["session_factory"]) == []
-
-
-@pytest.mark.parametrize("text", ["/cancel", "отмена", "Отмена"])
-async def test_cancel_during_decks_naming_creates_no_deck(routed, text):
-    await routed["set_state"](DeckStates.naming)
-
-    assert await routed["send"](text) == ["Отменено."]
-    assert await _deck_names(routed["session_factory"]) == []
-    assert await routed["get_state"]() is None
-
-
-async def test_plain_name_during_decks_naming_still_creates_the_deck(routed):
-    await routed["set_state"](DeckStates.naming)
-
-    assert await routed["send"]("Из книги") == ["Колода «Из книги» создана."]
-    assert await _deck_names(routed["session_factory"]) == ["Из книги"]
-    assert await routed["get_state"]() is None
 
 
 # --- AddStates.awaiting_instruction (clarifying question) ---------------------------
@@ -324,16 +288,6 @@ async def test_old_edit_menu_cancel_leaves_a_deck_pick_alone(routed):
 
     assert await routed["get_state"]() == AddStates.choosing_deck.state
     assert await routed["get_data"]() == NAMING_DATA
-
-
-async def test_edit_menu_cancel_still_drops_an_edit_in_progress(routed):
-    await routed["set_state"](
-        EditStates.awaiting_value, {"note_id": "n1", "field": "translation_ru"}
-    )
-
-    await routed["tap"]("noteeditcancel")
-
-    assert await routed["get_state"]() is None
 
 
 async def test_add_button_only_prompts(routed):

@@ -22,7 +22,7 @@ router = Router(name="core")
 # Persistent menu (plan: no more hunting for /start or remembering command
 # names) - sent once on /start and stays until Telegram clears it. Button
 # labels double as message text the other routers match on directly (see
-# learn_entry below, bot/decks.py, bot/add.py, bot/main.py's PICKER_BREAKERS)
+# learn_entry and decks_entry below, bot/add.py, bot/main.py's PICKER_BREAKERS)
 # - keep them in sync if these change.
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
@@ -52,9 +52,8 @@ async def help_(message: Message) -> None:
         "/start - поздороваться\n"
         "/help - эта справка\n"
         "/read - открыть читалку книг\n"
-        "/decks - список колод, создать новую, посмотреть и поправить карточки\n"
-        "/add <текст> - то же самое, что просто написать текст в чат\n"
-        "/delete <слово> - удалить слово из колоды\n\n"
+        "/decks - колоды в читалке: слова, правка, перенос, удаление, поиск\n"
+        "/add <текст> - то же самое, что просто написать текст в чат\n\n"
         "Пришли книгу файлом .txt - переведу её на финский по главам."
     )
 
@@ -62,6 +61,9 @@ async def help_(message: Message) -> None:
 READER_NOT_CONFIGURED_TEXT = "Читалка не настроена."
 LEARN_ENTRY_TEXT = "Карточки теперь учатся в читалке:"
 LEARN_MOVED_TEXT = "Учёба теперь в читалке: 📚 Учить"
+DECKS_ENTRY_TEXT = "Колоды теперь в читалке:"
+DELETE_ENTRY_TEXT = "Слова теперь удаляются в читалке: найди слово поиском и нажми 🗑."
+DECKS_MOVED_TEXT = "Колоды теперь в читалке: 🗂 Колоды"
 
 
 def _web_app_markup(text: str, url: str) -> InlineKeyboardMarkup:
@@ -114,3 +116,41 @@ async def learn_entry(message: Message, state: FSMContext, settings: Settings) -
 @router.callback_query(F.data.startswith("learn:"))
 async def old_learn_button(callback: CallbackQuery) -> None:
     await callback.answer(LEARN_MOVED_TEXT)
+
+
+# Decks live in the Mini App too (plan 2026-11-20-kirjakaveri-reader, П6/К3):
+# the menu button and /decks only hand out the button that opens them.
+@router.message(Command("decks"))
+@router.message(F.text == "🗂 Колоды")
+async def decks_entry(message: Message, settings: Settings) -> None:
+    # State left as is, unlike learn_entry: an /add deck pick survives a look
+    # at the decks (bot/main.py's PICKER_BREAKERS) - its buttons still work
+    # after. A pending input (a new deck's name) is already dropped by
+    # InputEscapeMiddleware, with UnsavedWordsMiddleware's warning first.
+    if not settings.reader_url:
+        await message.answer(READER_NOT_CONFIGURED_TEXT)
+        return
+    url = with_query_param(settings.reader_url, "screen", "decks")
+    await message.answer(DECKS_ENTRY_TEXT, reply_markup=_web_app_markup("🗂 Колоды", url))
+
+
+# Out of the commands menu, but a typed /delete (with a word or without)
+# still gets an answer: the reader's search, where 🗑 is. Here, in the core
+# router, so it wins over bot/add.py's delete_command.
+@router.message(Command("delete"))
+async def delete_entry(message: Message, settings: Settings) -> None:
+    if not settings.reader_url:
+        await message.answer(READER_NOT_CONFIGURED_TEXT)
+        return
+    url = with_query_param(settings.reader_url, "screen", "search")
+    await message.answer(DELETE_ENTRY_TEXT, reply_markup=_web_app_markup("🔎 Найти слово", url))
+
+
+# The old deck screens' buttons (bot/decks.py, bot/edit.py, /delete's list)
+# in the chat history - answered like old_learn_button. Not the /add picker's
+# adddeck:/addnewdeck:, which bot/add.py still handles.
+@router.callback_query(F.data.startswith("decks:"))
+@router.callback_query(F.data.startswith("noteedit"))
+@router.callback_query(F.data.startswith("delnote:"))
+async def old_decks_button(callback: CallbackQuery) -> None:
+    await callback.answer(DECKS_MOVED_TEXT)
