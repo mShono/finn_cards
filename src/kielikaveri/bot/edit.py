@@ -20,16 +20,21 @@ from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
-from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from kielikaveri.config import Settings
-from kielikaveri.db.models import Note, NoteKind, is_note_duplicate_error
-from kielikaveri.ingest import canonical_key, resolve_note_forms
+from kielikaveri.db.models import Note
+from kielikaveri.decks_core import (
+    DuplicateNoteError,
+    find_lemma_clash,
+    needs_forms,
+    save_lemma,
+    set_translation,
+    settle_lemma,
+)
+from kielikaveri.ingest import resolve_note_forms
 from kielikaveri.llm.breaker import CallBreaker, CircuitOpenError
 from kielikaveri.llm.client import make_client
-from kielikaveri.srs.graduation import resync_inflection_cards
 
 logger = logging.getLogger(__name__)
 
@@ -150,11 +155,13 @@ async def note_edit_apply(
         return
 
     if field == "translation_ru":
-        old = note.translation_ru
         async with session_factory() as session:
-            note = await session.get(Note, note_id)
-            note.translation_ru = value
-            await session.commit()
+            edited = await set_translation(session, message.from_user.id, note_id, value)
+        if edited is None:
+            logger.debug("event=edit.not_found note_id=%s", note_id)
+            await message.answer("Не нашла эту карточку - её уже удалили.")
+            return
+        note, old = edited
         logger.info(
             "event=edit.save note_id=%s field=translation_ru lemma=%s old=%r new=%r",
             note_id,
@@ -180,28 +187,10 @@ async def _apply_lemma_edit(
     note: Note,
     raw_value: str,
 ) -> None:
-    # canonical_key() lemmatizes the same way /add's dedup does (kind=pattern
-    # has pos=None and is returned unchanged - a pattern's "lemma" is the
-    # construction string itself, not something the FST can resolve).
-    new_lemma, _pos = canonical_key(raw_value, note.pos)
+    new_lemma = settle_lemma(note, raw_value)
 
-    # Deck-scoped, same as /add's dedup and uq_notes_user_deck_lemma_pos: the
-    # same word in another deck is allowed (requested 03.09.2026), so /edit
-    # must not refuse a rename /add would have let through.
     async with session_factory() as session:
-        pos_filter = Note.pos.is_(None) if note.pos is None else Note.pos == note.pos
-        deck_filter = (
-            Note.deck_id.is_(None) if note.deck_id is None else Note.deck_id == note.deck_id
-        )
-        clash = await session.scalar(
-            select(Note).where(
-                Note.user_id == message.from_user.id,
-                Note.lemma == new_lemma,
-                pos_filter,
-                deck_filter,
-                Note.id != note.id,
-            )
-        )
+        clash = await find_lemma_clash(session, note, new_lemma)
     if clash is not None:
         logger.debug(
             "event=edit.lemma_clash note_id=%s new_lemma=%s clash_note_id=%s",
@@ -214,7 +203,7 @@ async def _apply_lemma_edit(
 
     old_lemma = note.lemma
     resolved = None
-    if note.kind == NoteKind.word and note.pos is not None:
+    if needs_forms(note):
         client = make_client(settings.openai_api_key, settings.openai_timeout_seconds)
         try:
             resolved, _usage = await resolve_note_forms(
@@ -242,48 +231,19 @@ async def _apply_lemma_edit(
     note_id = note.id
 
     async with session_factory() as session:
-        note = await session.get(Note, note_id)
-        note.lemma = new_lemma
-        if resolved is not None:
-            new_meta = dict(note.meta)
-            new_meta["principal_forms"] = resolved.principal_forms
-            new_meta["forms_source"] = resolved.forms_source
-            new_meta["forms_verified"] = resolved.forms_verified
-            note.meta = new_meta
-            # The new lemma can belong to a different part of speech than the
-            # old one did (ingest.resolve_note_pos) - the forms above were
-            # generated for resolved.pos, so the note has to agree with them.
-            if resolved.pos is not None:
-                note.pos = resolved.pos
-        elif new_lemma != old_lemma:
-            # Forms weren't recomputed (breaker/OpenAI) - the old lemma's forms,
-            # still marked verified, would be quizzed as the new lemma's. Drop
-            # them: no forms is honest, wrong ones are not.
-            note.meta = {
-                key: value
-                for key, value in note.meta.items()
-                if key not in ("principal_forms", "forms_source", "forms_verified")
-            }
         try:
-            # The form set above can be another one than the cards on this
-            # note were built from - a different lemma, a different POS, or
-            # none at all when the recompute failed. Inside the try, and
-            # before the commit, on purpose: the SELECT it starts flushes the
-            # lemma written above, so a lost duplicate race still surfaces as
-            # the IntegrityError below, and its rollback then takes the card
-            # changes with it.
-            deleted, created = await resync_inflection_cards(session, note, datetime.now(UTC))
-            await session.commit()
-        except IntegrityError as error:
+            saved = await save_lemma(session, note_id, new_lemma, resolved, datetime.now(UTC))
+        except DuplicateNoteError:
             # The clash lookup above said this lemma was free, but a
             # concurrent /add or /edit took it in the meantime. Same answer as
             # the lookup's, just later - and the note keeps its old lemma.
-            if not is_note_duplicate_error(error):
-                raise
-            await session.rollback()
             logger.info("event=edit.lemma_clash_race note_id=%s new_lemma=%s", note_id, new_lemma)
             await message.answer(_clash_reply(new_lemma))
             return
+    if saved is None:
+        logger.debug("event=edit.not_found note_id=%s", note_id)
+        await message.answer("Не нашла эту карточку - её уже удалили.")
+        return
 
     logger.info(
         "event=edit.save note_id=%s field=lemma old=%r new=%r forms_source=%s "
@@ -292,7 +252,7 @@ async def _apply_lemma_edit(
         old_lemma,
         new_lemma,
         resolved.forms_source if resolved is not None else "unchanged",
-        len(deleted),
-        len(created),
+        saved.cards_deleted,
+        saved.cards_created,
     )
     await message.answer(f"Слово: «{old_lemma}» → «{new_lemma}».")

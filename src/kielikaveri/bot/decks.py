@@ -20,12 +20,17 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
-from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from kielikaveri.bot.edit import CANCEL_WORDS
-from kielikaveri.db.decks import create_deck, get_or_create_default_deck, list_decks
 from kielikaveri.db.models import Deck, Note
+from kielikaveri.decks_core import (
+    count_deck_notes,
+    deck_notes,
+    deck_summaries,
+    new_deck,
+    own_deck,
+)
 from kielikaveri.srs.queue import card_counters
 
 logger = logging.getLogger(__name__)
@@ -88,22 +93,11 @@ async def _decks_list_text_and_keyboard(
     session_factory: async_sessionmaker[AsyncSession], user_id: int, now: datetime
 ) -> tuple[str, InlineKeyboardMarkup]:
     async with session_factory() as session:
-        # Default deck first - it may get created here, and list_decks() must
-        # see it (a fresh user with zero decks would otherwise get an empty
-        # "Колод пока нет." list).
-        await get_or_create_default_deck(session, user_id)
-        await session.commit()
-        decks = await list_decks(session, user_id)
-
-        lines = []
-        for deck in decks:
-            notes_count = await session.scalar(
-                select(func.count())
-                .select_from(Note)
-                .where(Note.deck_id == deck.id, Note.user_id == user_id)
-            )
-            counters = await card_counters(session, user_id, now, deck_id=deck.id)
-            lines.append(f"• {deck.name} - слов: {notes_count}, к повторению: {counters.due}")
+        summaries = await deck_summaries(session, user_id, now)
+    decks = [summary.deck for summary in summaries]
+    lines = [
+        f"• {s.deck.name} - слов: {s.notes}, к повторению: {s.counters.due}" for s in summaries
+    ]
 
     text = "Твои колоды:\n" + "\n".join(lines) if lines else "Колод пока нет."
     return text, _decks_keyboard(decks)
@@ -140,35 +134,16 @@ async def decks_open(
     logger.debug("event=decks.open deck_id=%s page=%s", deck_id, page)
 
     async with session_factory() as session:
-        deck = await session.get(Deck, deck_id)
-        if deck is None or deck.user_id != user_id:
+        deck = await own_deck(session, user_id, deck_id)
+        if deck is None:
             logger.debug("event=decks.not_found deck_id=%s", deck_id)
             await callback.answer("Не нашла колоду.", show_alert=True)
             return
 
-        total = (
-            await session.scalar(
-                select(func.count())
-                .select_from(Note)
-                .where(Note.deck_id == deck_id, Note.user_id == user_id)
-            )
-            or 0
-        )
+        total = await count_deck_notes(session, user_id, deck_id)
         pages = max(1, ceil(total / NOTES_PER_PAGE))
         page = min(page, pages - 1)
-        notes = list(
-            (
-                await session.scalars(
-                    # Newest first: a freshly added word is the one you most
-                    # often come back to fix.
-                    select(Note)
-                    .where(Note.deck_id == deck_id, Note.user_id == user_id)
-                    .order_by(Note.created_at.desc())
-                    .offset(page * NOTES_PER_PAGE)
-                    .limit(NOTES_PER_PAGE)
-                )
-            ).all()
-        )
+        notes = await deck_notes(session, user_id, deck_id, page * NOTES_PER_PAGE, NOTES_PER_PAGE)
         counters = await card_counters(session, user_id, now, deck_id=deck_id)
 
     lines = [
@@ -224,8 +199,7 @@ async def decks_new_save(
 
     user_id = message.from_user.id
     async with session_factory() as session:
-        deck = await create_deck(session, user_id, name)
-        await session.commit()
+        deck = await new_deck(session, user_id, name)
 
     logger.info("event=decks.create deck_id=%s name=%r", deck.id, deck.name)
     await state.clear()

@@ -34,7 +34,7 @@ from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
-from sqlalchemy import delete, func, select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -50,12 +50,8 @@ from kielikaveri.cards_save import (
 )
 from kielikaveri.config import Settings
 from kielikaveri.db.decks import create_deck, get_or_create_default_deck, list_decks
-from kielikaveri.db.models import (
-    Card,
-    Deck,
-    Note,
-    Review,
-)
+from kielikaveri.db.models import Deck, Note
+from kielikaveri.decks_core import delete_note
 from kielikaveri.ingest import (
     build_chat_input,
     check_and_suggest,
@@ -162,49 +158,17 @@ async def delete_confirm(
 ) -> None:
     note_id = callback.data.split(":", 1)[1]
     async with session_factory() as session:
-        note = await session.get(Note, note_id)
-        if note is None or note.user_id != callback.from_user.id:
-            await callback.answer("Уже удалено.", show_alert=True)
-            return
+        # A double tap deletes once: the loser finds nothing (None) -
+        # decks_core.delete_note guards on the DELETE's rowcount.
+        deleted = await delete_note(session, callback.from_user.id, note_id)
+    if deleted is None:
+        await callback.answer("Уже удалено.", show_alert=True)
+        return
 
-        lemma = note.lemma
-        deck_id = note.deck_id
-        deck = await session.get(Deck, deck_id) if deck_id else None
-        deck_name = deck.name if deck else "без колоды"
-
-        # Two callback_query updates for one genuine double-tap both pass the
-        # None-check above (neither has committed yet) - same race class as
-        # ingest_cache. There's no FSM state to claim ahead of the first await
-        # here (the note to delete isn't known until session.get() itself
-        # returns), so the note DELETE's rowcount is the guard instead:
-        # only the invocation that actually removed the row may report success.
-        #
-        # Children first: there is no ON DELETE CASCADE (db/models.py) and
-        # PRAGMA foreign_keys is on (db/engine.py), so a note with cards, or a
-        # card with reviews, cannot be deleted before them. SQLite serializes
-        # the writes, so the loser of a double tap runs these after the
-        # winner's commit, finds nothing left and rolls back.
-        card_ids = select(Card.id).where(Card.note_id == note.id)
-        await session.execute(delete(Review).where(Review.card_id.in_(card_ids)))
-        await session.execute(delete(Card).where(Card.note_id == note.id))
-        result = await session.execute(delete(Note).where(Note.id == note.id))
-        if result.rowcount == 0:
-            await session.rollback()
-            await callback.answer("Уже удалено.", show_alert=True)
-            return
-        await session.commit()
-
-        count = 0
-        if deck_id is not None:
-            count = await session.scalar(
-                select(func.count())
-                .select_from(Note)
-                .where(Note.deck_id == deck_id, Note.user_id == callback.from_user.id)
-            )
-
+    deck_name = "без колоды" if deleted.deck_name is None else deleted.deck_name
     await callback.answer()
     await callback.message.answer(
-        f"Удалила «{lemma}» из колоды «{deck_name}». Осталось {count} слов."
+        f"Удалила «{deleted.lemma}» из колоды «{deck_name}». Осталось {deleted.remaining} слов."
     )
 
 

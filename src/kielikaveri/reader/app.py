@@ -19,6 +19,10 @@ connection up in the background (reader/warmup.py).
 
 П5 adds 📚 learning under /api/learn/ (reader/learn.py): decks, start,
 debt, review, undo and tts - the session's queue on the server.
+
+П6 adds 🗂 decks (reader/decks.py): /api/decks - the list, a new deck,
+renaming and deleting one, its words page by page - and /api/notes - the
+search, a word's screen, its edits, moving it, deleting it and its 🔊.
 """
 
 from __future__ import annotations
@@ -45,7 +49,7 @@ from kielikaveri.learn_core import LearnSide
 from kielikaveri.llm.breaker import BudgetExceededError, CallBreaker, CircuitOpenError
 from kielikaveri.llm.client import make_client
 from kielikaveri.logging_context import new_trace_id, trace_id_var
-from kielikaveri.reader import learn
+from kielikaveri.reader import decks, learn
 from kielikaveri.reader.auth import AuthError, user_id_from_header
 from kielikaveri.reader.cards import add_card, in_chapter_deck
 from kielikaveri.reader.lookup import (
@@ -91,6 +95,8 @@ CARD_LOCKS = web.AppKey("card_locks", KeyedLocks)
 # every learn call takes.
 LEARN_SESSIONS = web.AppKey("learn_sessions", dict)
 LEARN_LOCKS = web.AppKey("learn_locks", KeyedLocks)
+# 🗂 decks (reader/decks.py): one lock per note and per deck, keyed apart.
+DECK_LOCKS = web.AppKey("deck_locks", KeyedLocks)
 # The time of the reader's OpenAI calls and the connection's warm-up.
 WARMUP = web.AppKey("warmup", Warmup)
 USER_ID = web.RequestKey("user_id", int)
@@ -418,6 +424,7 @@ async def save_word(request: web.Request) -> web.Response:
             app[SETTINGS].openai_text_model,
             app[LOOKUP_LOCKS],
             app[CARD_LOCKS],
+            app[DECK_LOCKS],
             app[WARMUP],
             request[USER_ID],
             chapter,
@@ -624,6 +631,215 @@ async def learn_tts(request: web.Request) -> web.Response:
     return web.Response(body=audio, content_type="audio/wav")
 
 
+# --- 🗂 decks (reader/decks.py) -------------------------------------------------------
+
+
+async def _decks_call(event: str, ids: str, call: Awaitable[dict | None]) -> web.Response:
+    """A decks call's answer (None - 204), its errors as the plan says: 404
+    for what isn't the user's, 409 and 422 with a reason, the lookup's
+    503/502 for OpenAI. Anything else is logged by class only - a
+    traceback of an IntegrityError would quote the word - and is a 500."""
+    try:
+        body = await call
+    except web.HTTPException:
+        raise
+    except decks.NotFoundError:
+        raise web.HTTPNotFound() from None
+    except decks.ConflictError as exc:
+        return _conflict(exc.reason, exc.payload)
+    except decks.BadNameError:
+        return web.json_response({"reason": "bad_name"}, status=422)
+    except decks.NoOpenAIError:
+        return web.json_response({"reason": "no_openai"}, status=503)
+    except (CircuitOpenError, OpenAIError) as exc:
+        return _call_failed(event, ids, exc)
+    except Exception as exc:  # noqa: BLE001 - logged by class, then 500
+        logger.error("event=%s %s error=%s", event, ids, type(exc).__name__)
+        raise web.HTTPInternalServerError() from None
+    if body is None:
+        return web.Response(status=204)
+    return web.json_response(body)
+
+
+def _name(body: dict) -> str:
+    """A deck's name as sent: not a string - 400; its length is checked by
+    reader/decks.py (422 bad_name)."""
+    name = body.get("name")
+    if not isinstance(name, str):
+        raise web.HTTPBadRequest()
+    return name
+
+
+def _query_int(request: web.Request, name: str, default: int) -> int:
+    value = request.query.get(name)
+    if value is None:
+        return default
+    if not value.isascii() or not value.isdigit():
+        raise web.HTTPBadRequest()
+    return int(value)
+
+
+async def decks_list(request: web.Request) -> web.Response:
+    return await _decks_call(
+        "decks.failed",
+        "op=list source=reader",
+        decks.list_decks(request.app[SESSION_FACTORY], request[USER_ID]),
+    )
+
+
+async def decks_create(request: web.Request) -> web.Response:
+    name = _name(await _json_body(request))
+    return await _decks_call(
+        "decks.failed",
+        "op=create source=reader",
+        decks.create_deck(request.app[SESSION_FACTORY], request[USER_ID], name),
+    )
+
+
+async def decks_rename(request: web.Request) -> web.Response:
+    deck_id = request.match_info["deck_id"]
+    name = _name(await _json_body(request))
+    app = request.app
+    return await _decks_call(
+        "decks.failed",
+        f"op=rename deck_id={deck_id} source=reader",
+        decks.rename_deck(app[SESSION_FACTORY], app[DECK_LOCKS], request[USER_ID], deck_id, name),
+    )
+
+
+async def decks_delete(request: web.Request) -> web.Response:
+    deck_id = request.match_info["deck_id"]
+    app = request.app
+    return await _decks_call(
+        "decks.failed",
+        f"op=delete deck_id={deck_id} source=reader",
+        decks.delete_deck(app[SESSION_FACTORY], app[DECK_LOCKS], request[USER_ID], deck_id),
+    )
+
+
+async def decks_notes(request: web.Request) -> web.Response:
+    """A page of the deck's words, newest first: ?offset= (0) &limit= (50,
+    at most 100; 0 or not a number - 400)."""
+    deck_id = request.match_info["deck_id"]
+    offset = _query_int(request, "offset", 0)
+    limit = _query_int(request, "limit", decks.DEFAULT_PAGE)
+    if limit < 1:
+        raise web.HTTPBadRequest()
+    limit = min(limit, decks.MAX_PAGE)
+    return await _decks_call(
+        "decks.failed",
+        f"op=notes deck_id={deck_id} source=reader",
+        decks.deck_notes(request.app[SESSION_FACTORY], request[USER_ID], deck_id, offset, limit),
+    )
+
+
+async def notes_search(request: web.Request) -> web.Response:
+    query = request.query.get("q", "")
+    return await _decks_call(
+        "decks.failed",
+        "op=search source=reader",
+        decks.search(request.app[SESSION_FACTORY], request[USER_ID], query),
+    )
+
+
+async def notes_get(request: web.Request) -> web.Response:
+    note_id = request.match_info["note_id"]
+    return await _decks_call(
+        "decks.failed",
+        f"op=note note_id={note_id} source=reader",
+        decks.note(request.app[SESSION_FACTORY], request[USER_ID], note_id),
+    )
+
+
+async def notes_edit(request: web.Request) -> web.Response:
+    """{"translation_ru"} or {"lemma"} - one of the two, a non-empty string
+    once stripped (400 otherwise)."""
+    body = await _json_body(request)
+    fields = [name for name in ("lemma", "translation_ru") if name in body]
+    if len(fields) != 1:
+        raise web.HTTPBadRequest()
+    field = fields[0]
+    value = body[field]
+    if not isinstance(value, str) or not value.strip():
+        raise web.HTTPBadRequest()
+    value = value.strip()
+    note_id = request.match_info["note_id"]
+    app = request.app
+    ids = f"op=edit note_id={note_id} field={field} source=reader"
+    if field == "translation_ru":
+        call = decks.set_translation(
+            app[SESSION_FACTORY], app[DECK_LOCKS], request[USER_ID], note_id, value
+        )
+        return await _decks_call("decks.failed", ids, call)
+    call = decks.set_lemma(
+        app[SESSION_FACTORY],
+        app[LOOKUP_CLIENT],
+        app[READER_BREAKER],
+        app[SETTINGS].openai_text_model,
+        bool(app[SETTINGS].openai_api_key),
+        app[DECK_LOCKS],
+        request[USER_ID],
+        note_id,
+        value,
+    )
+    return await _decks_call("decks.lemma_failed", ids, call)
+
+
+async def notes_delete(request: web.Request) -> web.Response:
+    """204; a second time (a double tap) - 404."""
+    note_id = request.match_info["note_id"]
+    app = request.app
+    return await _decks_call(
+        "decks.failed",
+        f"op=delete_note note_id={note_id} source=reader",
+        decks.delete_note(app[SESSION_FACTORY], app[DECK_LOCKS], request[USER_ID], note_id),
+    )
+
+
+async def notes_move(request: web.Request) -> web.Response:
+    deck_id = _string(await _json_body(request), "deck_id")
+    note_id = request.match_info["note_id"]
+    app = request.app
+    return await _decks_call(
+        "decks.failed",
+        f"op=move note_id={note_id} deck_id={deck_id} source=reader",
+        decks.move_note(app[SESSION_FACTORY], app[DECK_LOCKS], request[USER_ID], note_id, deck_id),
+    )
+
+
+async def notes_tts(request: web.Request) -> web.Response:
+    """🔊 of the word's lemma or example_fi ({"what": "lemma" | "example"}):
+    WAV, the reader's cache and breaker, the errors of /api/learn/tts."""
+    body = await _json_body(request)
+    what = body.get("what")
+    if what not in ("lemma", "example"):
+        raise web.HTTPBadRequest()
+    note_id = request.match_info["note_id"]
+    app = request.app
+    settings = app[SETTINGS]
+    try:
+        text = await decks.text_to_speak(app[SESSION_FACTORY], request[USER_ID], note_id, what)
+    except decks.NotFoundError:
+        raise web.HTTPNotFound() from None
+    if (refused := _no_openai(app)) is not None:
+        return refused
+    ids = f"note_id={note_id} what={what} source=decks"
+    try:
+        audio = await speak_text(
+            app[TTS_CLIENT],
+            app[READER_BREAKER],
+            settings.reader_tts_model,
+            settings.reader_tts_speed,
+            Path(settings.reader_tts_cache_dir),
+            app[TTS_LOCKS],
+            text,
+            ids,
+        )
+    except (CircuitOpenError, OpenAIError, EmptySpeechError) as exc:
+        return _call_failed("reader.tts_failed", ids, exc)
+    return web.Response(body=audio, content_type="audio/wav")
+
+
 async def _stop_warmup(app: web.Application) -> None:
     await app[WARMUP].stop()
 
@@ -663,6 +879,7 @@ def make_app(
     app[CARD_LOCKS] = KeyedLocks()
     app[LEARN_SESSIONS] = {}
     app[LEARN_LOCKS] = KeyedLocks()
+    app[DECK_LOCKS] = KeyedLocks()
     app[WARMUP] = Warmup()
     app.on_shutdown.append(_stop_warmup)
     app.on_cleanup.append(_close_clients)
@@ -681,6 +898,17 @@ def make_app(
     app.router.add_post("/api/learn/review", learn_review)
     app.router.add_post("/api/learn/undo", learn_undo)
     app.router.add_post("/api/learn/tts", learn_tts)
+    app.router.add_get("/api/decks", decks_list)
+    app.router.add_post("/api/decks", decks_create)
+    app.router.add_patch("/api/decks/{deck_id}", decks_rename)
+    app.router.add_delete("/api/decks/{deck_id}", decks_delete)
+    app.router.add_get("/api/decks/{deck_id}/notes", decks_notes)
+    app.router.add_get("/api/notes/search", notes_search)
+    app.router.add_get("/api/notes/{note_id}", notes_get)
+    app.router.add_patch("/api/notes/{note_id}", notes_edit)
+    app.router.add_delete("/api/notes/{note_id}", notes_delete)
+    app.router.add_post("/api/notes/{note_id}/move", notes_move)
+    app.router.add_post("/api/notes/{note_id}/tts", notes_tts)
     static = app.router.add_static("/static/", STATIC_DIR)
     app[PUBLIC_RESOURCES] = frozenset({index_route.resource, favicon_route.resource, static})
     return app
