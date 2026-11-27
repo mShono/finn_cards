@@ -118,7 +118,8 @@ def test_front_face_by_card_type():
 
 
 def test_screen_learn_query_parameter_and_no_hash_writes():
-    assert 'new URLSearchParams(window.location.search).get("screen") === "learn"' in APP_JS
+    assert 'const screen = new URLSearchParams(window.location.search).get("screen");' in APP_JS
+    assert 'else if (screen === "learn") showLearn();' in APP_JS
     # Telegram keeps tgWebAppData in the hash: never write it.
     assert "location.hash" not in APP_JS
     assert "pushState" not in APP_JS and "replaceState" not in APP_JS
@@ -140,7 +141,10 @@ def test_back_button_steps():
     # Card, debt, end, empty and "session gone" go back to the side choice.
     for name in ("showCard", "showDebt", "showEnd", "showMessage", "showSessionGone"):
         assert "navigate(showSides)" in _function(name), name
-    assert "navigate(learn.decks.length > 1 ? showDecks : null)" in _function("showSides")
+    sides = _function("showSides")
+    assert "learn.decks.length > 1 ? showDecks : null" in sides
+    # Started from a deck screen (П6): back to that deck.
+    assert "fromDeck ? () => showDeck(fromDeck)" in sides
 
 
 # --- rating: buttons and keys, no swipes (У5) --------------------------------

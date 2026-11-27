@@ -5,7 +5,7 @@
 import re
 
 import pytest
-from test_reader_static import APP_JS, LEARN_PREFIX, _calls, _canonical, _routes, learn_merged
+from test_reader_static import APP_JS, _calls, _canonical, _routes, unmerged
 
 # Any string or template literal starting with api/, not just api()/request()
 # calls: a path kept in a constant is checked too.
@@ -16,15 +16,14 @@ def test_every_api_path_in_app_js_is_a_route():
     routes = _routes()
     if "/api/cards" not in routes:
         pytest.skip("server routes not merged yet")
-    paths = {_canonical("/" + path) for _, path in PATH_RE.findall(APP_JS)}
+    paths = {_canonical("/" + path.split("?", 1)[0]) for _, path in PATH_RE.findall(APP_JS)}
     assert {"/api/lemma", "/api/lookup", "/api/cards", "/api/tts"} <= paths
-    merged = learn_merged(routes)
     for path in paths:
-        if path.startswith(LEARN_PREFIX) and not merged:
+        if unmerged(path, routes):
             continue
         assert path in routes, path
     for path, methods in _calls().items():
-        if path.startswith(LEARN_PREFIX) and not merged:
+        if unmerged(path, routes):
             continue
         assert methods <= routes[path], (path, methods, routes[path])
 
